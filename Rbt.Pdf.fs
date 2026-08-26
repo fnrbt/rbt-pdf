@@ -1,4 +1,4 @@
-namespace FsPdf
+namespace Rbt.Pdf
 
 open System
 open System.IO
@@ -2051,11 +2051,11 @@ module FontResolve =
                                         let data = Pdf.getStreamData doc s
                                         if data.Length > 0 then
                                             if isCff then
-                                                let nameToGlyph, numGlyphs = OpenType.Cff.getCffNameToGlyph data 0
+                                                let nameToGlyph, numGlyphs = Rbt.OpenType.Cff.getCffNameToGlyph data 0
                                                 // Fall back to the CFF built-in encoding when the PDF has none.
                                                 let enc, diffs =
                                                     if not pdfHasEncoding then
-                                                        let builtin = OpenType.Cff.getCffBuiltinEncoding data 0
+                                                        let builtin = Rbt.OpenType.Cff.getCffBuiltinEncoding data 0
                                                         if not builtin.IsEmpty then "", builtin
                                                         else encoding, encodingDiffs
                                                     else encoding, encodingDiffs
@@ -2072,8 +2072,8 @@ module FontResolve =
                                                     match Pdf.dictGet doc "Length2" streamObj with
                                                     | Some (PdfInt n) -> int n | _ -> 0
                                                 try
-                                                    let t1 = OpenType.Type1.parseType1 data length1 length2
-                                                    let nameToGlyph = OpenType.Type1.nameToGlyphIndex t1
+                                                    let t1 = Rbt.OpenType.Type1.parseType1 data length1 length2
+                                                    let nameToGlyph = Rbt.OpenType.Type1.nameToGlyphIndex t1
                                                     let numGlyphs = t1.CharStrings.Length
                                                     // Fall back to the Type1 built-in encoding when the PDF has none.
                                                     let enc, diffs =
@@ -2606,7 +2606,7 @@ module Draw =
         /// Set stroke alpha (transparency) - uses ExtGState
         | SetStrokeAlpha of float
 
-    /// WinAnsi encoding map for Unicode code points 0x80-0x9F
+    /// WinAnsi encoding map for Rbt.Unicode code points 0x80-0x9F
     let private winAnsiMap =
         [
             0x20AC, 0x80; 0x201A, 0x82; 0x0192, 0x83; 0x201E, 0x84
@@ -3092,10 +3092,10 @@ module Font =
     open System.IO
     open System.Text
 
-    /// WinAnsi encoding: maps Unicode code points to WinAnsi bytes
+    /// WinAnsi encoding: maps Rbt.Unicode code points to WinAnsi bytes
     /// Covers Latin-1 supplement and some extended Latin characters
     let private winAnsiMap =
-        // Characters 0x80-0x9F in WinAnsi are different from Unicode
+        // Characters 0x80-0x9F in WinAnsi are different from Rbt.Unicode
         [
             0x20AC, 0x80  // Euro sign
             0x201A, 0x82  // Single low-9 quotation mark
@@ -3126,7 +3126,7 @@ module Font =
             0x0178, 0x9F  // Latin capital letter Y with diaeresis
         ] |> Map.ofList
 
-    /// Encode a Unicode string to WinAnsi bytes for standard PDF fonts
+    /// Encode a Rbt.Unicode string to WinAnsi bytes for standard PDF fonts
     let toWinAnsi (s: string) : byte[] =
         s |> Seq.map (fun c ->
             let code = int c
@@ -3170,7 +3170,7 @@ module Font =
         Descender: int
         NumGlyphs: int
         GlyphWidths: int[]  // indexed by glyph ID
-        Cmap: Map<int, int>  // Unicode code point to glyph ID
+        Cmap: Map<int, int>  // Rbt.Unicode code point to glyph ID
         /// Kerning pairs: (leftGlyphId, rightGlyphId) -> x adjustment in font units
         KerningPairs: Map<int * int, int>
     }
@@ -3422,14 +3422,14 @@ module Font =
         for i in numOfLongHorMetrics .. numGlyphs - 1 do
             glyphWidths.[i] <- lastWidth
 
-        // Parse 'cmap' table for Unicode mapping
+        // Parse 'cmap' table for Rbt.Unicode mapping
         let cmapFormat4 =
             match tables.TryFind "cmap" with
             | None -> None
             | Some cmapEntry ->
                 let cmapOffset = int cmapEntry.Offset
                 let numSubtables = int (readUInt16BE data (cmapOffset + 2))
-                // Find Unicode subtable (platform 3, encoding 1 or platform 0)
+                // Find Rbt.Unicode subtable (platform 3, encoding 1 or platform 0)
                 let mutable unicodeOffset = None
                 for i in 0 .. numSubtables - 1 do
                     let subtableOffset = cmapOffset + 4 + i * 8
@@ -3439,7 +3439,7 @@ module Font =
                     if (platformID = 3us && encodingID = 1us) || platformID = 0us then
                         unicodeOffset <- Some (cmapOffset + int offset)
 
-                // Also look for format 12 subtable (platform 3, encoding 10 for full Unicode)
+                // Also look for format 12 subtable (platform 3, encoding 10 for full Rbt.Unicode)
                 let mutable format12Offset = None
                 for i in 0 .. numSubtables - 1 do
                     let subtableOffset = cmapOffset + 4 + i * 8
@@ -3449,7 +3449,7 @@ module Font =
                     if platformID = 3us && encodingID = 10us then
                         format12Offset <- Some (cmapOffset + int offset)
 
-                // Prefer format 12 over format 4 for full Unicode coverage
+                // Prefer format 12 over format 4 for full Rbt.Unicode coverage
                 match format12Offset with
                 | Some offset ->
                     let format = readUInt16BE data offset
@@ -3480,7 +3480,7 @@ module Font =
                             let idDeltas = [| for i in 0 .. segCount - 1 -> int (readInt16BE data (offset + 16 + segCount * 4 + i * 2)) |]
                             let idRangeOffsetBase = offset + 16 + segCount * 6
 
-                            // Build Unicode -> GlyphID mapping
+                            // Build Rbt.Unicode -> GlyphID mapping
                             let mapping = ResizeArray<int * int>()
                             for seg in 0 .. segCount - 1 do
                                 let idRangeOffset = int (readUInt16BE data (idRangeOffsetBase + seg * 2))
@@ -3528,7 +3528,7 @@ module Font =
         parseTrueType data
 #endif
 
-    /// Get glyph ID for a Unicode code point
+    /// Get glyph ID for a Rbt.Unicode code point
     let getGlyphId (font: TrueTypeFont) (codePoint: int) : int =
         font.Cmap.TryFind codePoint |> Option.defaultValue 0
 
@@ -3672,7 +3672,7 @@ module Font =
         let cidFontRef = Write.newIndirectObj doc (PdfDict cidFontDict)
 
         // Generate ToUnicode CMap for text extraction
-        // Invert the Cmap (Unicode -> GlyphID) to get (GlyphID -> Unicode)
+        // Invert the Cmap (Rbt.Unicode -> GlyphID) to get (GlyphID -> Rbt.Unicode)
         let glyphToUnicode =
             font.Cmap
             |> Map.toSeq
@@ -3811,7 +3811,7 @@ module Doc =
             loadFontBytes builder fontName data |> ignore
             Map.empty
         else
-            let subsetBytes, remap = OpenType.Subset.subsetCompact data usedGids
+            let subsetBytes, remap = Rbt.OpenType.Subset.subsetCompact data usedGids
             let ttf = Font.parseTrueType subsetBytes
             // Rename the internal font to "ABCDEF+OriginalName" — a PDF
             // subset-font convention. This only affects the BaseFont name
@@ -3838,7 +3838,7 @@ module Doc =
             builder.EmbeddedFonts <- Map.add fontName f builder.EmbeddedFonts
             Map.empty
         else
-            let subsetBytes, remap = OpenType.Subset.subsetCompact data usedGids
+            let subsetBytes, remap = Rbt.OpenType.Subset.subsetCompact data usedGids
             let ttf = Font.parseTrueType subsetBytes
             // Rename the internal font to "ABCDEF+OriginalName" — a PDF
             // subset-font convention. This only affects the BaseFont name
@@ -3862,7 +3862,7 @@ module Doc =
     let getEmbeddedFont (builder: DocBuilder) (fontName: string) =
         Map.tryFind fontName builder.EmbeddedFonts
 
-    /// Create drawing ops for text using an embedded font (for Unicode/CJK)
+    /// Create drawing ops for text using an embedded font (for Rbt.Unicode/CJK)
     let embeddedText (builder: DocBuilder) (fontName: string) (fontSize: float) (x: float) (y: float) (text: string) =
         match getEmbeddedFont builder fontName with
         | None -> []

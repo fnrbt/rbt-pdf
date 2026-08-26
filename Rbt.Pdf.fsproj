@@ -4,12 +4,12 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="FsPdf.fs" />
+    <Compile Include="Rbt.Pdf.fs" />
   </ItemGroup>
   <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
-    <ProjectReference Include="../text/opentype/OpenType.Core.fsproj" />
+    <ProjectReference Include="../rbt-text/opentype/Rbt.OpenType.Core.fsproj" />
   </ItemGroup>
   <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true'">
-    <ProjectReference Include="../text/opentype/OpenType.fsproj" />
+    <ProjectReference Include="../rbt-text/opentype/Rbt.OpenType.fsproj" />
   </ItemGroup>
 </Project>
