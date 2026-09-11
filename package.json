@@ -1,0 +1,22 @@
+{
+  "name": "@rbt/pdf",
+  "version": "0.1.0",
+  "description": "Fable-compiled PDF viewer for browser applications",
+  "type": "module",
+  "sideEffects": false,
+  "files": ["dist", "assets"],
+  "exports": {
+    "./*": "./dist/*",
+    "./assets/*": "./assets/*"
+  },
+  "scripts": {
+    "assets": "mkdir -p Rbt.Pdf.Web/public/assets && cp ../rbt-renderer/NotoSans-Regular.ttf ../rbt-text/unicode/src/Rbt.Unicode/ucd.dat Rbt.Pdf.Web/public/assets/",
+    "build:fable": "dotnet tool restore && rm -rf dist && dotnet fable Rbt.Pdf.Web --outDir dist --lang JavaScript --noCache",
+    "fable:dev": "dotnet tool restore && rm -rf Rbt.Pdf.Web/.generated && dotnet fable Rbt.Pdf.Web --outDir Rbt.Pdf.Web/.generated",
+    "dev": "pnpm run fable:dev && vite --config Rbt.Pdf.Web/vite.config.js",
+    "build": "pnpm run build:fable && rm -rf assets && mkdir -p assets && cp ../rbt-renderer/NotoSans-Regular.ttf ../rbt-text/unicode/src/Rbt.Unicode/ucd.dat assets/"
+  },
+  "devDependencies": {
+    "vite": "^7.1.7"
+  }
+}

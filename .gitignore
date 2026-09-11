@@ -1,2 +1,8 @@
 bin/
 obj/
+node_modules/
+dist/
+Rbt.Pdf.Web/.generated/
+Rbt.Pdf.Web/public/assets/
+.pnpm-store/
+assets/

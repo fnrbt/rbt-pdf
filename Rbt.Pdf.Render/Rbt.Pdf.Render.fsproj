@@ -4,12 +4,17 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="ImageDecode.fs" />
+    <Compile Include="ImageDecode.fs" Condition="'$(FABLE_COMPILER)' != 'true'" />
     <Compile Include="Fonts.fs" />
     <Compile Include="Render.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Rbt.Pdf/Rbt.Pdf.fsproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
+    <ProjectReference Include="../../rbt-renderer/Rbt.Renderer.Core.fsproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true'">
     <ProjectReference Include="../../rbt-renderer/Rbt.Renderer.fsproj" />
   </ItemGroup>
 </Project>

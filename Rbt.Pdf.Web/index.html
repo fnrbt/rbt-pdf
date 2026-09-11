@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rbt-pdf viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #2b2b2b;
+      font-family: system-ui, -apple-system, sans-serif;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    #toolbar {
+      background: #363636;
+      border-bottom: 1px solid #4a4a4a;
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    #toolbar .label { font-size: 13px; font-weight: 600; color: #aaa; }
+    #toolbar select, #toolbar button {
+      font-size: 13px;
+      background: #4a4a4a;
+      color: #e0e0e0;
+      border: 1px solid #5a5a5a;
+      border-radius: 4px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+    #toolbar select:hover, #toolbar button:hover { background: #555; }
+    .sep { width: 1px; height: 24px; background: #4a4a4a; }
+    .zoom-display { font-size: 13px; min-width: 48px; text-align: center; }
+    #file-input { display: none; }
+    #status { font-size: 12px; color: #888; margin-left: auto; }
+    #pdf-root {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 16px;
+    }
+    .page {
+      background: #fff;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    .text-layer { color: transparent; pointer-events: auto; }
+    .text-layer > span { color: transparent; cursor: text; }
+    .text-layer > span::selection { background: rgba(0, 100, 200, 0.3); color: transparent; }
+    .text-layer > span::-moz-selection { background: rgba(0, 100, 200, 0.3); color: transparent; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <span class="label">rbt-pdf</span>
+    <div class="sep"></div>
+    <select id="pdf-select">
+      <option value="">Choose test PDF...</option>
+      <option value="/pdfs/tracemonkey.pdf">tracemonkey.pdf</option>
+      <option value="/pdfs/f1040.pdf">f1040.pdf</option>
+      <option value="/pdfs/git-cheat.pdf">git-cheat.pdf</option>
+      <option value="/pdfs/wiki.pdf">wiki.pdf</option>
+      <option value="/pdfs/attention.pdf">attention.pdf</option>
+      <option value="/pdfs/pdf20-simple.pdf">pdf20-simple.pdf</option>
+      <option value="/pdfs/css-spec.pdf">css-spec.pdf</option>
+      <option value="/pdfs/unix-haters.pdf">unix-haters.pdf</option>
+      <option value="/pdfs/pdfref13.pdf">pdfref13.pdf</option>
+      <option value="/pdfs/pdfref14.pdf">pdfref14.pdf</option>
+    </select>
+    <button id="open-file-btn">Open file...</button>
+    <input type="file" id="file-input" accept=".pdf,application/pdf" />
+    <div class="sep"></div>
+    <button id="zoom-out">&#x2212;</button>
+    <span class="zoom-display" id="zoom-label">100%</span>
+    <button id="zoom-in">+</button>
+    <button id="zoom-fit">Fit</button>
+    <div class="sep"></div>
+    <span id="status"></span>
+  </div>
+  <div id="pdf-root"></div>
+
+  <script type="module">
+    import { openPdf } from './.generated/App.js';
+
+    const root = document.getElementById('pdf-root');
+    const select = document.getElementById('pdf-select');
+    const fileInput = document.getElementById('file-input');
+    const zoomIn = document.getElementById('zoom-in');
+    const zoomOut = document.getElementById('zoom-out');
+    const zoomFit = document.getElementById('zoom-fit');
+    const zoomLabel = document.getElementById('zoom-label');
+    const status = document.getElementById('status');
+
+    let viewer = null;
+
+    function updateZoomLabel() {
+      if (viewer) zoomLabel.textContent = Math.round(viewer.zoom * 100) + '%';
+    }
+
+    async function loadFromBytes(bytes, name) {
+      if (viewer) { viewer.dispose(); viewer = null; }
+      root.innerHTML = '';
+      status.textContent = `Parsing ${(bytes.length / 1024).toFixed(0)} KB...`;
+      try {
+        viewer = await openPdf(root, bytes, './assets');
+        status.textContent = `${name} \u2014 ${viewer.pageCount} pages`;
+        updateZoomLabel();
+      } catch (e) {
+        status.textContent = 'Error: ' + e.message;
+        console.error(e);
+      }
+    }
+
+    async function loadPdf(url) {
+      status.textContent = 'Fetching...';
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const bytes = new Uint8Array(await resp.arrayBuffer());
+        const name = url.split('/').pop();
+        await loadFromBytes(bytes, name);
+      } catch (e) {
+        status.textContent = 'Error: ' + e.message;
+        console.error(e);
+      }
+    }
+
+    select.addEventListener('change', () => { if (select.value) loadPdf(select.value); });
+    document.getElementById('open-file-btn').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) {
+        const file = fileInput.files[0];
+        file.arrayBuffer().then(buf => loadFromBytes(new Uint8Array(buf), file.name));
+      }
+    });
+
+    zoomIn.addEventListener('click', () => { if (viewer) { viewer.setZoom(Math.min(viewer.zoom + 0.25, 5)); updateZoomLabel(); } });
+    zoomOut.addEventListener('click', () => { if (viewer) { viewer.setZoom(Math.max(viewer.zoom - 0.25, 0.25)); updateZoomLabel(); } });
+    zoomFit.addEventListener('click', () => { if (viewer) { viewer.setZoom(1); updateZoomLabel(); } });
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (!viewer) return;
+      if ((e.ctrlKey || e.metaKey) && e.key === '=') { e.preventDefault(); viewer.setZoom(Math.min(viewer.zoom + 0.25, 5)); updateZoomLabel(); }
+      if ((e.ctrlKey || e.metaKey) && e.key === '-') { e.preventDefault(); viewer.setZoom(Math.max(viewer.zoom - 0.25, 0.25)); updateZoomLabel(); }
+      if ((e.ctrlKey || e.metaKey) && e.key === '0') { e.preventDefault(); viewer.setZoom(1); updateZoomLabel(); }
+    });
+
+    // Auto-load from ?url= or default to tracemonkey
+    const urlParam = new URLSearchParams(location.search).get('url');
+    if (urlParam) {
+      loadPdf(urlParam);
+      select.value = urlParam;
+    }
+  </script>
+</body>
+</html>

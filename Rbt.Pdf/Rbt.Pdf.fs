@@ -533,11 +533,11 @@ module XRef =
 
 module Streams =
     let decompress (filter: string) (data: byte[]) =
-#if FABLE_COMPILER
-        data
-#else
         match filter with
-        | "FlateDecode" ->
+        | "FlateDecode" | "Fl" ->
+#if FABLE_COMPILER
+            try Rbt.OpenType.Inflate.inflate data with _ -> data
+#else
             try
                 use input = new MemoryStream(data)
                 // Skip zlib header (2 bytes)
@@ -556,6 +556,7 @@ module Streams =
                     deflate.CopyTo(output)
                     output.ToArray()
                 with _ -> data
+#endif
         | "ASCIIHexDecode" | "AHx" ->
             // Hex digits until '>' EOD; whitespace ignored; odd trailing nibble padded with 0.
             let out = ResizeArray<byte>(data.Length / 2)
@@ -651,7 +652,6 @@ module Streams =
                                 codeWidth <- codeWidth + 1
             out.ToArray()
         | _ -> data
-#endif
 
     // Reverse a PNG (Predictor 10-15) or TIFF (Predictor 2) predictor that was
     // applied before compression. Many PDFs predict xref/object/content streams
@@ -894,6 +894,9 @@ module Pdf =
 
     let numPages (doc: PdfDocument) =
         countPages doc (getPages doc)
+
+    let getPageCount (doc: PdfDocument) : int =
+        numPages doc
 
     let rec private findPage (doc: PdfDocument) (node: PdfObj) (pageNum: int) (currentPage: int) =
         let n = deref doc node
@@ -4392,19 +4395,14 @@ module Operations =
             Write.newIndirectObj dst (PdfDict copied)
         | _ -> failwith "Invalid page object"
 
-    /// Get the total page count
-    let private getPageCount (doc: PdfDocument) : int =
-        let pagesNode = Pdf.getPages doc
-        let n = Pdf.deref doc pagesNode
-        match Pdf.dictGet doc "Count" n with
-        | Some (PdfInt c) -> int c
-        | _ -> 0
+    /// Get the total page count (delegates to Pdf.getPageCount)
+    let private pageCount (doc: PdfDocument) : int = Pdf.getPageCount doc
 
     /// Extract specific pages from a PDF (1-indexed)
     let extractPages (doc: PdfDocument) (pageNums: int list) : PdfDocument =
         let newDoc = Write.createNew ()
         let objMap = System.Collections.Generic.Dictionary<int, int>()
-        let totalPages = getPageCount doc
+        let totalPages = pageCount doc
 
         let copiedPages =
             pageNums
@@ -4446,11 +4444,11 @@ module Operations =
     /// Split a PDF at given page numbers, returning multiple documents
     /// splitAt = [3; 5] splits into pages 1-2, 3-4, 5-end
     let splitAt (doc: PdfDocument) (splitPoints: int list) : PdfDocument list =
-        let pageCount = getPageCount doc
-        let sortedPoints = splitPoints |> List.sort |> List.distinct |> List.filter (fun p -> p > 1 && p <= pageCount)
+        let pageCount' = pageCount doc
+        let sortedPoints = splitPoints |> List.sort |> List.distinct |> List.filter (fun p -> p > 1 && p <= pageCount')
         let ranges =
             let starts = 1 :: sortedPoints
-            let ends = (sortedPoints |> List.map (fun p -> p - 1)) @ [pageCount]
+            let ends = (sortedPoints |> List.map (fun p -> p - 1)) @ [pageCount']
             List.zip starts ends
             |> List.map (fun (s, e) -> [s..e])
         ranges |> List.map (extractPages doc)
@@ -4459,7 +4457,7 @@ module Operations =
     let rotatePages (doc: PdfDocument) (pageNums: int list) (degrees: int) : unit =
         if degrees % 90 <> 0 then failwith "Rotation must be multiple of 90"
         let normalizedRotation = ((degrees % 360) + 360) % 360
-        let totalPages = getPageCount doc
+        let totalPages = pageCount doc
 
         for pageNum in pageNums do
             if pageNum >= 1 && pageNum <= totalPages then
@@ -4483,8 +4481,8 @@ module Operations =
 
     /// Delete pages from document (1-indexed)
     let deletePages (doc: PdfDocument) (pageNums: int list) : PdfDocument =
-        let pageCount = getPageCount doc
-        let toKeep = [1..pageCount] |> List.filter (fun n -> not (List.contains n pageNums))
+        let pc = pageCount doc
+        let toKeep = [1..pc] |> List.filter (fun n -> not (List.contains n pageNums))
         extractPages doc toKeep
 
     /// Reorder pages according to new order (list of 1-indexed page numbers)
@@ -4500,8 +4498,8 @@ module Operations =
             docs
             |> List.collect (fun doc ->
                 objMap.Clear()  // Fresh mapping per source doc
-                let pageCount = getPageCount doc
-                [1..pageCount]
+                let pc = pageCount doc
+                [1..pc]
                 |> List.choose (fun n ->
                     match Pdf.getPage doc n with
                     | Some pageRef -> Some (copyPage doc newDoc objMap pageRef)
@@ -4623,14 +4621,14 @@ module Operations =
 
     /// Add annotations to a document, modifying it in place
     let addAnnotations (doc: PdfDocument) (strokes: StrokeAnnotation list) (texts: TextAnnotation list) (images: ImageAnnotation list) =
-        let pageCount = getPageCount doc
+        let pc = pageCount doc
 
         // Group annotations by page
         let strokesByPage = strokes |> List.groupBy (fun s -> s.Page) |> Map.ofList
         let textsByPage = texts |> List.groupBy (fun t -> t.Page) |> Map.ofList
         let imagesByPage = images |> List.groupBy (fun i -> i.Page) |> Map.ofList
 
-        for pageNum in 1 .. pageCount do
+        for pageNum in 1 .. pc do
             let pageStrokes = strokesByPage |> Map.tryFind pageNum |> Option.defaultValue []
             let pageTexts = textsByPage |> Map.tryFind pageNum |> Option.defaultValue []
             let pageImages = imagesByPage |> Map.tryFind pageNum |> Option.defaultValue []

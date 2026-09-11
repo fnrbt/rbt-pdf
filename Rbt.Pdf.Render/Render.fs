@@ -139,9 +139,24 @@ type CharBox = {
     W: float; H: float
 }
 
+type RenderOptions =
+    { FallbackFont: Text.FontData
+      /// JPEG (DCTDecode) raw stream bytes -> (w, h, premultiplied BGRA uint32[]). None = skip image.
+      DecodeJpeg: byte[] -> (int * int * uint32[]) option }
+
+#if !FABLE_COMPILER
+module RenderOptions =
+    let private nativeOpts =
+        lazy
+            let fontPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "../../rbt-renderer/NotoSans-Regular.ttf"))
+            { FallbackFont = Text.loadFontFile fontPath
+              DecodeJpeg = ImageDecode.decode }
+    let native () = nativeOpts.Value
+#endif
+
 // ── Main Interpreter ─────────────────────────────────────
 
-let renderPage (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * float * float * CharBox[]) option =
+let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * float * float * CharBox[]) option =
     match Pdf.getPage doc pageNum with
     | None -> None
     | Some pageRef ->
@@ -229,9 +244,7 @@ let renderPage (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * fl
                     | None -> Fonts.decodeByEncoding fi.Encoding stringBytes
                 | None -> Fonts.decodeByEncoding fi.Encoding stringBytes
 
-            let fallbackFont =
-                let fontPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "../../renderer/NotoSans-Regular.ttf"))
-                Text.loadFontFile fontPath
+            let fallbackFont = opts.FallbackFont
 
             let getRendererFont () =
                 let fi = getFontInfo ()
@@ -918,7 +931,7 @@ let renderPage (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * fl
                                                         if paint then
                                                             pixels.[y * imgW + x] <- Pixel.pack fc.B fc.G fc.R fc.A
 
-                                            let fb = { W = imgW; H = imgH; Px = Memory(pixels) }
+                                            let fb = Framebuffer.ofArray pixels imgW imgH
                                             let srcR = rect 0.0 0.0 (float imgW) (float imgH)
                                             let dstR = rect 0.0 0.0 1.0 1.0
                                             cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
@@ -929,9 +942,9 @@ let renderPage (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * fl
                                                 match Pdf.deref doc xobj with
                                                 | PdfStream (_, raw) -> raw
                                                 | _ -> imgData
-                                            match ImageDecode.decode rawData with
+                                            match opts.DecodeJpeg rawData with
                                             | Some (dw, dh, dpixels) ->
-                                                let fb = { W = dw; H = dh; Px = Memory(dpixels) }
+                                                let fb = Framebuffer.ofArray dpixels dw dh
                                                 let srcR = rect 0.0 0.0 (float dw) (float dh)
                                                 let dstR = rect 0.0 0.0 1.0 1.0
                                                 cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
@@ -1024,7 +1037,7 @@ let renderPage (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * fl
                                                         if masked then pixels.[i] <- 0u
                                         | None -> ()
 
-                                        let fb = { W = imgW; H = imgH; Px = Memory(pixels) }
+                                        let fb = Framebuffer.ofArray pixels imgW imgH
                                         let srcR = rect 0.0 0.0 (float imgW) (float imgH)
                                         let dstR = rect 0.0 0.0 1.0 1.0
                                         cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
@@ -1108,9 +1121,9 @@ let renderPage (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * fl
                             if iiW > 0 && iiH > 0 then
                                 try
                                     if iiFilter = "DCTDecode" then
-                                        match ImageDecode.decode rawData with
+                                        match opts.DecodeJpeg rawData with
                                         | Some (dw, dh, dpixels) ->
-                                            let fb = { W = dw; H = dh; Px = Memory(dpixels) }
+                                            let fb = Framebuffer.ofArray dpixels dw dh
                                             let srcR = rect 0.0 0.0 (float dw) (float dh)
                                             let dstR = rect 0.0 0.0 1.0 1.0
                                             cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
@@ -1139,7 +1152,7 @@ let renderPage (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * fl
                                                         | _ -> (imgData.[idx], imgData.[idx+1], imgData.[idx+2])
                                                     else (255uy, 255uy, 255uy)
                                                 pixels.[y * iiW + x] <- Pixel.pack b g r 255uy
-                                        let fb = { W = iiW; H = iiH; Px = Memory(pixels) }
+                                        let fb = Framebuffer.ofArray pixels iiW iiH
                                         let srcR = rect 0.0 0.0 (float iiW) (float iiH)
                                         let dstR = rect 0.0 0.0 1.0 1.0
                                         cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))

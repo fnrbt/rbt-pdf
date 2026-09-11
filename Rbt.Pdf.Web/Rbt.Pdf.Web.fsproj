@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>preview</LangVersion>
+    <AssemblyName>Rbt.Pdf.Web</AssemblyName>
+    <RootNamespace>Rbt.Pdf.Web</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="WebApi.fs" />
+    <Compile Include="GlyphCache.fs" />
+    <Compile Include="ImageSource.fs" />
+    <Compile Include="CanvasBackend.fs" />
+    <Compile Include="TextLayer.fs" />
+    <Compile Include="PageView.fs" />
+    <Compile Include="App.fs" />
+    <Compile Include="Dev.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" Version="4.3.0" />
+    <PackageReference Include="Fable.Browser.Dom" Version="2.17.0" />
+    <PackageReference Include="Fable.Browser.Blob" Version="1.4.0" />
+  </ItemGroup>
+</Project>

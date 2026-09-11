@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FORGE_VERSION:?FORGE_VERSION is required}"
+: "${FORGE_NPM_REGISTRY:?FORGE_NPM_REGISTRY is required}"
+: "${NPM_CONFIG_USERCONFIG:?NPM_CONFIG_USERCONFIG is required}"
+
+actual_version="$(node -p "require('./package.json').version")"
+[[ "$actual_version" == "$FORGE_VERSION" ]] || {
+    printf 'package version %s does not match Forge version %s\n' "$actual_version" "$FORGE_VERSION" >&2
+    exit 1
+}
+
+pnpm install --frozen-lockfile
+pnpm run build
+out="$(mktemp -d "${FORGE_ARTIFACT_TMP:-/tmp}/rbt-pdf-npm.XXXXXX")"
+npm pack --pack-destination "$out"
+tarball="$out/rbt-pdf-$FORGE_VERSION.tgz"
+[[ -f "$tarball" ]] || { printf 'npm pack did not create %s\n' "$tarball" >&2; exit 1; }
+npm publish "$tarball" --registry "$FORGE_NPM_REGISTRY" --access restricted
