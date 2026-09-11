@@ -7,9 +7,9 @@
     <Compile Include="Rbt.Pdf.fs" />
   </ItemGroup>
   <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
-    <ProjectReference Include="../rbt-text/opentype/Rbt.OpenType.Core.fsproj" />
+    <ProjectReference Include="../../rbt-text/opentype/Rbt.OpenType.Core.fsproj" />
   </ItemGroup>
   <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true'">
-    <ProjectReference Include="../rbt-text/opentype/Rbt.OpenType.fsproj" />
+    <ProjectReference Include="../../rbt-text/opentype/Rbt.OpenType.fsproj" />
   </ItemGroup>
 </Project>

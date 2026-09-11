@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Build and publish Rbt.Pdf and Rbt.Pdf.Render NuGet packages to the Forge registry.
+
+Runs inside the Forge publish-action shell. The coordinator injects
+FORGE_PACKAGE_SOURCE (registry v3 index URL) and FORGE_PACKAGE_API_KEYS
+(JSON prefix->token map). Version comes from FORGE_VERSION (the pushed tag).
+
+Rbt.Pdf is a leaf (depends on Rbt.OpenType from nuget.org/registry).
+Rbt.Pdf.Render depends on Rbt.Pdf + Rbt.Renderer — we pack Rbt.Pdf first
+into a local folder feed so the second pack resolves it as a package dependency.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+def main() -> int:
+    repo = Path(__file__).resolve().parent.parent
+
+    version = os.environ.get("FORGE_VERSION", "").strip()
+    if not version:
+        fail("FORGE_VERSION is required (set by the publish action from the version tag)")
+
+    source = os.environ.get("FORGE_PACKAGE_SOURCE")
+    if not source:
+        fail("FORGE_PACKAGE_SOURCE is required")
+
+    try:
+        api_keys = json.loads(os.environ.get("FORGE_PACKAGE_API_KEYS") or "{}")
+    except json.JSONDecodeError as error:
+        fail(f"FORGE_PACKAGE_API_KEYS is not valid JSON: {error}")
+    api_key = api_keys.get("Rbt.Pdf")
+    if not api_key:
+        fail("FORGE_PACKAGE_API_KEYS has no Rbt.Pdf publisher token")
+
+    source_sha = os.environ.get("FORGE_SOURCE_SHA", "")
+
+    workdir = Path(tempfile.mkdtemp(prefix="rbt-pdf-publish-"))
+    feed = workdir / "feed"
+    feed.mkdir()
+
+    # NuGet config: nuget.org + the forge registry (for Rbt.OpenType, Rbt.Renderer)
+    # + local feed for inter-project deps
+    nuget_config = workdir / "NuGet.Config"
+    nuget_config.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<configuration>\n"
+        "  <packageSources>\n"
+        "    <clear />\n"
+        f'    <add key="local-feed" value="{feed}" />\n'
+        f'    <add key="forge" value="{source}" />\n'
+        '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />\n'
+        "  </packageSources>\n"
+        "</configuration>\n",
+        encoding="utf-8",
+    )
+
+    common_args = [
+        "-c", "Release",
+        "--configfile", str(nuget_config),
+        f"-p:Version={version}",
+        f"-p:PackageVersion={version}",
+        f"-p:RepositoryCommit={source_sha}",
+        "-p:ContinuousIntegrationBuild=true",
+        "-p:IncludeSymbols=false",
+        "-p:ForgePublish=true",
+    ]
+
+    # 1. Pack Rbt.Pdf into the local feed
+    run(["dotnet", "pack", "Rbt.Pdf/Rbt.Pdf.fsproj", *common_args, "-o", str(feed)], cwd=repo)
+
+    # 2. Pack Rbt.Pdf.Render (picks up Rbt.Pdf from local feed)
+    output = workdir / "nupkg"
+    output.mkdir()
+    run(["dotnet", "pack", "Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj", *common_args, "-o", str(output)], cwd=repo)
+
+    # Move Rbt.Pdf package from feed to output for publishing
+    for pkg in feed.glob("*.nupkg"):
+        pkg.rename(output / pkg.name)
+
+    # Publish all packages
+    endpoint = publish_endpoint(source)
+    packages = sorted(output.glob("*.nupkg"))
+    if not packages:
+        fail("no packages were produced")
+
+    for package in packages:
+        push(package, endpoint, api_key, source_sha, version)
+
+    return 0
+
+
+def run(command: list[str], **kwargs) -> None:
+    print("+ " + " ".join(command), flush=True)
+    subprocess.run(command, check=True, **kwargs)
+
+
+def push(package: Path, endpoint: str, api_key: str, source_sha: str, version: str) -> None:
+    boundary = "----ForgePackage" + uuid.uuid4().hex
+    prefix = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="package"; filename="{package.name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    body = prefix + package.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="PUT",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-NuGet-ApiKey": api_key,
+            "X-Forge-Source-Sha": source_sha,
+            "X-Forge-Version-Mode": "explicit",
+        },
+    )
+    print(f"+ publish {package.name} to {endpoint}", flush=True)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            if response.status < 200 or response.status >= 300:
+                fail(f"publish returned HTTP {response.status}: {package.name}")
+    except urllib.error.HTTPError as error:
+        if error.code == 409:
+            print(f"{package.name} already published (409); no-op", flush=True)
+            return
+        detail = error.read(4096).decode("utf-8", errors="replace")
+        fail(f"publish failed with HTTP {error.code}: {package.name}\n{detail}")
+    except (OSError, urllib.error.URLError) as error:
+        fail(f"publish failed: {package.name}: {error}")
+    print(f"published {package.name}", flush=True)
+
+
+def publish_endpoint(source: str) -> str:
+    request = urllib.request.Request(source, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            index = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        fail(f"could not read NuGet service index {source}: {error}")
+    for resource in index.get("resources", []):
+        resource_types = resource.get("@type", [])
+        if isinstance(resource_types, str):
+            resource_types = [resource_types]
+        if any(str(value).split("/", 1)[0] == "PackagePublish" for value in resource_types):
+            endpoint = str(resource.get("@id") or "").strip()
+            if endpoint:
+                return urllib.parse.urljoin(source, endpoint)
+    fail(f"NuGet service index has no PackagePublish resource: {source}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
