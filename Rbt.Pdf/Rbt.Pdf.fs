@@ -60,6 +60,29 @@ module Binary =
         | -1 -> -1
         | i -> start + i
 
+    /// True when `pattern` occurs in `data` at `pos`.
+    let matchesAt (data: byte[]) (pos: int) (pattern: byte[]) =
+        if pos < 0 || pos + pattern.Length > data.Length then false
+        else
+            let mutable i = 0
+            while i < pattern.Length && data.[pos + i] = pattern.[i] do i <- i + 1
+            i = pattern.Length
+
+    /// First index of `pattern` in `data` at or after `start` and before `limit`
+    /// (the match must start before `limit`), or -1.
+    let indexOfBefore (pattern: byte[]) (data: byte[]) (start: int) (limit: int) =
+        let last = min (data.Length - pattern.Length) (limit - 1)
+        let mutable i = max 0 start
+        let mutable found = -1
+        while found < 0 && i <= last do
+            if data.[i] = pattern.[0] && matchesAt data i pattern then found <- i
+            else i <- i + 1
+        found
+
+    /// First index of `pattern` in `data` at or after `start`, or -1.
+    let indexOf (pattern: byte[]) (data: byte[]) (start: int) =
+        indexOfBefore pattern data start data.Length
+
 [<AutoOpen>]
 module Compat =
     let bytesToAscii (data: byte[]) =
@@ -266,6 +289,82 @@ module Lexer =
 module Parser =
     open Lexer
 
+    /// Skip the EOL that follows the `stream` keyword (CRLF, LF, or a bare CR).
+    let skipStreamEol (s: LexState) =
+        match peek s with
+        | Some 13uy ->
+            advance s 1
+            if peek s = Some 10uy then advance s 1
+        | Some 10uy -> advance s 1
+        | _ -> ()
+
+    /// Read a stream body starting at s.Pos (just past the EOL after `stream`)
+    /// and consume the following `endstream`/`endobj`.
+    ///
+    /// A known /Length is trusted when `endstream` follows it (after optional
+    /// whitespace). Otherwise (no usable length, or a wrong one) the data runs
+    /// to the next `endstream`, less only the single EOL that precedes that
+    /// keyword: the data's own trailing CR/LF bytes are part of the stream
+    /// (compressed data often ends in one).
+    let readStreamData (s: LexState) (declared: int64 option) : byte[] =
+        let data = s.Data
+        let start = s.Pos
+        let endstreamAfter p =
+            let mutable q = p
+            while q < data.Length && isWhitespace data.[q] do q <- q + 1
+            Binary.matchesAt data q "endstream"B
+        let body =
+            match declared with
+            | Some n when n >= 0L && int64 start + n <= int64 data.Length && endstreamAfter (start + int n) ->
+                s.Pos <- start + int n
+                Binary.slice data start (int n)
+            | _ ->
+                match Binary.indexOf "endstream"B data start with
+                | -1 ->
+                    // No endstream at all: take the declared length if it fits, else the rest.
+                    let n =
+                        match declared with
+                        | Some n when n >= 0L && int64 start + n <= int64 data.Length -> int n
+                        | _ -> data.Length - start
+                    s.Pos <- start + n
+                    Binary.slice data start n
+                | found ->
+                    let mutable e = found
+                    if e > start && data.[e - 1] = 10uy then e <- e - 1
+                    if e > start && data.[e - 1] = 13uy then e <- e - 1
+                    s.Pos <- found
+                    Binary.slice data start (e - start)
+        skipWhitespaceAndComments s
+        if Binary.matchesAt data s.Pos "endstream"B then s.Pos <- s.Pos + 9
+        let saved = s.Pos
+        match nextToken s with
+        | TokKeyword "endobj" -> ()
+        | _ -> s.Pos <- saved
+        body
+
+    /// Finish an object body whose value `obj` has been parsed: a stream body
+    /// if `stream` follows, else the (optional) `endobj`. An indirect /Length is
+    /// resolved through `resolveLength` when the caller can.
+    let finishObjBody (resolveLength: PdfObj -> int64 option) (s: LexState) (obj: PdfObj) : PdfObj =
+        let saved = s.Pos
+        match nextToken s with
+        | TokKeyword "endobj" -> obj
+        | TokKeyword "stream" ->
+            match obj with
+            | PdfDict header ->
+                skipStreamEol s
+                let declared =
+                    match Map.tryFind "Length" header with
+                    | Some (PdfInt n) -> Some n
+                    | Some (PdfIndirect _ as r) -> resolveLength r
+                    | _ -> None
+                PdfStream (header, readStreamData s declared)
+            | _ -> failwith "Stream without dict header"
+        | _ ->
+            // A missing endobj is common in damaged files; the value stands.
+            s.Pos <- saved
+            obj
+
     let rec parseObj (s: LexState) : PdfObj =
         match nextToken s with
         | TokInt n -> PdfInt n
@@ -367,67 +466,36 @@ module Parser =
         | tok -> failwithf "Unexpected value token: %A" tok
 
     and parseObjBody (s: LexState) : PdfObj =
-        let obj = parseObj s
-        match nextToken s with
-        | TokKeyword "endobj" -> obj
-        | TokKeyword "stream" ->
-            match obj with
-            | PdfDict header ->
-                // Skip single newline after "stream"
-                match Lexer.peek s with
-                | Some 13uy ->
-                    Lexer.advance s 1
-                    if Lexer.peek s = Some 10uy then Lexer.advance s 1
-                | Some 10uy -> Lexer.advance s 1
-                | _ -> ()
-                let length =
-                    match Map.tryFind "Length" header with
-                    | Some (PdfInt n) -> int n
-                    | Some (PdfIndirect _) ->
-                        // Length is an indirect reference; scan forward for "endstream"
-                        let marker = "endstream"B
-                        let mutable found = -1
-                        let mutable p = s.Pos
-                        while found < 0 && p + marker.Length <= s.Data.Length do
-                            let mutable ok = true
-                            for j in 0..marker.Length - 1 do
-                                if s.Data.[p + j] <> marker.[j] then ok <- false
-                            if ok then found <- p
-                            else p <- p + 1
-                        if found > s.Pos then
-                            // Trim trailing whitespace before endstream
-                            let mutable e = found - 1
-                            while e > s.Pos && (s.Data.[e] = 10uy || s.Data.[e] = 13uy) do e <- e - 1
-                            e - s.Pos + 1
-                        else 0
-                    | _ -> 0
-                let data = Binary.slice s.Data s.Pos length
-                s.Pos <- s.Pos + length
-                // Skip to endstream
-                while Lexer.peek s |> Option.map (fun b -> b <> 101uy) |> Option.defaultValue false do
-                    Lexer.advance s 1
-                match nextToken s with
-                | TokKeyword "endstream" -> ()
-                | _ -> ()
-                match nextToken s with
-                | TokKeyword "endobj" -> ()
-                | _ -> ()
-                PdfStream (header, data)
-            | _ -> failwith "Stream without dict header"
-        | tok -> failwithf "Expected endobj, got %A" tok
+        finishObjBody (fun _ -> None) s (parseObj s)
 
-    let parseIndirectObj (s: LexState) expectedObjNum expectedGen =
+    /// Parse `n g obj ... endobj` at s.Pos, resolving an indirect stream
+    /// /Length through `resolveLength`.
+    let parseIndirectObjWith (resolveLength: PdfObj -> int64 option) (s: LexState) expectedObjNum (_expectedGen: int) =
         match nextToken s with
         | TokInt objNum ->
             if expectedObjNum >= 0 && int objNum <> expectedObjNum then
                 failwithf "Expected obj %d, got %d" expectedObjNum (int objNum)
             match nextToken s with
-            | TokInt gen ->
+            | TokInt _ ->
                 match nextToken s with
-                | TokKeyword "obj" -> parseObjBody s
+                | TokKeyword "obj" -> finishObjBody resolveLength s (parseObj s)
                 | tok -> failwithf "Expected obj, got %A" tok
             | tok -> failwithf "Expected gen, got %A" tok
         | tok -> failwithf "Expected objnum, got %A" tok
+
+    let parseIndirectObj (s: LexState) expectedObjNum expectedGen =
+        parseIndirectObjWith (fun _ -> None) s expectedObjNum expectedGen
+
+    /// True when `n g obj` starts at `pos` (after whitespace) for object `objNum`.
+    let objectHeaderAt (data: byte[]) (pos: int64) (objNum: int) =
+        if pos < 0L || pos >= int64 data.Length then false
+        else
+            let s = create data (int pos)
+            try
+                match nextToken s, nextToken s, nextToken s with
+                | TokInt n, TokInt _, TokKeyword "obj" -> int n = objNum
+                | _ -> false
+            with _ -> false
 
 module XRef =
     open Lexer
@@ -450,29 +518,50 @@ module XRef =
             if s.Pos < s.Data.Length && s.Data.[s.Pos] = 10uy then s.Pos <- s.Pos + 1
             line
 
+        let parseInt (text: string) =
+            match Int64.TryParse text with
+            | true, v -> Some v
+            | _ -> None
+
+        // Lenient: `trailer` may share a line with its dictionary (the caller
+        // parses the dictionary from s.Pos), entries are split on whitespace
+        // rather than read at fixed columns, and a subsection whose count
+        // overruns into `trailer` stops there. Anything else unparseable raises,
+        // and the caller falls back to reconstructing the xref.
         let rec parseSubsections () =
             skipWhitespaceAndComments s
-            let line = readLine ()
-            if line.StartsWith("trailer") then
-                ()
+            if Binary.matchesAt s.Data s.Pos "trailer"B then
+                s.Pos <- s.Pos + 7
+            elif s.Pos >= s.Data.Length then
+                failwith "xref table has no trailer"
             else
-                let parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                if parts.Length >= 2 then
-                    let startObj = Int32.Parse(parts.[0])
-                    let count = Int32.Parse(parts.[1])
+                let line = readLine ()
+                let parts = line.Split([| ' '; '\t'; '\012'; '\000' |], StringSplitOptions.RemoveEmptyEntries)
+                match parts |> Array.truncate 2 |> Array.map parseInt with
+                | [| Some startObj; Some count |] when startObj >= 0L && count >= 0L && startObj + count < 50_000_000L ->
+                    let startObj, count = int startObj, int count
                     xref <- ensureSize xref (startObj + count)
-                    for i in 0 .. count - 1 do
-                        let entryLine = readLine ()
-                        let objNum = startObj + i
-                        if objNum < xref.Length &&
-                           (match xref.[objNum] with Free (0, 0) -> true | _ -> false) then
-                            let pos = Int64.Parse(entryLine.[0..9])
-                            let gen = Int32.Parse(entryLine.[11..15])
-                            let typ = entryLine.[17]
-                            xref.[objNum] <-
-                                if typ = 'f' then Free (int pos, gen)
-                                else InUse (pos, gen, None)
+                    let mutable i = 0
+                    while i < count do
+                        skipWhitespaceAndComments s
+                        if Binary.matchesAt s.Data s.Pos "trailer"B then
+                            i <- count  // count overran the entries
+                        else
+                            let entryLine = readLine ()
+                            let fields = entryLine.Split([| ' '; '\t'; '\012'; '\000' |], StringSplitOptions.RemoveEmptyEntries)
+                            if fields.Length < 3 then failwithf "Malformed xref entry: %s" entryLine
+                            let objNum = startObj + i
+                            match parseInt fields.[0], parseInt fields.[1] with
+                            | Some pos, Some gen ->
+                                if objNum < xref.Length &&
+                                   (match xref.[objNum] with Free (0, 0) -> true | _ -> false) then
+                                    xref.[objNum] <-
+                                        if fields.[2].StartsWith "f" then Free (int pos, int gen)
+                                        else InUse (pos, int gen, None)
+                            | _ -> failwithf "Malformed xref entry: %s" entryLine
+                            i <- i + 1
                     parseSubsections ()
+                | _ -> failwithf "Malformed xref subsection: %s" line
 
         parseSubsections ()
         xref
@@ -736,99 +825,224 @@ module Pdf =
     let private emptyXRef size =
         Array.init size (fun _ -> Free (0, 0))
 
+    /// Offset of the `%PDF-` header. The spec lets it appear anywhere in the
+    /// first 1024 bytes (some producers prepend junk); -1 when absent.
+    let findHeader (data: byte[]) =
+        Binary.indexOfBefore "%PDF-"B data 0 1024
+
+    let private startXRefValue (data: byte[]) (pos: int) =
+        let s = Lexer.create data (pos + 9)
+        Lexer.skipWhitespaceAndComments s
+        match Lexer.nextToken s with
+        | TokInt n -> Some (int64 n)
+        | _ -> None
+
     let findStartXRef (data: byte[]) =
         let pattern = asciiBytes "startxref"
-        match Binary.findLastInRange pattern data 1024 with
-        | -1 -> failwith "No startxref found"
-        | pos ->
-            let s = Lexer.create data (pos + 9)
-            Lexer.skipWhitespaceAndComments s
-            match Lexer.nextToken s with
-            | TokInt n -> int64 n
-            | _ -> failwith "Invalid startxref"
+        let pos =
+            match Binary.findLastInRange pattern data 1024 with
+            | -1 -> Binary.findLast pattern data  // trailing junk after %%EOF
+            | pos -> pos
+        if pos < 0 then failwith "No startxref found"
+        match startXRefValue data pos with
+        | Some n -> n
+        | None -> failwith "Invalid startxref"
 
-    let openData (data: byte[]) : PdfDocument =
-        if data.Length < 8 || bytesToAscii data.[0..4] <> "%PDF-" then
-            failwith "Not a PDF file"
-
+    /// Follow startxref and the /Prev chain, reading xref tables and streams.
+    let private readXRefChain (data: byte[]) =
         let startXRef = findStartXRef data
         let mutable xref = emptyXRef 256  // grows as xref sections are parsed
         let mutable trailer = Map.empty
         let mutable xrefType = "table"
         let mutable prevXRef = Some startXRef
+        let visited = System.Collections.Generic.HashSet<int64>()
+
+        let readXRefStreamAt (pos: int64) =
+            if pos < 0L || pos >= int64 data.Length then failwithf "xref offset %d is outside the file" pos
+            let s = Lexer.create data (int pos)
+            match Lexer.nextToken s, Lexer.nextToken s, Lexer.nextToken s with
+            | TokInt _, TokInt _, TokKeyword "obj" ->
+                match parseObjBody s with
+                | PdfStream (header, rawData) ->
+                    let decoded = Streams.decodeStream header rawData
+                    xref <- XRef.parseXRefStream decoded header xref
+                    header
+                | _ -> failwithf "Object at xref offset %d is not an xref stream" pos
+            | _ -> failwithf "No xref at offset %d" pos
 
         while prevXRef.IsSome do
             let pos = prevXRef.Value
-            let s = Lexer.create data (int pos)
-            Lexer.skipWhitespaceAndComments s
-
-            match Lexer.nextToken s with
-            | TokKeyword "xref" ->
-                xrefType <- "table"
-                xref <- XRef.parseXRefTable s xref
-                let trailerObj = parseObj s
-                match trailerObj with
-                | PdfDict d ->
-                    if trailer.IsEmpty then trailer <- d
+            prevXRef <- None
+            if pos < 0L || pos >= int64 data.Length then failwithf "xref offset %d is outside the file" pos
+            if visited.Add pos then
+                let s = Lexer.create data (int pos)
+                Lexer.skipWhitespaceAndComments s
+                let keywordPos = s.Pos
+                match Lexer.nextToken s with
+                | TokKeyword "xref" ->
+                    xref <- XRef.parseXRefTable s xref
+                    match parseObj s with
+                    | PdfDict d ->
+                        if trailer.IsEmpty then trailer <- d
+                        // Hybrid files: a table plus an xref stream for compressed objects.
+                        match Map.tryFind "XRefStm" d with
+                        | Some (PdfInt n) when visited.Add n ->
+                            try readXRefStreamAt n |> ignore with _ -> ()
+                        | _ -> ()
+                        prevXRef <-
+                            match Map.tryFind "Prev" d with
+                            | Some (PdfInt n) -> Some n
+                            | _ -> None
+                    | _ -> failwith "xref table has no trailer dictionary"
+                | TokInt _ ->
+                    xrefType <- "stream"
+                    let header = readXRefStreamAt (int64 keywordPos)
+                    if trailer.IsEmpty then trailer <- header
                     prevXRef <-
-                        match Map.tryFind "Prev" d with
+                        match Map.tryFind "Prev" header with
                         | Some (PdfInt n) -> Some n
                         | _ -> None
-                | _ -> prevXRef <- None
-            | TokInt objNum ->
-                xrefType <- "stream"
-                match Lexer.nextToken s with
-                | TokInt gen ->
-                    match Lexer.nextToken s with
-                    | TokKeyword "obj" ->
-                        let obj = parseObjBody s
-                        match obj with
-                        | PdfStream (header, rawData) ->
-                            let decoded = Streams.decodeStream header rawData
-                            xref <- XRef.parseXRefStream decoded header xref
-                            if trailer.IsEmpty then trailer <- header
-                            prevXRef <-
-                                match Map.tryFind "Prev" header with
-                                | Some (PdfInt n) -> Some n
-                                | _ -> None
-                        | _ -> prevXRef <- None
-                    | _ -> prevXRef <- None
-                | _ -> prevXRef <- None
-            | _ -> prevXRef <- None
+                | tok -> failwithf "No xref at offset %d (found %A)" pos tok
+        xref, trailer, xrefType
 
-        let catalog =
-            match Map.tryFind "Root" trailer with
-            | Some cat -> cat
-            | _ -> failwith "No catalog found"
+    /// Every `n g obj` in the file, in file order, plus the trailer
+    /// dictionaries that follow `trailer` keywords, found by scanning the
+    /// bytes, as mutool and pdf.js do when the xref is unusable. Each object's
+    /// body is parsed to skip over it, so byte sequences inside stream data are
+    /// not mistaken for objects.
+    let scanObjects (data: byte[]) =
+        let objects = ResizeArray<int * int * int64 * PdfObj option>()
+        let trailers = ResizeArray<Map<string, PdfObj>>()
+        let isRegular b = not (isWhitespace b || isDelimiter b)
+        let readInt (pos: int) =
+            let mutable e = pos
+            let mutable v = 0L
+            while e < data.Length && isDigit data.[e] && e - pos < 10 do
+                v <- v * 10L + int64 (data.[e] - 48uy)
+                e <- e + 1
+            if e = pos || (e < data.Length && isDigit data.[e]) then None else Some (v, e)
+        let skipWs (pos: int) =
+            let mutable p = pos
+            while p < data.Length && isWhitespace data.[p] do p <- p + 1
+            p
+        let mutable i = 0
+        while i < data.Length do
+            let b = data.[i]
+            let boundary = i = 0 || not (isRegular data.[i - 1])
+            if boundary && isDigit b then
+                let header =
+                    match readInt i with
+                    | Some (num, e1) when e1 < data.Length && isWhitespace data.[e1] ->
+                        match readInt (skipWs e1) with
+                        | Some (gen, e2) when e2 < data.Length && isWhitespace data.[e2] ->
+                            let k = skipWs e2
+                            if Binary.matchesAt data k "obj"B && (k + 3 >= data.Length || not (isRegular data.[k + 3])) then
+                                Some (int num, int gen, k + 3)
+                            else None
+                        | _ -> None
+                    | _ -> None
+                match header with
+                | Some (num, gen, bodyStart) ->
+                    let s = Lexer.create data bodyStart
+                    let parsed =
+                        try Some (finishObjBody (fun _ -> None) s (parseObj s))
+                        with _ -> None
+                    objects.Add((num, gen, int64 i, parsed))
+                    i <- (match parsed with Some _ when s.Pos > bodyStart -> s.Pos | _ -> bodyStart)
+                | None -> i <- i + 1
+            elif boundary && b = 116uy && Binary.matchesAt data i "trailer"B then
+                let s = Lexer.create data (i + 7)
+                match (try Some (parseObj s) with _ -> None) with
+                | Some (PdfDict d) ->
+                    trailers.Add d
+                    i <- s.Pos
+                | _ -> i <- i + 7
+            else i <- i + 1
+        objects, trailers
 
-        {
-            Data = data
-            XRef = xref
-            XRefType = xrefType
-            Trailer = trailer
-            Catalog = catalog
-            Modified = Set.empty
-        }
-
-    let openFile (path: string) =
-#if FABLE_COMPILER
-        failwith "Pdf.openFile is not available in Fable; use openData with caller-provided bytes."
-#else
-        File.ReadAllBytes(path) |> openData
-#endif
+    /// Rebuild the cross-reference table (and a trailer) from a byte scan.
+    let reconstructXRef (data: byte[]) =
+        let objects, trailers = scanObjects data
+        let maxNum = objects |> Seq.fold (fun m (n, _, _, _) -> max m n) 0
+        let mutable xref = emptyXRef (maxNum + 1)
+        // Later definitions win, as in an incrementally updated file.
+        for (num, gen, pos, _) in objects do
+            if num > 0 then xref.[num] <- InUse (pos, gen, None)
+        let typeOf (obj: PdfObj option) =
+            match obj with
+            | Some (PdfDict d) | Some (PdfStream (d, _)) ->
+                match Map.tryFind "Type" d with
+                | Some (PdfName t) -> t
+                | _ -> ""
+            | _ -> ""
+        // Objects inside object streams, where no direct definition exists.
+        let direct = objects |> Seq.map (fun (n, _, _, _) -> n) |> Set.ofSeq
+        for (streamNum, _, _, parsed) in objects do
+            match parsed with
+            | Some (PdfStream (header, raw)) when typeOf parsed = "ObjStm" ->
+                try
+                    let decoded = Streams.decodeStream header raw
+                    let n = match Map.tryFind "N" header with Some (PdfInt n) -> int n | _ -> 0
+                    let s = Lexer.create decoded 0
+                    for index in 0 .. n - 1 do
+                        match Lexer.nextToken s, Lexer.nextToken s with
+                        | TokInt num, TokInt _ when int num > 0 && not (direct.Contains (int num)) ->
+                            xref <- XRef.ensureSize xref (int num + 1)
+                            xref.[int num] <- Compressed (streamNum, index)
+                        | _ -> ()
+                with _ -> ()
+            | _ -> ()
+        xref.[0] <- Free (0, 65535)
+        // Trailer: the last one naming a catalog, from `trailer` keywords or
+        // xref-stream headers; else the last /Type /Catalog object.
+        let xrefHeaders =
+            objects |> Seq.choose (fun (_, _, _, parsed) ->
+                match parsed with
+                | Some (PdfStream (header, _)) when typeOf parsed = "XRef" -> Some header
+                | _ -> None)
+        let candidates = Seq.append trailers xrefHeaders |> Seq.filter (fun t -> t.ContainsKey "Root") |> List.ofSeq
+        let trailer =
+            match List.tryLast candidates with
+            | Some t -> t |> Map.filter (fun k _ -> k = "Root" || k = "Info" || k = "ID" || k = "Encrypt")
+            | None ->
+                match objects |> Seq.filter (fun (_, _, _, parsed) -> typeOf parsed = "Catalog") |> Seq.tryLast with
+                | Some (num, gen, _, _) -> Map.ofList [ "Root", PdfIndirect (num, gen) ]
+                | None -> Map.empty
+        xref, trailer
 
     let rec deref (doc: PdfDocument) (obj: PdfObj) : PdfObj =
         match obj with
-        | PdfIndirect (objNum, gen) ->
-            if objNum >= doc.XRef.Length then PdfNull
+        | PdfIndirect (objNum, _) ->
+            if objNum < 0 || objNum >= doc.XRef.Length then PdfNull
             else
                 match doc.XRef.[objNum] with
                 | Free _ -> PdfNull
                 | InUse (_, _, Some cached) -> cached
                 | InUse (pos, g, None) ->
-                    let s = Lexer.create doc.Data (int pos)
-                    let loaded = Parser.parseIndirectObj s objNum g
-                    doc.XRef.[objNum] <- InUse (pos, g, Some loaded)
+                    let parseAt (pos: int64) =
+                        if pos < 0L || pos >= int64 doc.Data.Length then failwith "object offset outside the file"
+                        let s = Lexer.create doc.Data (int pos)
+                        let resolveLength (lengthRef: PdfObj) =
+                            match lengthRef with
+                            | PdfIndirect (n, _) when n = objNum -> None
+                            | _ ->
+                                match deref doc lengthRef with
+                                | PdfInt n -> Some n
+                                | _ -> None
+                        Parser.parseIndirectObjWith resolveLength s objNum g
+                    let loaded =
+                        try parseAt pos
+                        with _ ->
+                            // The xref entry is wrong: rebuild the table by scanning and retry.
+                            repairXRef doc
+                            match doc.XRef.[objNum] with
+                            | InUse (pos2, _, None) when pos2 <> pos -> (try parseAt pos2 with _ -> PdfNull)
+                            | InUse (_, _, Some cached) -> cached
+                            | Compressed _ -> deref doc obj
+                            | _ -> PdfNull
+                    match doc.XRef.[objNum] with
+                    | InUse (p, g2, _) -> doc.XRef.[objNum] <- InUse (p, g2, Some loaded)
+                    | _ -> ()
                     loaded
                 | Compressed (streamObj, index) ->
                     // Guard against cyclic object-stream references (a malformed
@@ -863,12 +1077,82 @@ module Pdf =
                         if index < n then
                             let _, off = offsets.[index]
                             let s2 = Lexer.create decoded (first + off)
-                            let loaded = Parser.parseObj s2
+                            let loaded = try Parser.parseObj s2 with _ -> PdfNull
                             doc.XRef.[objNum] <- InUse (0L, 0, Some loaded)
                             loaded
                         else PdfNull
                     | _ -> PdfNull
         | _ -> obj
+
+    /// Replace every unloaded xref entry whose offset does not hold its object
+    /// with the position found by a byte scan (or a null object when the scan
+    /// has none), and add scanned objects the xref lacks. After a repair every
+    /// entry is valid, so a document is scanned at most once.
+    and repairXRef (doc: PdfDocument) =
+        let scanned, _ = reconstructXRef doc.Data
+        let xref = XRef.ensureSize doc.XRef scanned.Length
+        for num in 1 .. xref.Length - 1 do
+            let fromScan = if num < scanned.Length then Some scanned.[num] else None
+            match xref.[num] with
+            | InUse (pos, gen, None) when not (Parser.objectHeaderAt doc.Data pos num) ->
+                xref.[num] <-
+                    match fromScan with
+                    | Some (InUse _ as e) | Some (Compressed _ as e) -> e
+                    | _ -> InUse (pos, gen, Some PdfNull)
+            | Free (0, 0) ->
+                match fromScan with
+                | Some (InUse _ as e) | Some (Compressed _ as e) -> xref.[num] <- e
+                | _ -> ()
+            | _ -> ()
+        doc.XRef <- xref
+
+    let openData (data: byte[]) : PdfDocument =
+        let offset = findHeader data
+        if offset < 0 || data.Length - offset < 8 then
+            failwith "Not a PDF file"
+        // Offsets are relative to the header, so drop anything before it.
+        let data = if offset > 0 then Array.sub data offset (data.Length - offset) else data
+
+        let fromChain =
+            try
+                let xref, trailer, xrefType = readXRefChain data
+                if trailer.ContainsKey "Root" then Some (xref, trailer, xrefType) else None
+            with _ -> None
+
+        let build (xref, trailer: Map<string, PdfObj>, xrefType) =
+            match Map.tryFind "Root" trailer with
+            | Some catalog ->
+                Some {
+                    Data = data
+                    XRef = xref
+                    XRefType = xrefType
+                    Trailer = trailer
+                    Catalog = catalog
+                    Modified = Set.empty
+                }
+            | None -> None
+
+        let isCatalog (doc: PdfDocument) =
+            match (try deref doc doc.Catalog with _ -> PdfNull) with
+            | PdfDict d -> d.ContainsKey "Pages" || Map.tryFind "Type" d = Some (PdfName "Catalog")
+            | _ -> false
+
+        // deref repairs individual bad offsets itself; reconstruct outright when
+        // the xref chain is unreadable or its catalog does not resolve.
+        match fromChain |> Option.bind build with
+        | Some doc when isCatalog doc -> doc
+        | _ ->
+            let xref, trailer = reconstructXRef data
+            match build (xref, trailer, "table") with
+            | Some doc -> doc
+            | None -> failwith "No catalog found"
+
+    let openFile (path: string) =
+#if FABLE_COMPILER
+        failwith "Pdf.openFile is not available in Fable; use openData with caller-provided bytes."
+#else
+        File.ReadAllBytes(path) |> openData
+#endif
 
     let dictGet (doc: PdfDocument) (key: string) (obj: PdfObj) =
         match deref doc obj with
@@ -922,16 +1206,49 @@ module Pdf =
     let getPage (doc: PdfDocument) (pageNum: int) =
         findPage doc (getPages doc) pageNum 1
 
+    /// An inheritable page attribute (MediaBox, CropBox, Resources, Rotate):
+    /// the page's own, else the nearest ancestor's. A cyclic /Parent chain ends
+    /// the search.
     let getPageInheritable (doc: PdfDocument) (pageRef: PdfObj) (name: string) =
-        let rec search node =
-            let n = deref doc node
-            match dictGet doc name n with
-            | Some v -> Some v
-            | None ->
-                match dictGet doc "Parent" n with
-                | Some parent -> search parent
-                | None -> None
-        search pageRef
+        let rec search depth node =
+            if depth > 64 then None
+            else
+                let n = deref doc node
+                match dictGet doc name n with
+                | Some v -> Some v
+                | None ->
+                    match dictGet doc "Parent" n with
+                    | Some parent -> search (depth + 1) parent
+                    | None -> None
+        search 0 pageRef
+
+    /// Leaf page refs in document order, found by walking /Kids (a stale
+    /// /Count is ignored). Cyclic or implausibly deep branches are skipped.
+    /// Leaves missing /Type /Page are accepted.
+    let getPageRefs (doc: PdfDocument) : PdfObj list =
+        let pages = ResizeArray<PdfObj>()
+        let seen = System.Collections.Generic.HashSet<int>()
+        let rec walk depth (node: PdfObj) =
+            let fresh =
+                match node with
+                | PdfIndirect (num, _) -> seen.Add num
+                | _ -> true
+            if fresh && depth <= 64 then
+                match deref doc node with
+                | PdfDict d ->
+                    match Map.tryFind "Type" d |> Option.map (deref doc) with
+                    | Some (PdfName "Pages") ->
+                        match Map.tryFind "Kids" d |> Option.map (deref doc) with
+                        | Some (PdfArray kids) -> for kid in kids do walk (depth + 1) kid
+                        | _ -> ()
+                    | Some (PdfName "Page") -> pages.Add node
+                    | _ ->
+                        match Map.tryFind "Kids" d |> Option.map (deref doc) with
+                        | Some (PdfArray kids) -> for kid in kids do walk (depth + 1) kid
+                        | _ -> pages.Add node
+                | _ -> ()
+        walk 0 (getPages doc)
+        List.ofSeq pages
 
     let getStreamData (doc: PdfDocument) (obj: PdfObj) =
         match deref doc obj with
@@ -4360,86 +4677,126 @@ module Table =
 module Operations =
     open System.IO
 
-    /// Deep copy an object from source to destination, remapping indirect refs
-    let rec private copyObject (src: PdfDocument) (dst: PdfDocument) (objMap: System.Collections.Generic.Dictionary<int, int>) (obj: PdfObj) : PdfObj =
-        match obj with
-        | PdfIndirect (objNum, gen) ->
-            if objMap.ContainsKey(objNum) then
-                PdfIndirect (objMap.[objNum], 0)
-            else
-                // Copy the referenced object
-                let resolved = Pdf.deref src obj
-                let copiedObj = copyObject src dst objMap resolved
-                let newRef = Write.newIndirectObj dst copiedObj
-                match newRef with
-                | PdfIndirect (newObjNum, _) ->
-                    objMap.[objNum] <- newObjNum
-                    newRef
-                | _ -> newRef
-        | PdfArray items ->
-            PdfArray (items |> List.map (copyObject src dst objMap))
-        | PdfDict d ->
-            PdfDict (d |> Map.map (fun _ v -> copyObject src dst objMap v))
-        | PdfStream (header, data) ->
-            let newHeader = header |> Map.map (fun _ v -> copyObject src dst objMap v)
-            PdfStream (newHeader, data)
-        | other -> other
+    /// Page attributes a page may inherit from its ancestors in the page tree.
+    let private inheritableKeys = [ "MediaBox"; "CropBox"; "Resources"; "Rotate" ]
 
-    /// Copy a page from source to destination document, returns the new page ref
-    let private copyPage (src: PdfDocument) (dst: PdfDocument) (objMap: System.Collections.Generic.Dictionary<int, int>) (pageRef: PdfObj) : PdfObj =
-        let page = Pdf.deref src pageRef
-        match page with
-        | PdfDict d ->
-            // Copy page dict, excluding Parent (will be set later)
-            let copied = d |> Map.filter (fun k _ -> k <> "Parent") |> Map.map (fun _ v -> copyObject src dst objMap v)
-            Write.newIndirectObj dst (PdfDict copied)
-        | _ -> failwith "Invalid page object"
+    let private isPageNode (src: PdfDocument) (d: Map<string, PdfObj>) =
+        match Map.tryFind "Type" d |> Option.map (Pdf.deref src) with
+        | Some (PdfName "Page") | Some (PdfName "Pages") -> true
+        | _ -> false
 
-    /// Get the total page count (delegates to Pdf.getPageCount)
-    let private pageCount (doc: PdfDocument) : int = Pdf.getPageCount doc
+    /// Builds a new document from pages copied out of source documents.
+    ///
+    /// Copied pages carry their inherited attributes (MediaBox, CropBox,
+    /// Resources, Rotate from ancestor Pages nodes). Indirect objects are
+    /// copied through a work queue, each source object once, so reference
+    /// cycles (an annotation's /P back to its page, /Parent chains) and long
+    /// reference chains neither loop nor overflow the stack. References to
+    /// pages that are not being copied, and to page-tree nodes, become null
+    /// rather than dragging the rest of the source document along.
+    type private PageCopier() =
+        let xref = ResizeArray<XRefEntry>([ Free (0, 65535); InUse (0L, 0, Some PdfNull) ])
+        let kids = ResizeArray<PdfObj>()
+        let reserve () =
+            xref.Add(InUse (0L, 0, Some PdfNull))
+            xref.Count - 1
+        let set (num: int) (obj: PdfObj) = xref.[num] <- InUse (0L, 0, Some obj)
 
-    /// Extract specific pages from a PDF (1-indexed)
-    let extractPages (doc: PdfDocument) (pageNums: int list) : PdfDocument =
-        let newDoc = Write.createNew ()
-        let objMap = System.Collections.Generic.Dictionary<int, int>()
-        let totalPages = pageCount doc
+        member _.PageCount = kids.Count
 
-        let copiedPages =
-            pageNums
-            |> List.filter (fun n -> n >= 1 && n <= totalPages)
-            |> List.choose (fun n ->
-                match Pdf.getPage doc n with
-                | Some pageRef -> Some (copyPage doc newDoc objMap pageRef)
-                | None -> None)
+        /// Copy `pages` (page refs of `src`) in order.
+        member _.CopyPages(src: PdfDocument, pages: PdfObj list) =
+            let map = System.Collections.Generic.Dictionary<int, int>()
+            let nulls = System.Collections.Generic.HashSet<int>()
+            let queue = System.Collections.Generic.Queue<int * int>()
+            // Map copied pages first so links and annotations land on the copies.
+            let targets =
+                pages |> List.map (fun pageRef ->
+                    let dst = reserve ()
+                    match pageRef with
+                    | PdfIndirect (num, _) when not (map.ContainsKey num) -> map.[num] <- dst
+                    | _ -> ()
+                    pageRef, dst)
+            let rec copy (obj: PdfObj) : PdfObj =
+                match obj with
+                | PdfIndirect (num, _) ->
+                    match map.TryGetValue num with
+                    | true, dst -> PdfIndirect (dst, 0)
+                    | _ when nulls.Contains num -> PdfNull
+                    | _ ->
+                        match Pdf.deref src obj with
+                        | PdfDict d when isPageNode src d ->
+                            nulls.Add num |> ignore
+                            PdfNull
+                        | _ ->
+                            let dst = reserve ()
+                            map.[num] <- dst
+                            queue.Enqueue((num, dst))
+                            PdfIndirect (dst, 0)
+                | PdfArray items -> PdfArray (items |> List.map copy)
+                | PdfDict d -> PdfDict (d |> Map.map (fun _ v -> copy v))
+                | PdfStream (header, data) -> PdfStream (header |> Map.map (fun _ v -> copy v), data)
+                | other -> other
+            for pageRef, dst in targets do
+                match Pdf.deref src pageRef with
+                | PdfDict d ->
+                    let withInherited =
+                        inheritableKeys |> List.fold (fun (acc: Map<string, PdfObj>) key ->
+                            if acc.ContainsKey key then acc
+                            else
+                                match Pdf.getPageInheritable src pageRef key with
+                                | Some v -> acc.Add(key, v)
+                                | None -> acc) d
+                    let withInherited =
+                        if withInherited.ContainsKey "MediaBox" then withInherited
+                        else withInherited.Add("MediaBox", PdfArray [ PdfInt 0L; PdfInt 0L; PdfInt 612L; PdfInt 792L ])
+                    let copied =
+                        withInherited
+                        |> Map.remove "Parent"
+                        |> Map.add "Type" (PdfName "Page")
+                        |> Map.map (fun _ v -> copy v)
+                    set dst (PdfDict copied)
+                    kids.Add(PdfIndirect (dst, 0))
+                | _ -> failwith "Invalid page object"
+                while queue.Count > 0 do
+                    let num, dst = queue.Dequeue()
+                    set dst (copy (Pdf.deref src (PdfIndirect (num, 0))))
 
-        // Build Pages tree
-        let pagesDict = PdfDict (Map.ofList [
-            ("Type", PdfName "Pages")
-            ("Kids", PdfArray copiedPages)
-            ("Count", PdfInt (int64 (List.length copiedPages)))
-        ])
-        let pagesRef = Write.newIndirectObj newDoc pagesDict
-
-        // Set Parent on each page
-        for pageRef in copiedPages do
-            match pageRef with
-            | PdfIndirect (objNum, _) ->
-                match newDoc.XRef.[objNum] with
-                | InUse (pos, gen, Some (PdfDict d)) ->
-                    Write.setObj newDoc objNum (PdfDict (d |> Map.add "Parent" pagesRef))
+        /// The finished document: catalog (object 1), one flat Pages node, and
+        /// every copied object, all marked for writing.
+        member _.ToDocument() : PdfDocument =
+            let pagesNum = reserve ()
+            set pagesNum (PdfDict (Map.ofList [
+                "Type", PdfName "Pages"
+                "Kids", PdfArray (List.ofSeq kids)
+                "Count", PdfInt (int64 kids.Count) ]))
+            for kid in kids do
+                match kid with
+                | PdfIndirect (num, _) ->
+                    match xref.[num] with
+                    | InUse (_, _, Some (PdfDict d)) -> set num (PdfDict (d.Add("Parent", PdfIndirect (pagesNum, 0))))
+                    | _ -> ()
                 | _ -> ()
-            | _ -> ()
+            set 1 (PdfDict (Map.ofList [ "Type", PdfName "Catalog"; "Pages", PdfIndirect (pagesNum, 0) ]))
+            {
+                Data = Array.empty
+                XRef = xref.ToArray()
+                XRefType = "table"
+                Trailer = Map.empty
+                Catalog = PdfIndirect (1, 0)
+                Modified = Set.ofSeq [ 0 .. xref.Count - 1 ]
+            }
 
-        // Update catalog
-        match newDoc.Catalog with
-        | PdfIndirect (objNum, _) ->
-            Write.setObj newDoc objNum (PdfDict (Map.ofList [
-                ("Type", PdfName "Catalog")
-                ("Pages", pagesRef)
-            ]))
-        | _ -> ()
+    /// Get the total page count (walks the page tree)
+    let private pageCount (doc: PdfDocument) : int = Pdf.getPageRefs doc |> List.length
 
-        newDoc
+    /// Extract specific pages from a PDF (1-indexed); out-of-range numbers are skipped.
+    let extractPages (doc: PdfDocument) (pageNums: int list) : PdfDocument =
+        let all = Pdf.getPageRefs doc |> Array.ofList
+        let copier = PageCopier()
+        let pages = pageNums |> List.filter (fun n -> n >= 1 && n <= all.Length) |> List.map (fun n -> all.[n - 1])
+        copier.CopyPages(doc, pages)
+        copier.ToDocument()
 
     /// Split a PDF at given page numbers, returning multiple documents
     /// splitAt = [3; 5] splits into pages 1-2, 3-4, 5-end
@@ -4457,27 +4814,23 @@ module Operations =
     let rotatePages (doc: PdfDocument) (pageNums: int list) (degrees: int) : unit =
         if degrees % 90 <> 0 then failwith "Rotation must be multiple of 90"
         let normalizedRotation = ((degrees % 360) + 360) % 360
-        let totalPages = pageCount doc
+        let all = Pdf.getPageRefs doc |> Array.ofList
 
         for pageNum in pageNums do
-            if pageNum >= 1 && pageNum <= totalPages then
-                match Pdf.getPage doc pageNum with
-                | Some pageRef ->
-                    match pageRef with
-                    | PdfIndirect (objNum, _) ->
-                        let parsed = Pdf.deref doc pageRef
-                        match parsed with
-                        | PdfDict d ->
-                            let currentRotation =
-                                match Map.tryFind "Rotate" d with
-                                | Some (PdfInt r) -> int r
-                                | _ -> 0
-                            let newRotation = (currentRotation + normalizedRotation) % 360
-                            let updated = d |> Map.add "Rotate" (PdfInt (int64 newRotation))
-                            Write.setObj doc objNum (PdfDict updated)
-                        | _ -> ()
+            if pageNum >= 1 && pageNum <= all.Length then
+                match all.[pageNum - 1] with
+                | PdfIndirect (objNum, _) as pageRef ->
+                    match Pdf.deref doc pageRef with
+                    | PdfDict d ->
+                        let currentRotation =
+                            match Pdf.getPageInheritable doc pageRef "Rotate" with
+                            | Some (PdfInt r) -> int r
+                            | _ -> 0
+                        let newRotation = (currentRotation + normalizedRotation) % 360
+                        let updated = d |> Map.add "Rotate" (PdfInt (int64 newRotation))
+                        Write.setObj doc objNum (PdfDict updated)
                     | _ -> ()
-                | None -> ()
+                | _ -> ()
 
     /// Delete pages from document (1-indexed)
     let deletePages (doc: PdfDocument) (pageNums: int list) : PdfDocument =
@@ -4491,48 +4844,10 @@ module Operations =
 
     /// Merge multiple PDFs into one
     let merge (docs: PdfDocument list) : PdfDocument =
-        let newDoc = Write.createNew ()
-        let objMap = System.Collections.Generic.Dictionary<int, int>()
-
-        let allPages =
-            docs
-            |> List.collect (fun doc ->
-                objMap.Clear()  // Fresh mapping per source doc
-                let pc = pageCount doc
-                [1..pc]
-                |> List.choose (fun n ->
-                    match Pdf.getPage doc n with
-                    | Some pageRef -> Some (copyPage doc newDoc objMap pageRef)
-                    | None -> None))
-
-        // Build Pages tree
-        let pagesDict = PdfDict (Map.ofList [
-            ("Type", PdfName "Pages")
-            ("Kids", PdfArray allPages)
-            ("Count", PdfInt (int64 (List.length allPages)))
-        ])
-        let pagesRef = Write.newIndirectObj newDoc pagesDict
-
-        // Set Parent on each page
-        for pageRef in allPages do
-            match pageRef with
-            | PdfIndirect (objNum, _) ->
-                match newDoc.XRef.[objNum] with
-                | InUse (pos, gen, Some (PdfDict d)) ->
-                    Write.setObj newDoc objNum (PdfDict (d |> Map.add "Parent" pagesRef))
-                | _ -> ()
-            | _ -> ()
-
-        // Update catalog
-        match newDoc.Catalog with
-        | PdfIndirect (objNum, _) ->
-            Write.setObj newDoc objNum (PdfDict (Map.ofList [
-                ("Type", PdfName "Catalog")
-                ("Pages", pagesRef)
-            ]))
-        | _ -> ()
-
-        newDoc
+        let copier = PageCopier()
+        for doc in docs do
+            copier.CopyPages(doc, Pdf.getPageRefs doc)
+        copier.ToDocument()
 
     /// Merge PDFs from byte arrays
     let mergeBytes (pdfBytes: byte[] list) : byte[] =

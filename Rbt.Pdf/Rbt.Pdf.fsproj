@@ -9,7 +9,12 @@
   <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
     <ProjectReference Include="../../rbt-text/opentype/Rbt.OpenType.Core.fsproj" />
   </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true'">
+  <!-- Development builds use the sibling checkout; published packages depend on
+       the released package (an exact, existing version, not this repo's). -->
+  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true' and '$(ForgePublish)' != 'true'">
     <ProjectReference Include="../../rbt-text/opentype/Rbt.OpenType.fsproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true' and '$(ForgePublish)' == 'true'">
+    <PackageReference Include="Rbt.OpenType" Version="0.1.1" />
   </ItemGroup>
 </Project>

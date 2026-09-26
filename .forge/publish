@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Build and publish Rbt.Pdf and Rbt.Pdf.Render NuGet packages to the Forge registry.
+"""Build and publish this repository's NuGet packages to the Forge registry.
 
-Runs inside the Forge publish-action shell. The coordinator injects
-FORGE_PACKAGE_SOURCE (registry v3 index URL) and FORGE_PACKAGE_API_KEYS
-(JSON prefix->token map). Version comes from FORGE_VERSION (the pushed tag).
+Runs inside the Forge publish-action shell as the sole checkout. Sibling-repo
+ProjectReferences (Rbt.OpenType, Rbt.Renderer) become PackageReferences under
+ForgePublish=true (Directory.Build.targets) and restore from the Forge registry
+(through the sandbox gateway, NUGET_REDBAT_SOURCE) or nuget.org. In-repo
+ProjectReferences (Rbt.Pdf.Render -> Rbt.Pdf) become package dependencies at
+the same version.
 
-Rbt.Pdf is a leaf (depends on Rbt.OpenType from nuget.org/registry).
-Rbt.Pdf.Render depends on Rbt.Pdf + Rbt.Renderer — we pack Rbt.Pdf first
-into a local folder feed so the second pack resolves it as a package dependency.
+The coordinator injects FORGE_PACKAGE_SOURCE (registry v3 index URL) and
+FORGE_PACKAGE_API_KEYS (JSON prefix->token map). FORGE_VERSION comes from the
+pushed version tag (refs/tags/vX.Y.Z). Re-publishing an existing immutable
+version returns HTTP 409, treated as a no-op so re-pushing a tag is safe.
 """
 from __future__ import annotations
 
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -21,9 +26,28 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+PREFIX = "Rbt.Pdf"
+PROJECTS = [
+    "Rbt.Pdf/Rbt.Pdf.fsproj",
+    # Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj joins once Rbt.Renderer publishes the
+    # API Render.fs uses (it does not build against Rbt.Renderer 0.1.1).
+]
+
 
 def fail(message: str) -> None:
     raise SystemExit(message)
+
+
+def run(command: list[str], **kwargs) -> None:
+    print("+ " + " ".join(command), flush=True)
+    # dotnet reports build and restore errors on stdout, but a failed action only
+    # records stderr; echo the output tail there so the failure explains itself.
+    completed = subprocess.run(command, capture_output=True, text=True, **kwargs)
+    sys.stdout.write(completed.stdout)
+    sys.stderr.write(completed.stderr)
+    if completed.returncode != 0:
+        tail = "\n".join((completed.stdout + completed.stderr).splitlines()[-60:])
+        fail(f"{command[0]} {command[1]} failed with exit code {completed.returncode}:\n{tail}")
 
 
 def main() -> int:
@@ -32,82 +56,78 @@ def main() -> int:
     version = os.environ.get("FORGE_VERSION", "").strip()
     if not version:
         fail("FORGE_VERSION is required (set by the publish action from the version tag)")
-
     source = os.environ.get("FORGE_PACKAGE_SOURCE")
     if not source:
         fail("FORGE_PACKAGE_SOURCE is required")
-
     try:
         api_keys = json.loads(os.environ.get("FORGE_PACKAGE_API_KEYS") or "{}")
     except json.JSONDecodeError as error:
         fail(f"FORGE_PACKAGE_API_KEYS is not valid JSON: {error}")
-    api_key = api_keys.get("Rbt.Pdf")
+    api_key = api_keys.get(PREFIX)
     if not api_key:
-        fail("FORGE_PACKAGE_API_KEYS has no Rbt.Pdf publisher token")
-
+        fail(f"FORGE_PACKAGE_API_KEYS has no {PREFIX} publisher token")
     source_sha = os.environ.get("FORGE_SOURCE_SHA", "")
 
-    workdir = Path(tempfile.mkdtemp(prefix="rbt-pdf-publish-"))
-    feed = workdir / "feed"
-    feed.mkdir()
+    # Out-of-tree work directory so the checkout stays clean.
+    workdir = Path(tempfile.mkdtemp(prefix=PREFIX.lower().replace(".", "-") + "-publish-"))
 
-    # NuGet config: nuget.org + the forge registry (for Rbt.OpenType, Rbt.Renderer)
-    # + local feed for inter-project deps
-    nuget_config = workdir / "NuGet.Config"
-    nuget_config.write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        "<configuration>\n"
-        "  <packageSources>\n"
-        "    <clear />\n"
-        f'    <add key="local-feed" value="{feed}" />\n'
-        f'    <add key="forge" value="{source}" />\n'
-        '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />\n'
-        "  </packageSources>\n"
-        "</configuration>\n",
-        encoding="utf-8",
-    )
+    # Rbt dependencies restore through the sandbox's credential-injecting gateway
+    # (declared with packages.read). The sandbox writes the canonical NuGet.Config
+    # for it; the gateway is plain HTTP, so any fallback config must allow that.
+    sandbox_config = Path("/workspace/NuGet.Config")
+    if sandbox_config.is_file():
+        nuget_config = sandbox_config
+    else:
+        restore_source = os.environ.get("NUGET_REDBAT_SOURCE") or source
+        insecure = ' allowInsecureConnections="true"' if restore_source.startswith("http://") else ""
+        nuget_config = workdir / "NuGet.Config"
+        nuget_config.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<configuration>\n"
+            "  <packageSources>\n"
+            "    <clear />\n"
+            f'    <add key="forge" value="{restore_source}"{insecure} />\n'
+            '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />\n'
+            "  </packageSources>\n"
+            "</configuration>\n",
+            encoding="utf-8",
+        )
 
-    common_args = [
-        "-c", "Release",
-        "--configfile", str(nuget_config),
-        f"-p:Version={version}",
-        f"-p:PackageVersion={version}",
-        f"-p:RepositoryCommit={source_sha}",
-        "-p:ContinuousIntegrationBuild=true",
-        "-p:IncludeSymbols=false",
-        "-p:ForgePublish=true",
-    ]
+    # MSBuild creates its own temp directories under TMPDIR; give it one we own so a
+    # sandbox TMPDIR that is missing or cleaned mid-run cannot fail the pack.
+    build_tmp = workdir / "tmp"
+    build_tmp.mkdir()
+    environment = dict(os.environ, TMPDIR=str(build_tmp), TMP=str(build_tmp), TEMP=str(build_tmp))
 
-    # 1. Pack Rbt.Pdf into the local feed
-    run(["dotnet", "pack", "Rbt.Pdf/Rbt.Pdf.fsproj", *common_args, "-o", str(feed)], cwd=repo)
-
-    # 2. Pack Rbt.Pdf.Render (picks up Rbt.Pdf from local feed)
-    output = workdir / "nupkg"
-    output.mkdir()
-    run(["dotnet", "pack", "Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj", *common_args, "-o", str(output)], cwd=repo)
-
-    # Move Rbt.Pdf package from feed to output for publishing
-    for pkg in feed.glob("*.nupkg"):
-        pkg.rename(output / pkg.name)
-
-    # Publish all packages
+    # Pack and push each project in dependency order, so Rbt.Pdf is published
+    # even if a later package (Rbt.Pdf.Render) fails to build.
     endpoint = publish_endpoint(source)
-    packages = sorted(output.glob("*.nupkg"))
-    if not packages:
-        fail("no packages were produced")
-
-    for package in packages:
-        push(package, endpoint, api_key, source_sha, version)
-
+    for index, project in enumerate(PROJECTS):
+        output = workdir / f"nupkg-{index}"
+        run(
+            [
+                "dotnet", "pack", project,
+                "-c", "Release",
+                "--configfile", str(nuget_config),
+                f"-p:Version={version}",
+                f"-p:PackageVersion={version}",
+                f"-p:RepositoryCommit={source_sha}",
+                "-p:ContinuousIntegrationBuild=true",
+                "-p:IncludeSymbols=false",
+                "-p:ForgePublish=true",
+                "-o", str(output),
+            ],
+            cwd=repo,
+            env=environment,
+        )
+        packages = sorted(path for path in output.glob("*.nupkg") if ".symbols." not in path.name)
+        if len(packages) != 1:
+            fail(f"expected one package from {project}, produced {[path.name for path in packages]}")
+        push(packages[0], endpoint, api_key, source_sha)
     return 0
 
 
-def run(command: list[str], **kwargs) -> None:
-    print("+ " + " ".join(command), flush=True)
-    subprocess.run(command, check=True, **kwargs)
-
-
-def push(package: Path, endpoint: str, api_key: str, source_sha: str, version: str) -> None:
+def push(package: Path, endpoint: str, api_key: str, source_sha: str) -> None:
     boundary = "----ForgePackage" + uuid.uuid4().hex
     prefix = (
         f"--{boundary}\r\n"
@@ -133,7 +153,7 @@ def push(package: Path, endpoint: str, api_key: str, source_sha: str, version: s
                 fail(f"publish returned HTTP {response.status}: {package.name}")
     except urllib.error.HTTPError as error:
         if error.code == 409:
-            print(f"{package.name} already published (409); no-op", flush=True)
+            print(f"{package.name} is already published (409); no-op", flush=True)
             return
         detail = error.read(4096).decode("utf-8", errors="replace")
         fail(f"publish failed with HTTP {error.code}: {package.name}\n{detail}")
