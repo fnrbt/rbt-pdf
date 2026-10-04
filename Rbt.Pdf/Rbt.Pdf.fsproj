@@ -17,4 +17,10 @@
   <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true' and '$(ForgePublish)' == 'true'">
     <PackageReference Include="Rbt.OpenType" Version="0.1.1" />
   </ItemGroup>
+  <!-- Ship the F# sources under fable/ so Fable can compile this library from
+       the NuGet package alone (for example in a Forge build sandbox). -->
+  <ItemGroup>
+    <Content Include="$(MSBuildProjectFullPath)" PackagePath="fable/" Pack="true" Visible="false" />
+    <Content Include="@(Compile)" PackagePath="fable/%(RelativeDir)" Pack="true" Visible="false" />
+  </ItemGroup>
 </Project>
