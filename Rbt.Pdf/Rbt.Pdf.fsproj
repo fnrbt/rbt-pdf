@@ -6,8 +6,11 @@
   <ItemGroup>
     <Compile Include="Rbt.Pdf.fs" />
   </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
+  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' != 'true'">
     <ProjectReference Include="../../rbt-text/opentype/Rbt.OpenType.Core.fsproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' == 'true'">
+    <PackageReference Include="Rbt.OpenType.Core" Version="$(RbtTextPackageVersion)" />
   </ItemGroup>
   <!-- Development builds use the sibling checkout; published packages depend on
        the released package (an exact, existing version, not this repo's). -->

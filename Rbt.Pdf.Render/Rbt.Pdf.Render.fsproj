@@ -11,8 +11,11 @@
   <ItemGroup>
     <ProjectReference Include="../Rbt.Pdf/Rbt.Pdf.fsproj" />
   </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
+  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' != 'true'">
     <ProjectReference Include="../../rbt-renderer/Rbt.Renderer.Core.fsproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' == 'true'">
+    <PackageReference Include="Rbt.Renderer.Core" Version="$(RbtRendererCorePackageVersion)" />
   </ItemGroup>
   <!-- Development builds use the sibling checkout; published packages depend on
        the released package (an exact, existing version, not this repo's). -->
