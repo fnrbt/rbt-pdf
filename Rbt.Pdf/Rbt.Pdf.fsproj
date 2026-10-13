@@ -6,18 +6,12 @@
   <ItemGroup>
     <Compile Include="Rbt.Pdf.fs" />
   </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' != 'true'">
-    <ProjectReference Include="../../rbt-text/opentype/Rbt.OpenType.Core.fsproj" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' == 'true'">
+  <!-- OpenType comes from the package registry: the Fable-safe variant for a
+       Fable build, the released package (an exact, existing version) for .NET. -->
+  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
     <PackageReference Include="Rbt.OpenType.Core" Version="$(RbtTextPackageVersion)" />
   </ItemGroup>
-  <!-- Development builds use the sibling checkout; published packages depend on
-       the released package (an exact, existing version, not this repo's). -->
-  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true' and '$(ForgePublish)' != 'true'">
-    <ProjectReference Include="../../rbt-text/opentype/Rbt.OpenType.fsproj" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true' and '$(ForgePublish)' == 'true'">
+  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true'">
     <PackageReference Include="Rbt.OpenType" Version="0.1.1" />
   </ItemGroup>
   <!-- Ship the F# sources under fable/ so Fable can compile this library from

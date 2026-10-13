@@ -11,10 +11,6 @@ actual_version="$(node -p "require('./package.json').version")"
     exit 1
 }
 
-# The sandbox has only this repository: take the sibling libraries from the
-# package registry (see Directory.Build.props).
-export ForgePublish=true
-
 # `dotnet tool restore` does not read RestoreConfigFile, so hand it the
 # sandbox's NuGet configuration explicitly.
 dotnet tool restore ${NUGET_CONFIG_FILE:+--configfile "$NUGET_CONFIG_FILE"}

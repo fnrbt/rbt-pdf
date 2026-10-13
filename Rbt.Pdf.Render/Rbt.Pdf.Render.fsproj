@@ -11,20 +11,12 @@
   <ItemGroup>
     <ProjectReference Include="../Rbt.Pdf/Rbt.Pdf.fsproj" />
   </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' != 'true'">
-    <ProjectReference Include="../../rbt-renderer/Rbt.Renderer.Core.fsproj" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true' and '$(ForgePublish)' == 'true'">
+  <!-- The renderer comes from the package registry: the Fable-safe subset for
+       a Fable build, the whole renderer for .NET. -->
+  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
     <PackageReference Include="Rbt.Renderer.Core" Version="$(RbtRendererCorePackageVersion)" />
   </ItemGroup>
-  <!-- Development builds use the sibling checkout; published packages depend on
-       the released package (an exact, existing version, not this repo's). -->
-  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true' and '$(ForgePublish)' != 'true'">
-    <ProjectReference Include="../../rbt-renderer/Rbt.Renderer.fsproj" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true' and '$(ForgePublish)' == 'true'">
-    <!-- Render.fs needs Rbt.Renderer API newer than 0.1.1 (the latest release), so
-         this package is not published until Rbt.Renderer is; bump then. -->
-    <PackageReference Include="Rbt.Renderer" Version="0.1.1" />
+  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true'">
+    <PackageReference Include="Rbt.Renderer" Version="$(RbtRendererPackageVersion)" />
   </ItemGroup>
 </Project>

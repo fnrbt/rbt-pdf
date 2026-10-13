@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build and publish this repository's NuGet packages to the Forge registry.
 
-Runs inside the Forge publish-action shell as the sole checkout. Sibling-repo
-ProjectReferences (Rbt.OpenType, Rbt.Renderer) become PackageReferences under
-ForgePublish=true (Directory.Build.targets) and restore from the Forge registry
-(through the sandbox gateway, NUGET_REDBAT_SOURCE) or nuget.org. In-repo
+Runs inside the Forge publish-action shell as the sole checkout. The libraries
+of other repositories (Rbt.OpenType, Rbt.Renderer) are PackageReferences and
+restore from the Forge registry (through the sandbox gateway,
+NUGET_REDBAT_SOURCE) or nuget.org. In-repo
 ProjectReferences (Rbt.Pdf.Render -> Rbt.Pdf) become package dependencies at
 the same version.
 
@@ -29,8 +29,8 @@ from pathlib import Path
 PREFIX = "Rbt.Pdf"
 PROJECTS = [
     "Rbt.Pdf/Rbt.Pdf.fsproj",
-    # Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj joins once Rbt.Renderer publishes the
-    # API Render.fs uses (it does not build against Rbt.Renderer 0.1.1).
+    # Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj is not published yet; it builds
+    # against Rbt.Renderer 0.1.4.
 ]
 
 
@@ -114,7 +114,6 @@ def main() -> int:
                 f"-p:RepositoryCommit={source_sha}",
                 "-p:ContinuousIntegrationBuild=true",
                 "-p:IncludeSymbols=false",
-                "-p:ForgePublish=true",
                 "-o", str(output),
             ],
             cwd=repo,

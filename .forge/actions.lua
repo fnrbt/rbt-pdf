@@ -27,7 +27,7 @@ return {
             output = "package",
             base = ".forge/publish-npm",
             packages = {
-                -- Restores the sibling libraries the viewer is compiled from.
+                -- Restores the Rbt libraries the viewer is compiled from.
                 read = {
                     { registry = "41021897", ecosystem = "nuget" },
                 },
