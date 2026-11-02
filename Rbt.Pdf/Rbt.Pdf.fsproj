@@ -6,13 +6,10 @@
   <ItemGroup>
     <Compile Include="Rbt.Pdf.fs" />
   </ItemGroup>
-  <!-- OpenType comes from the package registry: the Fable-safe variant for a
-       Fable build, the released package (an exact, existing version) for .NET. -->
-  <ItemGroup Condition="'$(FABLE_COMPILER)' == 'true'">
+  <!-- OpenType comes from the package registry: the cross-platform Core package,
+       which carries its F# sources for a Fable build. -->
+  <ItemGroup>
     <PackageReference Include="Rbt.OpenType.Core" Version="$(RbtTextPackageVersion)" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(FABLE_COMPILER)' != 'true'">
-    <PackageReference Include="Rbt.OpenType" Version="0.1.1" />
   </ItemGroup>
   <!-- Ship the F# sources under fable/ so Fable can compile this library from
        the NuGet package alone (for example in a Forge build sandbox). -->
