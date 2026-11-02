@@ -146,11 +146,29 @@ type RenderOptions =
 
 #if !FABLE_COMPILER
 module RenderOptions =
+    /// Where the native options look for the fallback font (NotoSans-Regular.ttf), in order: next to the binary,
+    /// in the current directory, in this repository's assets/. An application ships the font next to its binary;
+    /// __SOURCE_DIRECTORY__ is only meaningful on a dev machine, and a package build maps it to a placeholder path.
+    let fallbackFontCandidates () =
+        [ System.IO.Path.Combine(System.AppContext.BaseDirectory, "NotoSans-Regular.ttf")
+          System.IO.Path.Combine(System.Environment.CurrentDirectory, "NotoSans-Regular.ttf")
+          System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "../assets/NotoSans-Regular.ttf")) ]
+
+    // Loaded on first use, once.
     let private nativeOpts =
         lazy
-            let fontPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "../../rbt-renderer/NotoSans-Regular.ttf"))
+            let candidates = fallbackFontCandidates ()
+            let fontPath =
+                match candidates |> List.tryFind System.IO.File.Exists with
+                | Some path -> path
+                | None ->
+                    raise (System.IO.FileNotFoundException(
+                        "Rbt.Pdf.Render: fallback font NotoSans-Regular.ttf not found; looked in: " + String.concat ", " candidates,
+                        "NotoSans-Regular.ttf"))
             { FallbackFont = Text.loadFontFile fontPath
               DecodeJpeg = ImageDecode.decode }
+
+    /// Options for .NET: the fallback font from fallbackFontCandidates, JPEG decoding by ImageDecode.decode.
     let native () = nativeOpts.Value
 #endif
 

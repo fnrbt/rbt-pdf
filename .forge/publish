@@ -26,11 +26,12 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-PREFIX = "Rbt.Pdf"
+# Publisher prefix -> project. Forge allows one publish entry per registry and
+# ecosystem in an action, so each package is its own action (see actions.lua)
+# and this script is run once per package, with the package named as argument.
 PROJECTS = [
-    "Rbt.Pdf/Rbt.Pdf.fsproj",
-    # Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj is not published yet; it builds
-    # against Rbt.Renderer 0.1.4.
+    ("Rbt.Pdf", "Rbt.Pdf/Rbt.Pdf.fsproj"),
+    ("Rbt.Pdf.Render", "Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj"),
 ]
 
 
@@ -63,13 +64,16 @@ def main() -> int:
         api_keys = json.loads(os.environ.get("FORGE_PACKAGE_API_KEYS") or "{}")
     except json.JSONDecodeError as error:
         fail(f"FORGE_PACKAGE_API_KEYS is not valid JSON: {error}")
-    api_key = api_keys.get(PREFIX)
-    if not api_key:
-        fail(f"FORGE_PACKAGE_API_KEYS has no {PREFIX} publisher token")
+    selected = [entry for entry in PROJECTS if entry[0] in sys.argv[1:]]
+    if not selected:
+        fail(f"usage: publish <package>...; known packages: {', '.join(prefix for prefix, _ in PROJECTS)}")
+    for prefix, _ in selected:
+        if not api_keys.get(prefix):
+            fail(f"FORGE_PACKAGE_API_KEYS has no {prefix} publisher token")
     source_sha = os.environ.get("FORGE_SOURCE_SHA", "")
 
     # Out-of-tree work directory so the checkout stays clean.
-    workdir = Path(tempfile.mkdtemp(prefix=PREFIX.lower().replace(".", "-") + "-publish-"))
+    workdir = Path(tempfile.mkdtemp(prefix="rbt-pdf-publish-"))
 
     # Rbt dependencies restore through the sandbox's credential-injecting gateway
     # (declared with packages.read). The sandbox writes the canonical NuGet.Config
@@ -99,10 +103,11 @@ def main() -> int:
     build_tmp.mkdir()
     environment = dict(os.environ, TMPDIR=str(build_tmp), TMP=str(build_tmp), TEMP=str(build_tmp))
 
-    # Pack and push each project in dependency order, so Rbt.Pdf is published
-    # even if a later package (Rbt.Pdf.Render) fails to build.
+    # A project's in-repo references (Rbt.Pdf.Render -> Rbt.Pdf) are built from
+    # source and become package dependencies at the same version, published by
+    # their own actions.
     endpoint = publish_endpoint(source)
-    for index, project in enumerate(PROJECTS):
+    for index, (prefix, project) in enumerate(selected):
         output = workdir / f"nupkg-{index}"
         run(
             [
@@ -122,7 +127,7 @@ def main() -> int:
         packages = sorted(path for path in output.glob("*.nupkg") if ".symbols." not in path.name)
         if len(packages) != 1:
             fail(f"expected one package from {project}, produced {[path.name for path in packages]}")
-        push(packages[0], endpoint, api_key, source_sha)
+        push(packages[0], endpoint, api_keys[prefix], source_sha)
     return 0
 
 
