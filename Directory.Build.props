@@ -12,5 +12,6 @@
     <RbtTextPackageVersion Condition="'$(RbtTextPackageVersion)' == ''">0.1.6</RbtTextPackageVersion>
     <RbtRendererCorePackageVersion Condition="'$(RbtRendererCorePackageVersion)' == ''">0.1.4</RbtRendererCorePackageVersion>
     <RbtRendererPackageVersion Condition="'$(RbtRendererPackageVersion)' == ''">0.1.4</RbtRendererPackageVersion>
+    <RbtImagePackageVersion Condition="'$(RbtImagePackageVersion)' == ''">0.1.0</RbtImagePackageVersion>
   </PropertyGroup>
 </Project>

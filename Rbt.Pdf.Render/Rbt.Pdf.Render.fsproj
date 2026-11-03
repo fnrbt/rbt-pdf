@@ -4,12 +4,16 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="ImageDecode.fs" Condition="'$(FABLE_COMPILER)' != 'true'" />
+    <Compile Include="ImageDecode.fs" />
     <Compile Include="Fonts.fs" />
     <Compile Include="Render.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Rbt.Pdf/Rbt.Pdf.fsproj" />
+  </ItemGroup>
+  <!-- JPEG decoding (DCTDecode): managed, portable, carries its sources for Fable. -->
+  <ItemGroup>
+    <PackageReference Include="Rbt.Image" Version="$(RbtImagePackageVersion)" />
   </ItemGroup>
   <!-- The renderer comes from the package registry: the Fable-safe subset for
        a Fable build, the whole renderer for .NET. -->
