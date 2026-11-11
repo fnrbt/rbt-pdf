@@ -506,6 +506,59 @@
       "expected": "Top quadrants both show bright purple near (188,0,188). Bottom-left is near (94,128,94): half that display-space purple over green. Bottom-right is near (0,128,0): half-opacity Multiply over green. Untouched parent pixels must not make a profile roundtrip."
     },
     {
+      "id": "synth-icc-rgb-lut8-xyz-page",
+      "path": "generated/synth-icc-rgb-lut8-xyz-page.pdf",
+      "sha256": "5ed0445ed8a6886b2b1296cc367e3dbdfdb46382bbab6765f98c89fd5c289256",
+      "bytes": 5124,
+      "tags": [
+        "icc",
+        "lut",
+        "xyz",
+        "transparency",
+        "page-group",
+        "image",
+        "shading",
+        "pattern"
+      ],
+      "description": "Bidirectional RGB lut8 XYZ page space, with four source paint types composited as encoded components.",
+      "expected": "At (50,50), (150,50), (50,150), (150,150) all four source paints produce the LittleCMS color of encoded RGB (0.5,0,0.5), not half the separately displayed red and blue."
+    },
+    {
+      "id": "synth-icc-rgb-lut16-lab-forms",
+      "path": "generated/synth-icc-rgb-lut16-lab-forms.pdf",
+      "sha256": "049bbf4e775965da0e9f3f7d3220bb45ae4504bd76f76a70d2c6736fd0232623",
+      "bytes": 7055,
+      "tags": [
+        "icc",
+        "lut",
+        "lab",
+        "xyz",
+        "transparency",
+        "form",
+        "soft-mask",
+        "blend-mode",
+        "opacity"
+      ],
+      "description": "RGB lut16 Lab Form with same-space nested group, distinct RGB lut8 XYZ nested group, non-isolated backdrop, and opacity/blend/mask boundaries.",
+      "expected": "Top-left (50,50) is LittleCMS Lab L*75 near (186,184,183): same-space nested Form must not roundtrip through non-reciprocal B2A. Top-right (150,50) is half-alpha Lab white over green near (128,255,127); bottom-left (50,150) is near (93,220,92) after half-opacity over green; bottom-right (150,150) converts half-blue XYZ into Lab before half-opacity Multiply and a half-alpha mask, near (0,207,0)."
+    },
+    {
+      "id": "synth-icc-rgb-lut-luminosity",
+      "path": "generated/synth-icc-rgb-lut-luminosity.pdf",
+      "sha256": "8c4b7c630f0dedb62173a3ef4ee82bebbbe8f299ec307caceafb85ffca783256",
+      "bytes": 4618,
+      "tags": [
+        "icc",
+        "lut",
+        "xyz",
+        "soft-mask",
+        "luminosity",
+        "transfer"
+      ],
+      "description": "RGB LUT luminosity mask preserves encoded source components before XYZ Y extraction and transfer.",
+      "expected": "The profile maps encoded red 0.5 to XYZ Y 0.25: left red over white is (255,191,191), and inverse transfer on the right gives (255,64,64). A lossy B2A roundtrip must not alter mask luminosity."
+    },
+    {
       "id": "synth-function-cubic-1d",
       "path": "generated/synth-function-cubic-1d.pdf",
       "sha256": "03ab8ad81685871accd11f66a586755994f4ec132f72790b96c93f58b8eba144",

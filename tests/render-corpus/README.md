@@ -1,14 +1,14 @@
 # PDF rendering corpus
 
-The collection contains **78 PDFs (3,219,336 bytes)**: 30 Mozilla pdf.js
+The collection contains **81 PDFs (3,236,133 bytes)**: 30 Mozilla pdf.js
 fixtures pinned to commit `94a48f3c844d4677b264b6e7c0a1e239c245189f`,
-one PDF Association PDF 2.0 example, and 47 generated fixtures.
+one PDF Association PDF 2.0 example, and 50 generated fixtures.
 
 Coverage includes embedded/subset/Type 3/CID fonts, Arabic and CJK text,
 JPEG/JPEG2000/JBIG2, packed images and masks, transparency/blending,
 shading/patterns, Form XObjects and AcroForms, offset page boxes/rotation,
 text state and clipping, malformed streams, and multipage/performance cases.
-The collection has **599 pages**, including a generated 500-page document for
+The collection has **602 pages**, including a generated 500-page document for
 scrolling, zoom cancellation and offscreen canvas eviction checks.
 
 Two complementary sets:
@@ -310,3 +310,27 @@ Ten additional live EGL cases verify callback ordering, replacement/in-place
 arrays, premultiplication/orientation, empty seeding, transformed clips, masks,
 backdrop filters, shadow order and exception propagation. These are software
 Mesa checks, not physical-GPU verification.
+
+## Explicit RGB LUT blending spaces
+
+Three new fixtures cover bidirectional RGB lut8 XYZ page blending, lut16 Lab
+Form blending, and LUT luminosity masks with inverse transfer. Page quadrants
+compare vector/image/shading/pattern sources. Forms exercise same-profile
+nesting, cross-profile conversion, nonisolated backdrop, opacity, Multiply and
+alpha masks. Deliberately non-reciprocal B2A0 tables catch unwanted profile
+round trips; they are not numerically derived inverses.
+
+Image owns the explicit B2A0 transforms. PDF preserves components when the
+source and working space name the same ICC stream and selects ordinary nested
+groups in that case. Renderer owns rounded premultiplication: truncation had
+changed constant encoded colors during native source-over, visible as a Lab
+color shift. A regression covers every byte component and source alpha.
+
+All **12 targeted PDFs / 12 pages** completed on native Raster, live Mesa
+llvmpipe GL and the Chromium worker. LittleCMS group colors and independent
+luminosity/transfer expectations match within two channel levels; the earlier
+CMYK LUT source fixtures also retain their expected colors on all three
+backends. The native regression suite, Fable build and 109 Image ICC checks
+pass. This is software-GL and targeted browser evidence, not full-corpus
+conformance. CMYK blending surfaces, unsupported/missing LUT inverse tables,
+`mAB`/`mBA`, and `/AIS true` remain outside the supported subset.

@@ -98,8 +98,8 @@ matching the document widths. The original is now pinned in the corpus.
 
 ### Assets, packaging and remaining limits
 
-- Rbt.Image **0.1.3**, Rbt.Text **0.1.7**, and
-  Rbt.Renderer/Core/Canvas **0.1.9** are published through the normal protected
+- Rbt.Image **0.1.4**, Rbt.Text **0.1.7**, and
+  Rbt.Renderer/Core/Canvas **0.1.10** are published through the normal protected
   Forge tag actions. The earlier missing-native-package incident was fixed in
   Forge; no manual rollout is needed for these library releases.
 - Codec ports retain Apache-2.0 attribution and the bundled PDF.js license.
@@ -122,22 +122,25 @@ matching the document widths. The original is now pinned in the corpus.
   stack with 100,000 execution steps. Patch meshes still use fixed 16×16
   tessellation; shading/pattern surfaces are capped at four million pixels.
 - ICC support covers Gray/RGB matrix/TRC and RGB/CMYK `mft1`/`mft2` A2B0 profiles,
-  plus calibrated Gray/RGB/Lab spaces. Unsupported profiles use the PDF Alternate;
-  this is not a complete ICC implementation.
+  explicit RGB B2A0 LUT transforms, and calibrated Gray/RGB/Lab spaces.
+  Unsupported profiles use the PDF Alternate; this is not a complete ICC implementation.
 - JPX does not support every profile: COC, ROI, progression changes, packed
   headers, palettes/component mappings and some codeblock styles are rejected.
 - The 36 bundled CMaps remain a selected subset. Vertical CID `W2`/`DW2`,
   inherited CMaps and mixed-width codes now have focused regressions.
 - Transparency supports the standard blend modes, isolated/non-isolated and
   knockout groups, and alpha/luminosity soft masks. Page and Form groups support
-  DeviceRGB and invertible RGB matrix/TRC ICC blending spaces on Raster/Canvas.
+  DeviceRGB, invertible RGB matrix/TRC ICC spaces, and RGB LUT profiles with
+  supported explicit B2A0 transforms on Raster, Canvas and GL.
   Source paints retain their original components until conversion into the active
-  group space; profile conversion belongs to Image and compositing to Renderer.
-  RGB matrix/TRC luminosity masks composite in the declared group space before
-  XYZ Y extraction and transfer; backdrop color also applies outside the BBox.
+  group space; the same ICC stream stays encoded without a lossy round trip.
+  Profile conversion belongs to Image and compositing to Renderer.
+  RGB matrix/TRC and LUT luminosity masks composite in the declared group space
+  before XYZ Y extraction and transfer; backdrop color also applies outside the BBox.
   Managed alpha masks and DeviceGray soft masks remain supported. RGB/CMYK
   `mft1`/`mft2` ICC sources convert directly through unclipped D50 XYZ into managed
-  RGB groups. LUT/CMYK group transforms and `AIS true` remain unsupported.
+  RGB groups. CMYK group blending, missing/unsupported LUT inverses and
+  `AIS true` remain unsupported.
   GL supports managed groups and custom pixel filters through CPU readback
   compositing, including PDF luminosity and transfer masks. Knockout shape
   extraction remains approximate for
@@ -274,8 +277,28 @@ not universal latency or adversarial-resource bounds.
   checks cover LUT colors, masks, nested clips and knockout combinations; dense
   CMYK gradients match native within one channel value across 640 samples.
   Ten generic live EGL callback scenarios and 77 Image ICC checks also passed.
-- LUT inverse transforms, four-component CMYK group blending and `/AIS true`
-  remain unsupported. GL callbacks use CPU readback/upload, not GPU execution.
+- At that release, LUT inverse transforms, four-component CMYK group blending
+  and `/AIS true` remained unsupported. GL callbacks use CPU readback/upload,
+  not GPU execution.
+
+## RGB LUT blending and premultiplication follow-up
+
+- Image interprets explicit RGB lut8/lut16 B2A0 transforms with XYZ or legacy
+  Lab PCS. It does not numerically invert forward LUTs. Malformed or missing
+  inverses leave supported forward transforms usable.
+- PDF preserves components for the same ICC profile stream, including Indexed
+  paints and nested groups. Different group profiles still convert through PCS.
+  Non-reciprocal test tables expose accidental forward/inverse round trips.
+- Native rendering exposed downward premultiplication rounding in Renderer,
+  amplified by Lab conversion. Renderer now uses integer rounded division by
+  255; a consumer regression checks constant-color source-over at every channel
+  value and alpha. ICC parsing remains in Image; PDF semantics remain here.
+- The corpus has 81 documents / 602 pages. Twelve targeted pages passed native
+  Raster, live Mesa llvmpipe GL and Chromium Canvas checks. New page/Form/mask
+  samples match independent LittleCMS and luminosity expectations within two
+  channel levels. The pass also covers opacity, Multiply, alpha masks, nested
+  same/different profiles and inverse luminosity transfer. Image has 109 passing
+  ICC checks. GL verification uses software Mesa, not a physical GPU.
 
 ## Incidental (throwaway scripts, not product bugs)
 - Native PPM writer dropped the R-channel mask (`v >>> 16` without `&&& 0xFFu`),

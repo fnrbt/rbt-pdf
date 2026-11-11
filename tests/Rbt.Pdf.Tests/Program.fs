@@ -242,6 +242,16 @@ let main _ =
                      && int (Pixel.b pixel) = expected b 21
         check "all source alpha values match scalar source-over" exact)
 
+    test "premultiplication preserves constant color through source-over" (fun () ->
+        let mutable exact = true
+        for channel in 0 .. 255 do
+            let color = Color.rgb (byte channel) (byte (255-channel)) (byte ((79*channel)%256))
+            let destination = Pixel.fromColorPremul color
+            for alpha in 0 .. 255 do
+                let source = Pixel.fromColorPremul { color with A = byte alpha }
+                exact <- exact && Pixel.blend source destination = destination
+        check "every component and alpha preserve unchanged source-over color" exact)
+
     test "managed groups convert contributions before parent compositing" (fun () ->
         let square = [MoveTo (vec2 0.0 0.0); LineTo (vec2 16.0 0.0); LineTo (vec2 16.0 16.0); LineTo (vec2 0.0 16.0); Close]
         let paint color = FillPath (square, Solid color, NonZero)
@@ -440,13 +450,99 @@ let main _ =
         let target: Rbt.Pdf.Render.PdfColor.WorkingSpace =
             { IsDisplay = false; IsGray = false
               ToPcs = fun r g b -> struct(r,g,b)
-              FromPcs = fun x y z -> struct(x/2.0,y,z) }
+              FromPcs = fun x y z -> struct(x/2.0,y,z)
+              ProfileSource = None }
         let convert k = Rbt.Pdf.Render.PdfColor.toWorkingRgb target space [|0.0;0.0;0.0;k|]
         // Range clips K without rescaling: X=1.5*K, then target R=X/2.
         let struct(r0,g0,b0) = convert 0.0
         let struct(r1,g1,b1) = convert 1.0
         check "ICC Range clips low fourth input" (r0 = 48uy && g0 = 64uy && b0 = 32uy)
         check "ICC Range clips high fourth input without display clipping" (r1 = 143uy && g1 = 64uy && b1 = 32uy))
+
+    let loadLutFixture name =
+        use stream = Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
+        use reader = new IO.StreamReader(stream)
+        Convert.FromBase64String(reader.ReadToEnd())
+
+    test "explicit RGB LUT8 XYZ and LUT16 Lab inverse admit PDF blending spaces" (fun () ->
+        let fixture name colorName =
+            let fixtureDoc = Pdf.openData (loadLutFixture name)
+            let page = Pdf.getPage fixtureDoc 1 |> Option.get
+            let resources = Pdf.dictGet fixtureDoc "Resources" page |> Option.get
+            let spaces = Pdf.dictGet fixtureDoc "ColorSpace" resources |> Option.get
+            let space = Pdf.dictGet fixtureDoc colorName spaces |> Option.get
+            match Pdf.deref fixtureDoc space with
+            | PdfArray [PdfName "ICCBased"; stream] -> Pdf.getStreamData fixtureDoc stream
+            | _ -> failwith "LUT fixture has no ICC profile"
+        let doc = Pdf.openData (build normal onePage 1)
+        let space bytes =
+            Rbt.Pdf.Render.PdfColor.resolve doc PdfNull
+                (PdfArray [PdfName "ICCBased"; PdfStream (Map.ofList ["N", PdfInt 3L], bytes)])
+            |> Option.get
+        let xyzBytes = fixture "icc-rgb-lut8-xyz-page.base64" "Working"
+        let labBytes = fixture "icc-rgb-lut16-lab-forms.base64" "Lab"
+        let xyzSpace, labSpace = space xyzBytes, space labBytes
+        let xyz = Rbt.Pdf.Render.PdfColor.tryWorkingSpace xyzSpace |> Option.get
+        let lab = Rbt.Pdf.Render.PdfColor.tryWorkingSpace labSpace |> Option.get
+        // Independent fixture definition: A2B swaps R/G and halves XYZ;
+        // B2A accepts physical D50 XYZ (not a normalized or display RGB triplet).
+        let struct(x,y,z) = xyz.ToPcs 0.75 0.25 0.5
+        check "RGB lut8 forward XYZ component order" (abs(x-0.125)<0.004 && abs(y-0.375)<0.004 && abs(z-0.25)<0.004)
+        let struct(r,g,b) = xyz.FromPcs 0.125 0.375 0.25
+        check "RGB lut8 B2A XYZ physical encoding" (abs(r-0.5625)<0.015 && abs(g-0.25)<0.015 && abs(b-0.5)<0.015)
+        let struct(l,a,c) = lab.FromPcs 0.9642 1.0 0.8249
+        check "RGB lut16 B2A Lab D50 white encoding"
+            (abs(l-0.8)<0.006 && abs(a-0.502)<0.008 && abs(c-0.502)<0.008)
+        let missing = Array.copy xyzBytes
+        let struct(sr,sg,sb) =
+            Rbt.Pdf.Render.PdfColor.toWorkingRgb xyz xyzSpace [|0.75;0.25;0.5|]
+        check "same ICC source stays encoded despite non-reciprocal B2A"
+            (sr=191uy && sg=64uy && sb=128uy)
+        let struct(ll,aa,bb) =
+            Rbt.Pdf.Render.PdfColor.toWorkingRgb lab labSpace [|0.5;0.5;0.5|]
+        check "same Lab source avoids lossy B2A L contraction"
+            (ll=128uy && aa=128uy && bb=128uy)
+        // Hide B2A0 in the tag table, leaving the valid forward A2B0 intact.
+        let marker = latin1 "B2A0"
+        let index =
+            [132 .. missing.Length-4]
+            |> List.find (fun i -> missing.[i]=marker.[0] && missing.[i+1]=marker.[1]
+                                   && missing.[i+2]=marker.[2] && missing.[i+3]=marker.[3])
+        missing.[index] <- byte 'X'
+        check "RGB LUT without explicit inverse is unsupported as group"
+            (Rbt.Pdf.Render.PdfColor.tryWorkingSpace (space missing) |> Option.isNone)
+        let malformed = Array.copy xyzBytes
+        let offset =
+            [0..3] |> List.fold (fun value n -> value*256 + int malformed.[index+4+n]) 0
+        malformed.[offset] <- byte 'X'
+        check "unsupported inverse preserves valid forward RGB source"
+            (Rbt.Pdf.Render.PdfColor.tryWorkingSpace (space malformed) |> Option.isNone
+             && (match Rbt.Pdf.Render.PdfColor.toWorkingRgb Rbt.Pdf.Render.PdfColor.displaySpace
+                           (space malformed) [|1.0;0.0;0.0|] with
+                 | struct(_,green,_) -> green > 245uy)))
+
+    test "RGB LUT page and Form groups composite before display and boundary effects" (fun () ->
+        let render name =
+            loadLutFixture name
+            |> Pdf.openData
+            |> fun doc -> renderPage (RenderOptions.native ()) doc 1 1.0 |> Option.get |> rasterize
+        let pixel (pixels: uint32[]) x y = pixels.[y*200+x]
+        let checkColor label (r,g,b) p =
+            check label (abs(int(Pixel.r p)-r)<=5 && abs(int(Pixel.g p)-g)<=5
+                         && abs(int(Pixel.b p)-b)<=5)
+        let page = render "icc-rgb-lut8-xyz-page.base64"
+        // LittleCMS relative-colorimetric oracle, RGB [128,0,128] -> [0,186,148].
+        for x,y in [50,50;150,50;50,150;150,150] do
+            checkColor $"RGB LUT page encoded blend ({x},{y})" (0,186,148) (pixel page x y)
+        let forms = render "icc-rgb-lut16-lab-forms.base64"
+        // LittleCMS: Lab LUT RGB [191,128,128] -> sRGB [186,184,183].
+        checkColor "RGB LUT isolated Form" (186,184,183) (pixel forms 50 50)
+        checkColor "RGB LUT non-isolated Form sees green backdrop" (128,255,127) (pixel forms 150 50)
+        checkColor "RGB LUT boundary half-opacity in sRGB" (93,220,92) (pixel forms 50 150)
+        // XYZ blue -> Lab [0,.5,0]; half over Lab [.5,.5,.5] gives
+        // [.25,.5,.25], LittleCMS sRGB [0,64,159]. At the boundary
+        // Multiply over green with 0.5 opacity * 0.5 Alpha mask -> [0,207,0].
+        checkColor "RGB LUT nested XYZ to Lab, boundary Multiply and mask" (0,207,0) (pixel forms 150 150))
 
     test "ICC range bounds and image Decode preserve component values" (fun () ->
         let profile = Convert.FromBase64String("AAAAvAAAAAACIAAAc2NuckdSQVlYWVogAAAAAAAAAAAAAAAAYWNzcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACd3RwdAAAAJwAAAAUa1RSQwAAALAAAAAMWFlaIAAAAAAAAPbWAAEAAAAA0y1jdXJ2AAAAAAAAAAA=") |> text

@@ -474,6 +474,101 @@ def icc_lut_source_blending(bits, xyz=False):
         "/Group << /S /Transparency /CS /Working /I true >>")
 
 
+def rgb_lut_page():
+    def setup(pdf):
+        profile = pdf.stream("/N 3", icc_profiles.rgb_bidirectional_lut(8))
+        space = f"[/ICCBased {profile} 0 R]"
+        colors = f"/ColorSpace << /Working {space} >>"
+        im = pdf.stream(f"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                        f"/BitsPerComponent 8 /ColorSpace {space}", b"\0\0\xff")
+        fn = pdf.add("<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [0 0 1] /N 1 >>")
+        shade = pdf.add(f"<< /ShadingType 2 /ColorSpace {space} /Coords [0 0 100 0] "
+                        f"/Function {fn} 0 R /Extend [true true] >>")
+        pattern = pdf.stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] "
+            f"/XStep 10 /YStep 10 /Resources << {colors} >>",
+            "/Working cs 0 0 1 sc 0 0 10 10 re f")
+        return (f"{colors} /XObject << /Im {im} 0 R >> /Shading << /Shade {shade} 0 R >> "
+                f"/Pattern << /Tile {pattern} 0 R >> /ExtGState << /Half << /ca 0.5 >> >>")
+    return page(
+        "/Working cs 1 0 0 sc 0 0 200 200 re f /Half gs "
+        "/Working cs 0 0 1 sc 0 100 100 100 re f "
+        "q 100 0 0 100 100 100 cm /Im Do Q "
+        "q 0 0 100 100 re W n /Shade sh Q "
+        "/Pattern cs /Tile scn 100 0 100 100 re f",
+        setup=setup, page_options="/MediaBox [0 0 200 200] "
+        "/Group << /S /Transparency /CS /Working /I true >>")
+
+
+def rgb_lut_luminosity():
+    def setup(pdf):
+        profile = pdf.stream("/N 3", icc_profiles.rgb_bidirectional_lut(8))
+        mask = pdf.stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 100] "
+            f"/Resources << /ColorSpace << /Working [/ICCBased {profile} 0 R] >> >> "
+            "/Group << /S /Transparency /CS /Working /I true >>",
+            "/Working cs 0.5 0.25 0.5 sc 0 0 200 100 re f")
+        inverse = pdf.add("<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>")
+        return (f"/ExtGState << /NormalMask << /SMask << /S /Luminosity /G {mask} 0 R >> >> "
+                f"/InverseMask << /SMask << /S /Luminosity /G {mask} 0 R /TR {inverse} 0 R >> >> >>")
+    return page(
+        "1 0 0 rg /NormalMask gs 0 0 100 100 re f "
+        "/InverseMask gs 100 0 100 100 re f",
+        setup=setup, page_options="/MediaBox [0 0 200 100]")
+
+
+def rgb_lut_forms():
+    def setup(pdf):
+        lab = pdf.stream("/N 3", icc_profiles.rgb_bidirectional_lut(16, 'Lab '))
+        xyz = pdf.stream("/N 3", icc_profiles.rgb_bidirectional_lut(8))
+        colors = f"/ColorSpace << /Lab [/ICCBased {lab} 0 R] /Xyz [/ICCBased {xyz} 0 R] >>"
+        states = "/ExtGState << /Half << /ca 0.5 >> >>"
+        inner = pdf.stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] "
+            f"/Resources << {colors} {states} >> "
+            "/Group << /S /Transparency /CS /Xyz /I false >>",
+            "/Half gs /Xyz cs 0 0 1 sc 0 0 100 100 re f")
+        same = pdf.stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] "
+            f"/Resources << {colors} {states} >> "
+            "/Group << /S /Transparency /CS /Lab /I false >>",
+            "/Half gs /Lab cs 1 0.5 0.5 sc 0 0 100 100 re f")
+        mask = pdf.stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] "
+            f"/Resources << {states} >> "
+            "/Group << /S /Transparency /CS /DeviceGray /I true >>",
+            "/Half gs 1 g 0 0 100 100 re f")
+        forms = []
+        for name, isolated, nested in [("Isolated", True, False),
+                                        ("Backdrop", False, False),
+                                        ("Nested", True, True)]:
+            content = "/Lab cs 0.5 0.5 0.5 sc 0 0 100 100 re f "
+            if nested:
+                content += "/Inner Do"
+            elif isolated:
+                content += "/Same Do"
+            else:
+                # The non-isolated group starts on the page's green backdrop.
+                content = "/Half gs /Lab cs 1 0.5 0.5 sc 0 0 100 100 re f"
+            form = pdf.stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] "
+                f"/Resources << {colors} {states} /XObject << /Inner {inner} 0 R /Same {same} 0 R >> >> "
+                f"/Group << /S /Transparency /CS /Lab /I {str(isolated).lower()} >>",
+                content)
+            forms.append(f"/{name} {form} 0 R")
+        return (f"{colors} /XObject << {' '.join(forms)} >> "
+                f"/ExtGState << /HalfBoundary << /ca 0.5 >> "
+                f"/MultiplyMask << /ca 0.5 /BM /Multiply "
+                f"/SMask << /S /Alpha /G {mask} 0 R >> >> >>")
+    return page(
+        "0 1 0 rg 0 0 200 200 re f "
+        "q 1 0 0 1 0 100 cm /Isolated Do Q "
+        "q 1 0 0 1 100 100 cm /Backdrop Do Q "
+        "q /HalfBoundary gs /Isolated Do Q "
+        "q 1 0 0 1 100 0 cm /MultiplyMask gs /Nested Do Q",
+        setup=setup, page_options="/MediaBox [0 0 200 200]")
+
+
 
 def nested_clip_paints(pdf):
     function = pdf.add("<< /FunctionType 2 /Domain [0 1] /C0 [0 1 1] /C1 [0 1 1] /N 1 >>")
@@ -537,6 +632,9 @@ CASES = [
     dict(id="icc-page-linear-blend", tags=["icc", "transparency", "page-group", "image", "shading", "pattern"], description="Linear RGB page blending shared by vector, image, shading and tiling-pattern paints.", expected="All four quadrants are the same bright purple near RGB (188,0,188), not sRGB-space (128,0,128). Red and half-alpha blue are blended before display conversion.", factory=icc_page_blending),
     dict(id="icc-page-wide-gamut-blend", tags=["icc", "transparency", "page-group", "image", "shading", "pattern", "gamut"], description="Adobe RGB page blends green with quarter-alpha red without clipping source paints to sRGB first.", expected="All four quadrants agree near RGB (0,193,0), with no red contamination. The independent oracle converts the final Adobe RGB components (0.25,0.75,0), not separately clipped source colors.", factory=lambda: icc_page_blending(True)),
     dict(id="icc-form-blend-boundary", tags=["icc", "transparency", "form", "isolation", "blend-mode", "opacity"], description="Linear RGB isolated and non-isolated Forms return their source contribution to an sRGB parent before boundary opacity and Multiply.", expected="Top quadrants both show bright purple near (188,0,188). Bottom-left is near (94,128,94): half that display-space purple over green. Bottom-right is near (0,128,0): half-opacity Multiply over green. Untouched parent pixels must not make a profile roundtrip.", factory=icc_form_blending),
+    dict(id="icc-rgb-lut8-xyz-page", tags=["icc", "lut", "xyz", "transparency", "page-group", "image", "shading", "pattern"], description="Bidirectional RGB lut8 XYZ page space, with four source paint types composited as encoded components.", expected="At (50,50), (150,50), (50,150), (150,150) all four source paints produce the LittleCMS color of encoded RGB (0.5,0,0.5), not half the separately displayed red and blue.", factory=rgb_lut_page),
+    dict(id="icc-rgb-lut16-lab-forms", tags=["icc", "lut", "lab", "xyz", "transparency", "form", "soft-mask", "blend-mode", "opacity"], description="RGB lut16 Lab Form with same-space nested group, distinct RGB lut8 XYZ nested group, non-isolated backdrop, and opacity/blend/mask boundaries.", expected="Top-left (50,50) is LittleCMS Lab L*75 near (186,184,183): same-space nested Form must not roundtrip through non-reciprocal B2A. Top-right (150,50) is half-alpha Lab white over green near (128,255,127); bottom-left (50,150) is near (93,220,92) after half-opacity over green; bottom-right (150,150) converts half-blue XYZ into Lab before half-opacity Multiply and a half-alpha mask, near (0,207,0).", factory=rgb_lut_forms),
+    dict(id="icc-rgb-lut-luminosity", tags=["icc", "lut", "xyz", "soft-mask", "luminosity", "transfer"], description="RGB LUT luminosity mask preserves encoded source components before XYZ Y extraction and transfer.", expected="The profile maps encoded red 0.5 to XYZ Y 0.25: left red over white is (255,191,191), and inverse transfer on the right gives (255,64,64). A lossy B2A roundtrip must not alter mask luminosity.", factory=rgb_lut_luminosity),
     dict(id="function-cubic-1d", tags=["shading", "function", "sampled", "cubic"], description="Order 3 four-knot grayscale interpolation with Decode headroom for cubic overshoot.", expected="A grayscale hill from black through the 0.8-valued inner knots, peaking near 0.9 (RGB 230) at the center. Linear interpolation incorrectly gives a flat 0.8 plateau. Uses uniform Catmull-Rom with secant endpoint tangents.", page_options="/MediaBox [0 0 100 100]", setup=cubic_sampled_shading, content="q 10 10 80 80 re W n /Cubic sh Q"),
     dict(id="function-cubic-2d", tags=["shading", "function", "sampled", "cubic", "multidimensional"], description="Tensor-product sampled function with cubic four-knot x and linear two-knot y.", expected="Inside an inset square, red rises from zero at both sides to about 230 in the middle, while green rises linearly from bottom to top. The center is near RGB (230,128,0). Samples advance along x first.", page_options="/MediaBox [0 0 100 100]", setup=lambda pdf: cubic_sampled_shading(pdf, True), content="/Cubic sh"),
     dict(id="icc-inherited-nested-mask", tags=["icc", "transparency", "form", "inheritance", "soft-mask", "gamut"], description="Wide-gamut inherited fill provenance, nested nonisolated linear group and boundary alpha mask plus opacity.", expected="Top quadrants match near (0,192,0): inherited Adobe green must not be recovered from clipped sRGB. Bottom-left nested linear groups produce (188,0,188). Bottom-right applies half mask and half opacity exactly once over green, near (47,191,47).", factory=icc_inherited_nested_mask),
@@ -552,6 +650,8 @@ CASES = [
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "rgb-lut8-xyz.icc").write_bytes(icc_profiles.rgb_bidirectional_lut(8))
+    (OUT / "rgb-lut16-lab.icc").write_bytes(icc_profiles.rgb_bidirectional_lut(16, 'Lab '))
     entries = []
     for case in CASES:
         options = {key: case[key] for key in ("setup", "page_options", "parent_options") if key in case}

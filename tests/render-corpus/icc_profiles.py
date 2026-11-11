@@ -166,6 +166,69 @@ def cmyk_xyz_lut(bits):
     return profile('CMYK', 'XYZ ', [('wtpt', xyz(*D50)), ('A2B0', bytes(tag))])
 
 
+
+def rgb_bidirectional_lut(bits, pcs='XYZ ', inverse=True):
+    """Explicit RGB LUT pair with intentionally non-reciprocal B2A.
+
+    XYZ: R/G are exchanged in PCS; the PCS is half-scale so B2A input
+    tables expand XYZ u1.15 encoding. Its B2A also contracts red by 25%,
+    proving that already-encoded same-space PDF paints must not roundtrip.
+    Lab: R controls L*, G controls a*, B controls b* (legacy v2 Lab);
+    its B2A contracts L* by 20% as another non-reciprocal inverse.
+    """
+    assert bits in (8, 16) and pcs in ('XYZ ', 'Lab ')
+    kind = b'mft1' if bits == 8 else b'mft2'
+    word = (lambda v: bytes((round(v * 255),))) if bits == 8 else (lambda v: u16(round(v * 65535)))
+    def header():
+        tag = bytearray(kind + b'\0' * 4 + bytes((3, 3, 2, 0)))
+        tag.extend(b''.join(s15(1.0 if r == c else 0.0)
+                             for r in range(3) for c in range(3)))
+        if bits == 16:
+            tag.extend(u16(5) + u16(2))
+        return tag
+    def tables(tag, backwards):
+        for channel in range(3):
+            for i in range(256 if bits == 8 else 5):
+                t = i / (255 if bits == 8 else 4)
+                # B2A XYZ PCS is encoded in u1.15: x=.5 corresponds to .25
+                # at the table input; device-space values occupy 0..1.
+                if backwards and pcs == 'XYZ ':
+                    t = min(4*t, 1)
+                elif backwards and pcs == 'Lab ' and channel == 0:
+                    t = min(t * 65535/65280, 1)
+                tag.extend(word(t))
+    def clut(tag, backwards):
+        for a in range(2):
+            for b in range(2):
+                for c in range(2):
+                    if pcs == 'XYZ ':
+                        values = (b, a, c)
+                        if backwards:
+                            values = (b * .75, a, c)
+                        if not backwards:
+                            # Device -> XYZ: 0.5 PCS is .25 of u1.15 range.
+                            values = tuple(v * .25 for v in values)
+                    else:
+                        values = (a, b, c)
+                        if backwards:
+                            values = (a * .8, b, c)
+                        if not backwards:
+                            # ICC v2 Lab L*=100 is 0xff00 in a lut16 CLUT.
+                            values = (a * 65280/65535, b, c)
+                    for value in values:
+                        tag.extend(word(value))
+    def make(backwards):
+        tag = header()
+        tables(tag, backwards)
+        clut(tag, backwards)
+        for _ in range(3):
+            tag.extend(bytes(range(256)) if bits == 8 else u16(0) + u16(65535))
+        return bytes(tag)
+    tags = [('wtpt', xyz(*D50)), ('A2B0', make(False))]
+    if inverse:
+        tags.append(('B2A0', make(True)))
+    return profile('RGB ', pcs, tags)
+
 def lcms_oracle(profiles, samples):
     libname = ctypes.util.find_library('lcms2')
     if not libname:
@@ -222,13 +285,17 @@ def main(directory):
     directory.mkdir(parents=True, exist_ok=True)
     profiles = {'gray-linear': gray(), 'rgb-swapped': swapped_rgb(),
                 'cmyk-mft1': cmyk_lut(8), 'cmyk-mft2': cmyk_lut(16),
-                'rgb-linear': linear_rgb(), 'rgb-adobe': adobe_rgb()}
+                'rgb-linear': linear_rgb(), 'rgb-adobe': adobe_rgb(),
+                'rgb-lut8-xyz': rgb_bidirectional_lut(8),
+                'rgb-lut16-lab': rgb_bidirectional_lut(16, 'Lab ')}
     samples = {'gray-linear': [[0], [128], [255], [51], [204]],
                'rgb-swapped': [[255, 0, 0], [0, 255, 0], [0, 0, 255]],
                'cmyk-mft1': [[0, 0, 0, 0], [0, 0, 0, 128], [0, 0, 0, 255]],
                'cmyk-mft2': [[0, 0, 0, 0], [0, 0, 0, 128], [0, 0, 0, 255]],
                'rgb-linear': [[128, 0, 127]],
-               'rgb-adobe': [[64, 191, 0]]}
+               'rgb-adobe': [[64, 191, 0]],
+               'rgb-lut8-xyz': [[128, 0, 128], [255, 0, 0]],
+               'rgb-lut16-lab': [[191, 128, 128], [128, 128, 128]]}
     for name, content in profiles.items():
         (directory / (name + '.icc')).write_bytes(content)
     # Malformed examples: invalid header size/signature and truncated tag payload.
@@ -252,7 +319,9 @@ def main(directory):
                   'Embed RGB-swapped ICC with 1x1 /Device samples [255 0 0] and graphic /C cs 1 0 0 sc; both must match independent rgb-swapped[0].',
                   'Embed each CMYK mft1/mft2 with 1x1 sample [0 0 0 0], graphic /C cs 0 0 0 0 sc and 2-stop axial CMYK shading; compare endpoints to oracle.',
                   'rgb-linear[0] is the group-space red/half-blue composite for all four quadrants of synth-icc-page-linear-blend.',
-                  'rgb-adobe[0] is the group-space green/quarter-red composite for all four quadrants of synth-icc-page-wide-gamut-blend; never convert and clip each source to sRGB before blending.'
+                  'rgb-adobe[0] is the group-space green/quarter-red composite for all four quadrants of synth-icc-page-wide-gamut-blend; never convert and clip each source to sRGB before blending.',
+                  'rgb-lut8-xyz[0] is the encoded-component page composite (half red, half blue), independent of an sRGB blend. Its explicit B2A contracts red by 25%, so same-profile paints must bypass it.',
+                  'rgb-lut16-lab[0] is the L*75 Form composite including a same-profile nested Form. Its explicit B2A contracts L* by 20%; half-opacity over green acts after conversion to sRGB.'
               ]}
     (directory / 'oracle.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))

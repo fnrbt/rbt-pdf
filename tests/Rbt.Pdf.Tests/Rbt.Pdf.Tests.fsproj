@@ -10,6 +10,8 @@
     <EmbeddedResource Include="jpx-tiled-mct.base64" LogicalName="jpx-tiled-mct.base64" />
     <EmbeddedResource Include="vertical-cid.pdf" LogicalName="vertical-cid.pdf" />
     <EmbeddedResource Include="vertical-cid-default.pdf" LogicalName="vertical-cid-default.pdf" />
+    <EmbeddedResource Include="icc-rgb-lut8-xyz-page.base64" LogicalName="icc-rgb-lut8-xyz-page.base64" />
+    <EmbeddedResource Include="icc-rgb-lut16-lab-forms.base64" LogicalName="icc-rgb-lut16-lab-forms.base64" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../Rbt.Pdf/Rbt.Pdf.fsproj" />

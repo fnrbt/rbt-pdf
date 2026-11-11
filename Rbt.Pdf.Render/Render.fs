@@ -1080,7 +1080,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                                     let parent = working |> Option.defaultValue PdfColor.displaySpace
                                                     let conversion =
                                                         child |> Option.bind (fun target ->
-                                                            if parent.IsDisplay && target.IsDisplay then None
+                                                            if PdfColor.sameWorkingSpace parent target then None
                                                             else Some (groupConversion parent target))
                                                     child |> Option.orElse working, Some (cmds.Count, isolated, knockout, conversion)
                                                 | _ -> working, None

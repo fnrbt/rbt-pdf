@@ -12,20 +12,20 @@ type Space =
     | CalGray of struct(float * float * float) * float
     | CalRgb of struct(float * float * float) * float[] * float[]
     | Lab of struct(float * float * float) * float[]
-    | Icc of Icc.Profile * float[]
+    | Icc of Icc.Profile * float[] * PdfObj
     | Indexed of int * Space * float[][]
 let isIndexed = function Indexed _ -> true | _ -> false
 let isIcc = function Icc _ -> true | _ -> false
 let isDeviceGray = function Gray -> true | _ -> false
 let device = function 1 -> Some Gray | 3 -> Some Rgb | 4 -> Some Cmyk | _ -> None
 
-let components = function Gray | CalGray _ -> 1 | Rgb | CalRgb _ | Lab _ -> 3 | Cmyk -> 4 | Icc (p,_) -> Icc.components p | Indexed _ -> 1
+let components = function Gray | CalGray _ -> 1 | Rgb | CalRgb _ | Lab _ -> 3 | Cmyk -> 4 | Icc (p,_,_) -> Icc.components p | Indexed _ -> 1
 let private clamp v = max 0.0 (min 1.0 v)
 let private channel v = byte (int (clamp v * 255.0 + 0.5))
 let private number = function PdfInt n -> Some (float n) | PdfReal n when not (Double.IsNaN n || Double.IsInfinity n) -> Some n | _ -> None
 
 let private bounds = function
-    | Icc (_, ranges) | Lab (_,ranges) -> ranges
+    | Icc (_, ranges, _) | Lab (_,ranges) -> ranges
     | Indexed _ -> [|0.0; 1.0|]
     | space -> Array.init (2*components space) (fun i -> if i%2 = 0 then 0.0 else 1.0)
 
@@ -64,7 +64,7 @@ let rec toRgb space (values: float[]) : struct(byte * byte * byte) =
                 Icc.labToXyz white (bounded limits values 0) (bounded limits values 1) (bounded limits values 2)
             let struct(x,y,z) = Icc.adaptXYZToD50 white x y z
             Icc.xyzD50ToRgb x y z
-        | Icc (profile, limits) ->
+        | Icc (profile, limits, _) ->
             Icc.toRgbComponents profile (iccComponent limits values 0)
                 (if Icc.components profile > 1 then iccComponent limits values 1 else 0.0)
                 (if Icc.components profile > 2 then iccComponent limits values 2 else 0.0)
@@ -84,13 +84,16 @@ type WorkingSpace =
     { IsDisplay: bool
       IsGray: bool
       ToPcs: float -> float -> float -> struct(float * float * float)
-      FromPcs: float -> float -> float -> struct(float * float * float) }
+      FromPcs: float -> float -> float -> struct(float * float * float)
+      /// The PDF profile stream identity, not ICC payload equality.
+      ProfileSource: PdfObj option }
 
 let displaySpace =
     { IsDisplay = true
       IsGray = false
       ToPcs = Icc.rgbToXyzD50
-      FromPcs = Icc.xyzD50ToRgb }
+      FromPcs = Icc.xyzD50ToRgb
+      ProfileSource = None }
 
 // DeviceGray is represented by three identical channels in renderer surfaces.
 let deviceGraySpace =
@@ -99,16 +102,34 @@ let deviceGraySpace =
         let struct(r,g,b) = Icc.xyzD50ToRgb x y z
         let gray = 0.30*r + 0.59*g + 0.11*b
         struct(gray,gray,gray)
-    { IsDisplay = false; IsGray = true; ToPcs = toPcs; FromPcs = fromPcs }
+    { IsDisplay = false; IsGray = true; ToPcs = toPcs; FromPcs = fromPcs; ProfileSource = None }
 
 let tryWorkingSpace = function
     | Rgb -> Some displaySpace
-    | Icc (profile, _) ->
+    | Icc (profile, _, source) ->
         match Icc.tryToPcs profile, Icc.tryFromPcs profile with
         | Some forward, Some inverse when Icc.components profile = 3 ->
-            Some { IsDisplay = false; IsGray = false; ToPcs = (fun r g b -> forward r g b 0.0); FromPcs = inverse }
+            Some { IsDisplay = false; IsGray = false; ToPcs = (fun r g b -> forward r g b 0.0)
+                   FromPcs = inverse; ProfileSource = Some source }
         | _ -> None
     | _ -> None
+
+/// Same PDF stream, even when its ICC data was decoded and parsed separately.
+/// Indirect references are stable within a document; direct streams have
+/// reference identity. Do not compare bytes or transform closures.
+let sameWorkingSpace (left: WorkingSpace) (right: WorkingSpace) =
+    match left.ProfileSource, right.ProfileSource with
+    | Some (PdfIndirect a), Some (PdfIndirect b) -> a = b
+    | Some a, Some b -> Object.ReferenceEquals(a,b)
+    | None, None -> (left.IsDisplay && right.IsDisplay) || (left.IsGray && right.IsGray)
+    | _ -> false
+
+let private sameIccSource (target: WorkingSpace) source =
+    match target.ProfileSource, source with
+    | Some (PdfIndirect a), PdfIndirect b -> a = b
+    | Some a, b -> Object.ReferenceEquals(a,b)
+    | _ -> false
+
 
 let rec private toPcs space (values: float[]) =
     match space with
@@ -132,7 +153,7 @@ let rec private toPcs space (values: float[]) =
     | Lab (white,limits) ->
         let struct(x,y,z) = Icc.labToXyz white (bounded limits values 0) (bounded limits values 1) (bounded limits values 2)
         Icc.adaptXYZToD50 white x y z
-    | Icc (profile,limits) ->
+    | Icc (profile,limits,_) ->
         match Icc.tryToPcs profile with
         | Some forward ->
             let count = Icc.components profile
@@ -148,7 +169,12 @@ let rec private toPcs space (values: float[]) =
 /// Convert before quantization, without routing an out-of-gamut source through sRGB.
 let toWorkingRgb (target: WorkingSpace) space (values: float[]) =
     if isNull values || values.Length < components space then invalidArg "values" "PDF color component count mismatch"
-    if target.IsDisplay then toRgb space values
+    elif target.IsDisplay then toRgb space values
+    elif (match space with Icc (_,_,source) -> sameIccSource target source | _ -> false) then
+        let limits = bounds space
+        struct(channel (iccComponent limits values 0),
+               channel (iccComponent limits values 1),
+               channel (iccComponent limits values 2))
     elif target.IsGray then
         let struct(r,g,b) = toRgb space values
         let gray = channel (0.30 * float r / 255.0 + 0.59 * float g / 255.0 + 0.11 * float b / 255.0)
@@ -233,7 +259,7 @@ let resolve (doc: PdfDocument) (resources: PdfObj) (colorSpace: PdfObj) : Space 
                     | Some limits, PdfStream _ ->
                         let parsed = try Pdf.getStreamData doc profile |> Icc.tryParse with _ -> None
                         match parsed with
-                        | Some icc when Icc.components icc = int count -> Some (Icc(icc,limits))
+                        | Some icc when Icc.components icc = int count -> Some (Icc(icc,limits,profile))
                         | _ -> fallback ()
                     | _ -> fallback ()
                 | _ -> None
