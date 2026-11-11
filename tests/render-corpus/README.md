@@ -1,14 +1,14 @@
 # PDF rendering corpus
 
-The collection contains **81 PDFs (3,236,133 bytes)**: 30 Mozilla pdf.js
+The collection contains **85 PDFs (3,281,868 bytes)**: 30 Mozilla pdf.js
 fixtures pinned to commit `94a48f3c844d4677b264b6e7c0a1e239c245189f`,
-one PDF Association PDF 2.0 example, and 50 generated fixtures.
+one PDF Association PDF 2.0 example, and 54 generated fixtures.
 
 Coverage includes embedded/subset/Type 3/CID fonts, Arabic and CJK text,
 JPEG/JPEG2000/JBIG2, packed images and masks, transparency/blending,
 shading/patterns, Form XObjects and AcroForms, offset page boxes/rotation,
 text state and clipping, malformed streams, and multipage/performance cases.
-The collection has **602 pages**, including a generated 500-page document for
+The collection has **606 pages**, including a generated 500-page document for
 scrolling, zoom cancellation and offscreen canvas eviction checks.
 
 Two complementary sets:
@@ -333,4 +333,30 @@ CMYK LUT source fixtures also retain their expected colors on all three
 backends. The native regression suite, Fable build and 109 Image ICC checks
 pass. This is software-GL and targeted browser evidence, not full-corpus
 conformance. CMYK blending surfaces, unsupported/missing LUT inverse tables,
-`mAB`/`mBA`, and `/AIS true` remain outside the supported subset.
+and `mAB`/`mBA` remain outside the supported subset.
+
+## Alpha-is-shape knockout coverage
+
+Four fixtures cover `/AIS` false/true in isolated and nonisolated knockout
+groups: fills, strokes, shading, tiling patterns, Type 3 text, alpha/luminosity
+masks and transfer functions, nested ICC groups, and image masks. Coverage is
+independent of painted opacity, including fully transparent objects and
+unpainted portions of group bounds and pattern cells.
+
+Image cases distinguish stencil/color-key geometry from soft alpha and check
+mask precedence. Embedded JPX alpha overrides image and graphics-state masks;
+`SMaskInData` on non-JPX images is ignored. Stencils retain graphics-state
+soft masks. The shared `ais-rgba-jpx.base64` resource is a lossless 32×8 RGBA
+codestream generated with FFmpeg/libopenjpeg; an independent FFmpeg decode
+matches all 1,024 source bytes. Precedence follows the
+[ISO-approved clarification](https://github.com/pdf-association/pdf-issues/issues/215)
+and [image dictionary errata](https://pdf-issues.pdfa.org/32000-2-2020/clause08.html).
+
+All **19 targeted pages** rendered on native Raster, live Mesa llvmpipe GL and
+the Chromium worker. Each backend matches 116 independently calculated AIS
+pixel samples within two channel levels; 66 additional cross-backend ICC
+samples retain their previous expectations. Thirteen shared Renderer scenarios
+also pass on native and GL, including lazy shape evaluation, zero-opacity
+knockout and nested managed groups. Native regressions and the Fable build pass.
+Evidence is targeted and uses software GL, not physical-GPU or full-corpus
+conformance certification.

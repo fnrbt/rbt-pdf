@@ -99,7 +99,7 @@ matching the document widths. The original is now pinned in the corpus.
 ### Assets, packaging and remaining limits
 
 - Rbt.Image **0.1.4**, Rbt.Text **0.1.7**, and
-  Rbt.Renderer/Core/Canvas **0.1.10** are published through the normal protected
+  Rbt.Renderer/Core/Canvas **0.1.11** are published through the normal protected
   Forge tag actions. The earlier missing-native-package incident was fixed in
   Forge; no manual rollout is needed for these library releases.
 - Codec ports retain Apache-2.0 attribution and the bundled PDF.js license.
@@ -139,13 +139,14 @@ matching the document widths. The original is now pinned in the corpus.
   before XYZ Y extraction and transfer; backdrop color also applies outside the BBox.
   Managed alpha masks and DeviceGray soft masks remain supported. RGB/CMYK
   `mft1`/`mft2` ICC sources convert directly through unclipped D50 XYZ into managed
-  RGB groups. CMYK group blending, missing/unsupported LUT inverses and
-  `AIS true` remain unsupported.
+  RGB groups. CMYK group blending and missing/unsupported LUT inverses
+  remain unsupported.
   GL supports managed groups and custom pixel filters through CPU readback
-  compositing, including PDF luminosity and transfer masks. Knockout shape
-  extraction remains approximate for
-  geometry-expanding filters, text masks and intrinsic image alpha. These checks
-  are regression evidence, not PDF conformance certification.
+  compositing, including PDF luminosity and transfer masks. `/AIS` separates
+  geometric coverage from painted opacity for paths, text, patterns, images and
+  nested groups. Arbitrary geometry-expanding Renderer filters remain outside
+  the PDF coverage contract. These checks are regression evidence, not PDF
+  conformance certification.
 
 ## Open gaps (cause not positively identified — do not fix blind)
 
@@ -299,6 +300,21 @@ not universal latency or adversarial-resource bounds.
   channel levels. The pass also covers opacity, Multiply, alpha masks, nested
   same/different profiles and inverse luminosity transfer. Image has 109 passing
   ICC checks. GL verification uses software Mesa, not a physical GPU.
+
+## Alpha-is-shape closure
+
+- PDF tracks `/AIS` through graphics-state save/restore and stream boundaries.
+  Alpha constants and soft masks affect shape only when AIS is true; stencil,
+  color-key and explicit image masks retain intrinsic geometric coverage.
+- Renderer owns lazy `WithShape` commands and shared `Cmd.shapeOf` extraction
+  across Raster, GL and Canvas. Group coverage unions child shapes rather than
+  deriving coverage from final painted alpha. PDF owns image-mask precedence,
+  pattern initial state and transparency-group semantics.
+- Four new fixtures bring the corpus to 85 documents / 606 pages. Nineteen
+  targeted pages rendered on all three backends; 348 AIS pixel samples and 66
+  retained ICC samples match independent expectations within two channel levels.
+  Thirteen generic shape scenarios pass on native and live llvmpipe GL; native
+  regressions and Fable compilation pass.
 
 ## Incidental (throwaway scripts, not product bugs)
 - Native PPM writer dropped the R-channel mask (`v >>> 16` without `&&& 0xFFu`),

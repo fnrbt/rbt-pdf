@@ -123,6 +123,7 @@ let rec drawingEvents matrix clipped commands =
         | TransparencyGroup (_, _, _, _, _, children)
         | ColorManagedGroup (_, _, _, _, _, _, children) ->
             yield! drawingEvents matrix clipped children
+        | WithShape (_, children) -> yield! drawingEvents matrix clipped children
         | FillPath (segments, _, _) | StrokePath (segments, _) ->
             yield "path", clipped, [ for seg in segments do
                                         match seg with
@@ -294,6 +295,202 @@ let main _ =
             check $"{subtype} DeviceGray mask composites half red over opaque white"
                 (Pixel.a pixel = 255uy && Pixel.r pixel = 255uy
                  && abs (int (Pixel.g pixel)-128) <= 2 && abs (int (Pixel.b pixel)-128) <= 2))
+
+    test "PDF AIS defaults to opacity, inherits into groups, and is saved by q/Q" (fun () ->
+        let content = "0 0 1 rg 0 0 100 100 re f /Half gs 1 0 0 rg 0 0 100 100 re f"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</ExtGState <</Half <</ca 0.5>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS 7 0 R>> /Opacity <</AIS false>>>>"
+        let sample prefix =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,form; 7,"true"]
+                (prefix + " /F Do") 1.0 |> rasterize |> fun pixels -> pixels.[50*100+50]
+        let defaultPixel = sample ""
+        let shapePixel = sample "/Shape gs"
+        let restoredPixel = sample "q /Shape gs Q"
+        let explicitFalse = sample "/Shape gs /Opacity gs"
+        check "default alpha is opacity: knocked-out blue does not survive" (Pixel.r defaultPixel > 245uy && Pixel.g defaultPixel > 110uy && Pixel.b defaultPixel > 110uy)
+        check "indirect AIS true preserves blue underneath partial shape" (Pixel.r shapePixel < 200uy && Pixel.g shapePixel < 20uy && Pixel.b shapePixel > 100uy)
+        check "Q restores default AIS" (restoredPixel = defaultPixel)
+        check "explicit AIS false overrides inherited true" (explicitFalse = defaultPixel))
+
+    test "PDF AIS applies ca and CA to their own fill and stroke coverage, including zero" (fun () ->
+        let content = "0 0 1 rg 0 0 100 100 re f /Alphas gs 1 0 0 rg 1 0 0 RG 0 0 100 100 re f 10 w 15 15 70 70 re S"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</ExtGState <</Alphas <</ca 0 /CA 0.5>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let paint prefix =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,form] (prefix + " /F Do") 1.0 |> rasterize
+        let defaultPixels = paint ""
+        let shapedPixels = paint "/Shape gs"
+        let center (p: uint32[]) = p.[50*100+50]
+        let stroke (p: uint32[]) = p.[50*100+15]
+        check "zero ca still knocks out prior color by default" (Pixel.r (center defaultPixels) > 245uy)
+        check "zero ca preserves earlier opaque shape when AIS true" (Pixel.r (center shapedPixels) < 20uy && Pixel.b (center shapedPixels) > 245uy)
+        check "CA changes stroke knockout without changing its painted opacity"
+            (int (Pixel.r (stroke defaultPixels)) - int (Pixel.r (stroke shapedPixels)) > 40))
+
+    test "PDF soft mask affects shape only under AIS, without double applying color opacity" (fun () ->
+        let content = "0 0 1 rg 0 0 100 100 re f /Masked gs 1 0 0 rg 0 0 100 100 re f"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</ExtGState <</Masked <</SMask <</S /Alpha /G 6 0 R>>>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let maskContent = "/Half gs 1 g 0 0 100 100 re f"
+        let mask = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true>> /Resources <</ExtGState <</Half <</ca 0.5>>>>>> /Length {maskContent.Length}>>\nstream\n{maskContent}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let sample prefix =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,form; 6,mask]
+                (prefix + " /F Do") 1.0 |> rasterize |> fun pixels -> pixels.[50*100+50]
+        let opacity, shape = sample "", sample "/Shape gs"
+        check "opacity mask knocks out the full red geometry" (Pixel.r opacity > 245uy && Pixel.g opacity > 110uy)
+        check "AIS makes the mask partial shape but color still has half opacity"
+            (Pixel.r shape < 200uy && Pixel.g shape < 20uy && Pixel.b shape > 100uy))
+
+    test "nested Form shape does not promote internal Form opacity into caller AIS" (fun () ->
+        let innerContent = "/Inner gs 0 1 0 rg 0 0 100 100 re f"
+        let inner = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true>> /Resources <</ExtGState <</Inner <</ca 0.5 /AIS false>>>>>> /Length {innerContent.Length}>>\nstream\n{innerContent}\nendstream"
+        let outerContent = "0 0 1 rg 0 0 100 100 re f /F Do"
+        let outer = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</XObject <</F 6 0 R>>>> /Length {outerContent.Length}>>\nstream\n{outerContent}\nendstream"
+        let resources = "/XObject <</Outer 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let pixels =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,outer;6,inner]
+                "/Shape gs /Outer Do" 1.0 |> rasterize
+        let p = pixels.[50*100+50]
+        check "inner half-opacity green retains full geometric knockout shape"
+            (Pixel.r p > 110uy && Pixel.g p > 245uy && Pixel.b p > 110uy))
+
+    test "zero-opacity nested Form still has intrinsic shape at an AIS boundary" (fun () ->
+        let innerContent = "/Invisible gs 0 1 0 rg 0 0 100 100 re f"
+        let inner = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true>> /Resources <</ExtGState <</Invisible <</ca 0 /AIS false>>>>>> /Length {innerContent.Length}>>\nstream\n{innerContent}\nendstream"
+        let outerContent = "1 0 0 rg 0 0 100 100 re f /Half gs /Nested Do"
+        let outer = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</XObject <</Nested 6 0 R>> /ExtGState <</Half <</ca 0.5>>>>>> /Length {outerContent.Length}>>\nstream\n{outerContent}\nendstream"
+        let resources = "/XObject <</Outer 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let sample prefix =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,outer;6,inner]
+                (prefix + "/Outer Do") 1.0 |> rasterize |> fun pixels -> pixels.[50*100+50]
+        let opacity, shape = sample "", sample "/Shape gs "
+        check "default group boundary removes earlier red despite zero painted opacity"
+            (Pixel.r opacity > 245uy && Pixel.g opacity > 245uy)
+        check "AIS group boundary knocks out only half the previous red"
+            (Pixel.r shape > 245uy && Pixel.g shape > 110uy && Pixel.g shape < 190uy && Pixel.b shape > 110uy))
+
+    test "PDF image SMask is AIS-dependent; image masks override the graphics-state mask" (fun () ->
+        let rgb = "\xff\x00\x00\xff\x00\x00"
+        let image suffix =
+            $"<</Type /XObject /Subtype /Image /Width 2 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceRGB {suffix} /Length 6>>\nstream\n{rgb}\nendstream"
+        let soft = "<</Type /XObject /Subtype /Image /Width 2 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 2>>\nstream\n\x80\x80\nendstream"
+        let hard = "<</Type /XObject /Subtype /Image /Width 2 /Height 1 /ImageMask true /BitsPerComponent 1 /Length 1>>\nstream\n\x40\nendstream"
+        let zero = "0 0 0 0 re f"
+        let maskGroup = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true>> /Length {zero.Length}>>\nstream\n{zero}\nendstream"
+        let content = "0 0 1 rg 0 0 100 100 re f /Zero gs q 100 0 0 100 0 0 cm /Im Do Q"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</XObject <</Im 7 0 R>> /ExtGState <</Zero <</SMask <</S /Alpha /G 10 0 R>>>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let sample suffix shape =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources
+                [5,form;7,image suffix;8,soft;9,hard;10,maskGroup]
+                ((if shape then "/Shape gs " else "") + "/F Do") 1.0 |> rasterize
+        let plain = sample "" false
+        let imageSoftOpacity = sample "/SMask 8 0 R" false
+        let imageSoftShape = sample "/SMask 8 0 R" true
+        let explicit = sample "/Mask 9 0 R" false
+        let both = sample "/Mask 9 0 R /SMask 8 0 R" false
+        let nonJpxMaskInData = sample "/SMaskInData 1" false
+        let left (p: uint32[]) = p.[50*100+25]
+        let right (p: uint32[]) = p.[50*100+75]
+        check "ordinary image obeys zero graphics-state mask" (Pixel.g (left plain) > 245uy)
+        check "SMaskInData is ignored outside JPX and cannot suppress the graphics-state mask"
+            (Pixel.g (left nonJpxMaskInData) > 245uy)
+        check "image SMask overrides graphics-state mask" (Pixel.r (left imageSoftOpacity) > 245uy && Pixel.g (left imageSoftOpacity) < 200uy)
+        check "image SMask changes knockout coverage with AIS" (Pixel.r (left imageSoftShape) < 200uy && Pixel.g (left imageSoftShape) < 20uy)
+        check "explicit Mask is geometric and overrides graphics-state SMask"
+            (Pixel.r (left explicit) > 245uy && Pixel.g (left explicit) < 20uy &&
+             Pixel.r (right explicit) < 20uy && Pixel.b (right explicit) > 245uy)
+        check "SMask overrides image Mask, including the Mask's transparent sample"
+            (Pixel.r (right both) > 245uy && Pixel.g (right both) < 200uy))
+
+    test "JPX embedded soft mask has precedence and retains AIS shape semantics" (fun () ->
+        use stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("ais-rgba-jpx.base64")
+        use reader = new System.IO.StreamReader(stream)
+        let bytes = Convert.FromBase64String(reader.ReadToEnd())
+        let encoded = text bytes
+        let image = $"<</Type /XObject /Subtype /Image /Width 32 /Height 8 /ColorSpace /DeviceRGB /Filter /JPXDecode /SMaskInData 1 /SMask 6 0 R /Mask [0 0 0 0 255 255] /Length {bytes.Length}>>\nstream\n{encoded}\nendstream"
+        let zeroImage = "<</Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1>>\nstream\n\x00\nendstream"
+        let zeroGroup = "<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true>> /Resources <<>> /Length 0>>\nstream\n\nendstream"
+        let content = "1 0 0 rg 0 0 100 100 re f /Alpha gs q 100 0 0 100 0 0 cm /Im Do Q"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</XObject <</Im 5 0 R>> /ExtGState <</Alpha <</ca 0.5 /SMask <</S /Alpha /G 8 0 R>>>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = "/XObject <</F 7 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let sample prefix =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,image;6,zeroImage;7,form;8,zeroGroup]
+                (prefix + "/F Do") 1.0 |> rasterize
+        let opacity, shape = sample "", sample "/Shape gs "
+        let rgbNear (r,g,b) pixel =
+            abs(int(Pixel.r pixel)-r) <= 2 && abs(int(Pixel.g pixel)-g) <= 2 && abs(int(Pixel.b pixel)-b) <= 2
+        check "zero embedded opacity still knocks out earlier geometry" (rgbNear (255,255,255) opacity.[5025])
+        check "embedded alpha overrides image and graphics-state masks" (rgbNear (191,191,255) opacity.[5075])
+        check "zero embedded shape retains earlier geometry" (rgbNear (255,0,0) shape.[5025])
+        check "embedded shape and ca multiply once" (rgbNear (191,0,64) shape.[5075]))
+
+    test "stencil intrinsic shape does not override the graphics-state soft mask" (fun () ->
+        let stencil = "<</Type /XObject /Subtype /Image /Width 2 /Height 1 /ImageMask true /BitsPerComponent 1 /Length 1>>\nstream\n\x40\nendstream"
+        let zeroGroup = "<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true>> /Resources <<>> /Length 0>>\nstream\n\nendstream"
+        let resources = "/XObject <</Im 5 0 R>> /ExtGState <</Zero <</SMask <</S /Alpha /G 6 0 R>>>>>>"
+        let pixels = renderFixture "/MediaBox [0 0 100 100]" "" resources [5,stencil;6,zeroGroup]
+                         "0 0 1 rg 0 0 100 100 re f /Zero gs 1 0 0 rg q 100 0 0 100 0 0 cm /Im Do Q" 1.0 |> rasterize
+        check "graphics-state zero soft mask suppresses stencil ink"
+            (Pixel.r pixels.[5025] = 0uy && Pixel.b pixels.[5025] = 255uy))
+
+    test "inline stencil geometric shape remains distinct from zero paint alpha" (fun () ->
+        let content = "0 0 1 rg 0 0 100 100 re f /Zero gs 1 0 0 rg q 100 0 0 100 0 0 cm BI /W 2 /H 1 /IM true /BPC 1 ID \x40 EI Q"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</ExtGState <</Zero <</ca 0>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let sample prefix =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,form] (prefix + "/F Do") 1.0 |> rasterize
+        let defaultPixels, shapedPixels = sample "", sample "/Shape gs "
+        let left (p: uint32[]) = p.[50*100+25]
+        let right (p: uint32[]) = p.[50*100+75]
+        check "zero-alpha stencil knocks out only its inked sample by default"
+            (Pixel.r (left defaultPixels) > 245uy && Pixel.r (right defaultPixels) < 20uy)
+        check "AIS true zero-alpha stencil cannot knock out prior ink"
+            (Pixel.r (left shapedPixels) < 20uy && Pixel.b (left shapedPixels) > 245uy))
+
+    test "pattern cell opacity does not become its intrinsic shape under caller AIS" (fun () ->
+        let tileContent = "/Inner gs 1 0 0 rg 0 0 5 10 re f"
+        let tile = $"<</Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources <</ExtGState <</Inner <</ca 0.5 /AIS false>>>>>> /Length {tileContent.Length}>>\nstream\n{tileContent}\nendstream"
+        let formContent = "0 0 1 rg 0 0 100 100 re f /Pattern cs /P scn 0 0 100 100 re f"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</Pattern <</P 6 0 R>>>> /Length {formContent.Length}>>\nstream\n{formContent}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let pixels =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,form;6,tile]
+                "/Shape gs /F Do" 1.0 |> rasterize
+        let ink, gap = pixels.[50*100+22], pixels.[50*100+27]
+        check "half-transparent tile ink knocks out opaque blue with full cell geometry"
+            (Pixel.r ink > 245uy && Pixel.g ink > 110uy && Pixel.b ink > 110uy)
+        check "unpainted half of tile does not knock out underlying blue"
+            (Pixel.r gap < 20uy && Pixel.b gap > 245uy))
+
+    test "shading ca changes geometric coverage only when AIS true" (fun () ->
+        let shading = "<</ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 50 100 50] /Function <</FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [1 0 0] /N 1>> /Extend [true true]>>"
+        let content = "0 0 1 rg 0 0 100 100 re f /Half gs /Red sh"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</Shading <</Red 6 0 R>> /ExtGState <</Half <</ca 0.5>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let sample state =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,form;6,shading]
+                (state + "/F Do") 1.0 |> rasterize |> fun pixels -> pixels.[50*100+50]
+        let opacity, shape = sample "", sample "/Shape gs "
+        check "default shading alpha knocks out opaque underpaint" (Pixel.r opacity > 245uy && Pixel.g opacity > 110uy)
+        check "AIS shading alpha retains underpaint without duplicating the shader"
+            (Pixel.r shape < 200uy && Pixel.g shape < 20uy && Pixel.b shape > 110uy))
+
+    test "PDF AIS text fill uses glyph geometry rather than opacity as knockout shape" (fun () ->
+        let content = "0 0 1 rg 0 0 100 100 re f /Half gs 1 0 0 rg BT /F1 80 Tf 1 0 0 1 10 10 Tm (A) Tj ET"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <<{testFont} /ExtGState <</Half <</ca 0.5>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = "/XObject <</F 5 0 R>> /ExtGState <</Shape <</AIS true>>>>"
+        let sample prefix =
+            renderFixture "/MediaBox [0 0 100 100]" "" resources [5,form]
+                (prefix + "/F Do") 1.0 |> rasterize
+        let opacity, shape = sample "", sample "/Shape gs "
+        let mutable glyphPixels = 0
+        for i in 0 .. opacity.Length-1 do
+            let a, b = opacity.[i], shape.[i]
+            if Pixel.r a > 240uy && Pixel.g a > 80uy && Pixel.g a < 180uy &&
+               Pixel.r b < 200uy && Pixel.g b < 30uy && Pixel.b b > 80uy then
+                glyphPixels <- glyphPixels + 1
+        check "cached glyph paint retains half opacity but changes knockout coverage" (glyphPixels > 20))
 
     test "ICC luminosity masks composite in group space before PCS and transfer" (fun () ->
         // Adobe RGB (1998), D50 matrix primaries and a 563/256 gamma TRC.

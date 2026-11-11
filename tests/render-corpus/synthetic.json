@@ -719,6 +719,74 @@
       ],
       "description": "A rectangular clip intersects a diamond clip across consecutive fills and a third shading clip; Q restores each parent.",
       "expected": "A red-left/green-right diamond clipped to an inset square contains a cyan central region. A later blue bar spans the outer clip's top even outside the diamond; the final magenta strip lies outside all prior clips. Corners excluded by the diamond remain white."
+    },
+    {
+      "id": "synth-ais-paints",
+      "path": "generated/synth-ais-paints.pdf",
+      "sha256": "d551c2c5323c220d339253ba3d690fe322e383656699638469148e5d46e0785a",
+      "bytes": 10943,
+      "tags": [
+        "transparency",
+        "ais",
+        "knockout",
+        "path",
+        "stroke",
+        "shading",
+        "pattern",
+        "type3"
+      ],
+      "description": "Five rows of fill, stroke, shading, tiling pattern and Type3 glyph paints; columns alternate opacity/shape alpha in isolated then nonisolated knockout groups.",
+      "expected": "Each interior overlap is cyan (0,128,127) in opacity columns and purple (128,0,127) in shape columns. AIS true preserves half the preceding red; AIS false knocks red out. Stroke coverage is confined to its central band. Indirect true AIS values must be resolved."
+    },
+    {
+      "id": "synth-ais-masks",
+      "path": "generated/synth-ais-masks.pdf",
+      "sha256": "515f5a47ffee2a787bfb61178b4eda5cc96d020dcf4856aedec159105c53bb09",
+      "bytes": 8625,
+      "tags": [
+        "transparency",
+        "ais",
+        "knockout",
+        "soft-mask",
+        "luminosity",
+        "transfer"
+      ],
+      "description": "Alpha, luminosity and inverse-alpha mask rows distinguish mask shape from opacity, including outside the mask BBox.",
+      "expected": "On each panel's left half, opacity columns are near (0,191,64) and shape columns (191,0,64). Outside the mask BBox, top two rows are green for opacity and red for shape. The inverse-transfer bottom row instead gives cyan/purple half-alpha outside the BBox."
+    },
+    {
+      "id": "synth-ais-nested-groups",
+      "path": "generated/synth-ais-nested-groups.pdf",
+      "sha256": "57e4aceacda84644e992a0d93f599fa012e983e810a260d94ca1a1704e725a3f",
+      "bytes": 9518,
+      "tags": [
+        "transparency",
+        "ais",
+        "knockout",
+        "form",
+        "icc",
+        "blend-mode"
+      ],
+      "description": "Nested color-managed Forms distinguish internal opacity from internal shape and outer AIS. Rows alternate isolated/nonisolated parents, then repeat with Difference at the nested boundary.",
+      "expected": "Within painted shape, first three rows have column RGB near (0,223,32), (128,96,32), (223,0,32), (128,128,0). Nonisolated Difference bottom row gives (0,255,32), (128,128,32), (223,32,32), (128,128,0). The rightmost strip inside each Form BBox remains red: BBox is not object shape. Transparent intrinsic opacity must not become zero shape."
+    },
+    {
+      "id": "synth-ais-image-masks",
+      "path": "generated/synth-ais-image-masks.pdf",
+      "sha256": "fb64c184c1fd262dc822041997f9ac665d35303bd997cbb8d907046013b57df4",
+      "bytes": 16649,
+      "tags": [
+        "transparency",
+        "ais",
+        "knockout",
+        "image",
+        "soft-mask",
+        "stencil",
+        "inline-image",
+        "jpx"
+      ],
+      "description": "Image SMask and color-key masks override a zero graphics-state mask; stencil and inline images obey a half graphics-state mask; JPX embedded alpha overrides conflicting masks.",
+      "expected": "Soft-mask row: opacity panels have green left and quarter-blue cyan right; shape panels retain red left and quarter-blue purple right. Color-key row: red left in all columns, cyan/purple right. Stencil row: quarter-blue cyan/purple left and red right. Inline-image row is uniformly quarter-blue cyan/purple. JPX row matches the first row despite its zero SMask, all-masking color key and zero graphics-state mask."
     }
   ]
 }

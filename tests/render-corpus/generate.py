@@ -5,6 +5,7 @@ Only the Python standard library is required. Run from any working directory:
     python3 tests/render-corpus/generate.py
 """
 
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -593,6 +594,98 @@ def many_pages():
     return pdf.serialize(catalog)
 
 
+def ais_fixture(kind):
+    rows = {"paints": 5, "masks": 3, "groups": 4, "images": 5}[kind]
+
+    def setup(pdf):
+        true_value = pdf.add("true")
+        states = (f"/Off << /AIS false /ca 0.5 /CA 0.5 >> "
+                  f"/On << /AIS {true_value} 0 R /ca 0.5 /CA 0.5 >>")
+        resources = ""
+        if kind == "paints":
+            function = pdf.add("<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [0 0 1] /N 1 >>")
+            shade = pdf.add(f"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 40 0] /Function {function} 0 R /Extend [true true] >>")
+            tile = pdf.stream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+                              "0 0 1 rg 0 0 10 10 re f")
+            glyph = pdf.stream("", "1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f")
+            font = pdf.add(f"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] "
+                           f"/CharProcs << /A {glyph} 0 R >> /Encoding << /Type /Encoding /Differences [65 /A] >> "
+                           "/FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>")
+            resources = f"/Shading << /Blue {shade} 0 R >> /Pattern << /Tile {tile} 0 R >> /Font << /Square {font} 0 R >>"
+            paints = ["0 0 40 40 re f", "20 w 0 20 m 40 20 l S", "/Blue sh",
+                      "/Pattern cs /Tile scn 0 0 40 40 re f", "BT /Square 40 Tf 0 0 Td (A) Tj ET"]
+        elif kind in ("masks", "images"):
+            mask_width = 20 if kind == "masks" else 40
+            alpha = pdf.stream(f"/Type /XObject /Subtype /Form /BBox [0 0 {mask_width} 40] "
+                               "/Group << /S /Transparency /CS /DeviceGray /I true >> "
+                               "/Resources << /ExtGState << /Half << /ca 0.5 >> >> >>",
+                               f"/Half gs 1 g 0 0 {mask_width} 40 re f")
+            luminosity = pdf.stream(f"/Type /XObject /Subtype /Form /BBox [0 0 {mask_width} 40] "
+                                    "/Group << /S /Transparency /CS /DeviceGray /I true >> /Resources << >>",
+                                    f"0.5 g 0 0 {mask_width} 40 re f")
+            zero = pdf.stream("/Type /XObject /Subtype /Form /BBox [0 0 40 40] "
+                             "/Group << /S /Transparency /CS /DeviceGray /I true >> /Resources << >>", "")
+            inverse = pdf.add("<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>")
+            states += (f" /Alpha << /SMask << /S /Alpha /G {alpha} 0 R >> >>"
+                       f" /Luminosity << /SMask << /S /Luminosity /G {luminosity} 0 R >> >>"
+                       f" /Inverse << /SMask << /S /Alpha /G {alpha} 0 R /TR {inverse} 0 R >> >>"
+                       f" /ZeroMask << /SMask << /S /Alpha /G {zero} 0 R >> >>")
+            if kind == "masks":
+                paints = [f"/{name} gs 0 0 40 40 re f" for name in ("Alpha", "Luminosity", "Inverse")]
+            else:
+                soft = image(pdf, 2, 1, 8, "DeviceGray", [0, 128])
+                blue = image(pdf, 2, 1, 8, "DeviceRGB", [0, 0, 255] * 2,
+                             f"/SMask {soft} 0 R /Mask [0 0 0 0 255 255]")
+                keyed = image(pdf, 2, 1, 8, "DeviceRGB", [255, 0, 0, 0, 0, 255], "/Mask [255 255 0 0 0 0]")
+                stencil_image = pdf.stream("/Type /XObject /Subtype /Image /Width 2 /Height 1 /ImageMask true /BitsPerComponent 1 /Decode [0 1]", bytes([0x40]))
+                encoded = base64.b64decode((ROOT.parent / "Rbt.Pdf.Tests" / "ais-rgba-jpx.base64").read_text())
+                ignored_soft = image(pdf, 1, 1, 8, "DeviceGray", [0])
+                jpx = pdf.stream("/Type /XObject /Subtype /Image /Width 32 /Height 8 /ColorSpace /DeviceRGB "
+                                 f"/Filter /JPXDecode /SMaskInData 1 /SMask {ignored_soft} 0 R /Mask [0 0 0 0 255 255]", encoded)
+                resources = f"/XObject << /Soft {blue} 0 R /Keyed {keyed} 0 R /Stencil {stencil_image} 0 R /Jpx {jpx} 0 R >>"
+                paints = ["/ZeroMask gs 40 0 0 40 0 0 cm /Soft Do",
+                          "/ZeroMask gs 40 0 0 40 0 0 cm /Keyed Do",
+                          "/Alpha gs 40 0 0 40 0 0 cm /Stencil Do",
+                          "/Alpha gs 40 0 0 40 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /RGB /F /AHx ID 0000ff> EI",
+                          "/ZeroMask gs 40 0 0 40 0 0 cm /Jpx Do"]
+        else:
+            profile = pdf.stream("/N 3", icc_profiles.linear_rgb())
+            children = []
+            for name, ais, opacity in (("Opacity", False, 0.25), ("Shape", True, 0.25), ("Zero", False, 0)):
+                child = pdf.stream("/Type /XObject /Subtype /Form /BBox [0 0 40 40] "
+                                   f"/Group << /S /Transparency /CS [/ICCBased {profile} 0 R] /I true >> "
+                                   f"/Resources << /ExtGState << /Inner << /AIS {str(ais).lower()} /ca {opacity} >> >> >>",
+                                   "/Inner gs 0 0 1 rg 0 0 30 40 re f")
+                children.append(f"/{name} {child} 0 R")
+            resources = f"/XObject << {' '.join(children)} >>"
+            states += " /Difference << /BM /Difference >>"
+        forms = []
+        for row in range(rows):
+            for column in range(4):
+                if kind == "groups":
+                    isolated = row % 2 == 0
+                    state = "Off" if column == 0 else "On"
+                    paint = f"/{['Opacity', 'Opacity', 'Shape', 'Zero'][column]} Do"
+                    if row >= 2:
+                        paint = "/Difference gs " + paint
+                else:
+                    isolated = column < 2
+                    state = "On" if column % 2 else "Off"
+                    paint = paints[row]
+                form = pdf.stream("/Type /XObject /Subtype /Form /BBox [0 0 40 40] "
+                                  f"/Group << /S /Transparency /I {str(isolated).lower()} /K true >> "
+                                  f"/Resources << /ExtGState << {states} >> {resources} >>",
+                                  f"1 0 0 rg 0 0 40 40 re f q /{state} gs 0 0 1 rg 0 0 1 RG {paint} Q")
+                forms.append(f"/P{row}_{column} {form} 0 R")
+        return f"/XObject << {' '.join(forms)} >>"
+
+    commands = [f"0 1 0 rg 0 0 200 {rows * 50} re f"]
+    for row in range(rows):
+        for column in range(4):
+            commands.append(f"q 1 0 0 1 {column * 50 + 5} {(rows - row - 1) * 50 + 5} cm /P{row}_{column} Do Q")
+    return page(" ".join(commands), setup=setup, page_options=f"/MediaBox [0 0 200 {rows * 50}]")
+
+
 # Each entry contains PDF operators and an explicit human-readable visual oracle.
 CASES = [
     dict(id="paths-basic", tags=["paths", "fill", "stroke"], description="Basic filled and stroked path primitives.", expected="A red rectangle, a blue triangle, and a thick green cubic curve on white.", content="1 0.2 0.15 rg 25 140 70 65 re f\n0.1 0.3 0.9 rg 120 140 m 190 140 l 155 210 l h f\n0 0.6 0.2 RG 7 w 220 145 m 250 220 280 80 305 190 c S\n"),
@@ -645,6 +738,10 @@ CASES = [
     dict(id="icc-lut8-xyz-managed-source", tags=["icc", "lut", "xyz", "gamut", "transparency", "image", "shading", "pattern"], description="CMYK lut8 XYZ wide-gamut source paints inside an Adobe RGB page.", expected="All four quadrants agree: half-K attenuated Adobe green at 75 percent opacity over red. Source XYZ must not roundtrip through clipped sRGB before blending; independent profile-to-profile conversion supplies the color oracle.", factory=lambda: icc_lut_source_blending(8, True)),
     dict(id="icc-lut16-xyz-managed-source", tags=["icc", "lut", "xyz", "gamut", "transparency", "image", "shading", "pattern"], description="CMYK lut16 XYZ wide-gamut source paints inside an Adobe RGB page.", expected="All four quadrants agree with the higher precision version of lut8-xyz-managed-source, preserving out-of-sRGB gamut coordinates and the fourth input component.", factory=lambda: icc_lut_source_blending(16, True)),
     dict(id="nested-clip-paints", tags=["clip", "nested", "path", "shading", "graphics-state"], description="A rectangular clip intersects a diamond clip across consecutive fills and a third shading clip; Q restores each parent.", expected="A red-left/green-right diamond clipped to an inset square contains a cyan central region. A later blue bar spans the outer clip's top even outside the diamond; the final magenta strip lies outside all prior clips. Corners excluded by the diamond remain white.", page_options="/MediaBox [0 0 200 200]", setup=nested_clip_paints, content="q 20 20 160 160 re W n q 100 10 m 190 100 l 100 190 l 10 100 l h W n 1 0 0 rg 0 0 200 200 re f 0 1 0 rg 100 0 100 200 re f q 40 40 120 120 re W n /Cyan sh Q Q 0 0 1 rg 20 160 160 20 re f Q 1 0 1 rg 0 0 15 200 re f"),
+    dict(id="ais-paints", tags=["transparency", "ais", "knockout", "path", "stroke", "shading", "pattern", "type3"], description="Five rows of fill, stroke, shading, tiling pattern and Type3 glyph paints; columns alternate opacity/shape alpha in isolated then nonisolated knockout groups.", expected="Each interior overlap is cyan (0,128,127) in opacity columns and purple (128,0,127) in shape columns. AIS true preserves half the preceding red; AIS false knocks red out. Stroke coverage is confined to its central band. Indirect true AIS values must be resolved.", factory=lambda: ais_fixture("paints")),
+    dict(id="ais-masks", tags=["transparency", "ais", "knockout", "soft-mask", "luminosity", "transfer"], description="Alpha, luminosity and inverse-alpha mask rows distinguish mask shape from opacity, including outside the mask BBox.", expected="On each panel's left half, opacity columns are near (0,191,64) and shape columns (191,0,64). Outside the mask BBox, top two rows are green for opacity and red for shape. The inverse-transfer bottom row instead gives cyan/purple half-alpha outside the BBox.", factory=lambda: ais_fixture("masks")),
+    dict(id="ais-nested-groups", tags=["transparency", "ais", "knockout", "form", "icc", "blend-mode"], description="Nested color-managed Forms distinguish internal opacity from internal shape and outer AIS. Rows alternate isolated/nonisolated parents, then repeat with Difference at the nested boundary.", expected="Within painted shape, first three rows have column RGB near (0,223,32), (128,96,32), (223,0,32), (128,128,0). Nonisolated Difference bottom row gives (0,255,32), (128,128,32), (223,32,32), (128,128,0). The rightmost strip inside each Form BBox remains red: BBox is not object shape. Transparent intrinsic opacity must not become zero shape.", factory=lambda: ais_fixture("groups")),
+    dict(id="ais-image-masks", tags=["transparency", "ais", "knockout", "image", "soft-mask", "stencil", "inline-image", "jpx"], description="Image SMask and color-key masks override a zero graphics-state mask; stencil and inline images obey a half graphics-state mask; JPX embedded alpha overrides conflicting masks.", expected="Soft-mask row: opacity panels have green left and quarter-blue cyan right; shape panels retain red left and quarter-blue purple right. Color-key row: red left in all columns, cyan/purple right. Stencil row: quarter-blue cyan/purple left and red right. Inline-image row is uniformly quarter-blue cyan/purple. JPX row matches the first row despite its zero SMask, all-masking color key and zero graphics-state mask.", factory=lambda: ais_fixture("images")),
 ]
 
 

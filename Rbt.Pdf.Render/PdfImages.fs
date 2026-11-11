@@ -63,8 +63,9 @@ let private pack r g b a =
     let mul c = byte ((int c * int a + 127) / 255)
     Pixel.pack (mul b) (mul g) (mul r) a
 
-/// Decode an image XObject or an equivalent inline image stream into premultiplied pixels.
-let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte)) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) depth : (int * int * uint32[]) option =
+/// The optional pixels retain geometric coverage before a soft image mask.
+/// A soft image mask contributes to shape only when the caller's AIS is true.
+let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte)) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) depth : (int * int * uint32[] * uint32[] option * bool * bool) option =
     if depth > 8 then None else
     let w, h = integer doc "Width" obj, integer doc "Height" obj
     let stencil = match Pdf.dictGet doc "ImageMask" obj |> Option.map (Pdf.deref doc) with Some (PdfBool true) -> true | _ -> false
@@ -75,6 +76,14 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
     let fax = last = "CCITTFaxDecode" || last = "CCF"
     let jbig2 = last = "JBIG2Decode"
     let jpx = last = "JPXDecode"
+    let embeddedMaskMode = if jpx then integer doc "SMaskInData" obj else 0
+    let embeddedSoftMask = embeddedMaskMode = 1 || embeddedMaskMode = 2
+    let explicitSoftMask =
+        if embeddedSoftMask then None
+        else Pdf.dictGet doc "SMask" obj |> Option.bind (fun m -> match Pdf.deref doc m with PdfStream _ -> Some m | _ -> None)
+    let imageMask =
+        if stencil || embeddedSoftMask || explicitSoftMask.IsSome then None
+        else Pdf.dictGet doc "Mask" obj |> Option.map (Pdf.deref doc)
     let special = jpeg || fax || jbig2 || jpx
     let prefix = if special then fs |> List.take (fs.Length - 1) else fs
     let bits = if stencil || fax || jbig2 then 1 else let b = integer doc "BitsPerComponent" obj in if b = 0 then 8 else b
@@ -108,8 +117,8 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
         if jpx then
             match JpxDecode.decodeWithColorSpace (dataFor doc obj prefix) with
             | Some (dw, dh, components, bytes, containerCS) when dw = w && dh = h && components > 0 && int64 bytes.Length >= int64 w * int64 h * int64 components ->
-                let smask = match Pdf.dictGet doc "SMaskInData" obj |> Option.map (Pdf.deref doc) with Some (PdfInt n) -> int n | _ -> 0
-                let hasAlpha = smask = 1 || smask = 2
+                let smask = embeddedMaskMode
+                let hasAlpha = embeddedSoftMask
                 let colorCount = components - (if hasAlpha then 1 else 0)
                 let cs = match space with Some s -> Some s | None when Pdf.dictGet doc "ColorSpace" obj |> Option.isNone -> PdfColor.device colorCount | None -> None
                 match cs with
@@ -118,7 +127,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                     let values = Array.zeroCreate<float> colorCount
                     let defaults = if PdfColor.isIndexed cs then [|0.0; 255.0|] else PdfColor.ranges cs
                     let decodeRanges = decodeArray doc obj colorCount defaults
-                    let key = match Pdf.dictGet doc "Mask" obj |> Option.map (Pdf.deref doc) with Some (PdfArray a) when a.Length = 2*colorCount -> Some (a |> List.map (Pdf.deref doc >> number >> int) |> List.toArray) | _ -> None
+                    let key = match imageMask with Some (PdfArray a) when a.Length = 2*colorCount -> Some (a |> List.map (Pdf.deref doc >> number >> int) |> List.toArray) | _ -> None
                     let matte =
                         match smask, (Pdf.dictGet doc "Matte" obj |> Option.map (Pdf.deref doc)) with
                         | 2, Some (PdfArray entries) when entries.Length = colorCount ->
@@ -148,12 +157,12 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                                 if smask = 2 && matte.IsNone then
                                     Pixel.pack (min b alpha) (min g alpha) (min r alpha) alpha
                                 else pack r g b alpha
-                    Some (pixels, None)
+                    Some pixels
                 | _ -> invalidOp "Unsupported JPEG 2000 image color space or component count"
             | _ -> invalidOp "Unable to decode JPEG 2000 image"
         elif jpeg then
             let bytes = dataFor doc obj prefix
-            let key = match Pdf.dictGet doc "Mask" obj |> Option.map (Pdf.deref doc) with Some (PdfArray a) -> Some (a |> List.map (Pdf.deref doc >> number >> int) |> List.toArray) | _ -> None
+            let key = match imageMask with Some (PdfArray a) -> Some (a |> List.map (Pdf.deref doc >> number >> int) |> List.toArray) | _ -> None
             let parms = filterParameters doc obj
             let transform =
                 match Pdf.dictGet doc "ColorTransform" parms |> Option.map (Pdf.deref doc) with
@@ -181,7 +190,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                         if not masked then
                             let struct(r,g,b) = toTarget cs values
                             pixels.[i] <- pack r g b 255uy
-                    Some (pixels, None)
+                    Some pixels
                 | _ -> None
             | None when Pdf.dictGet doc "ColorSpace" obj |> Option.isSome -> None
             | _ ->
@@ -200,7 +209,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                                 values.[2] <- float (Pixel.b p) / float a
                                 let struct(r,g,b) = toTarget cs values
                                 converted.[i] <- pack r g b a
-                        Some (converted, None))
+                        Some converted)
         else
             match space with
             | None -> None
@@ -211,7 +220,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                 let maxSample = (1 <<< bits) - 1
                 let defaults = if PdfColor.isIndexed cs then [|0.0; float maxSample|] else PdfColor.ranges cs
                 let ranges = decodeArray doc obj n defaults
-                let key = match Pdf.dictGet doc "Mask" obj |> Option.map (Pdf.deref doc) with Some (PdfArray a) when a.Length = n*2 -> Some (a |> List.map (Pdf.deref doc >> number >> int) |> List.toArray) | _ -> None
+                let key = match imageMask with Some (PdfArray a) when a.Length = n*2 -> Some (a |> List.map (Pdf.deref doc >> number >> int) |> List.toArray) | _ -> None
                 let pixels = Array.zeroCreate<uint32> (w*h)
                 let samples = Array.zeroCreate<int> n
                 let values = Array.zeroCreate<float> n
@@ -233,18 +242,24 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                             else
                                 let struct(r,g,b) = toTarget cs values
                                 pixels.[y*w+x] <- pack r g b 255uy
-                Some (pixels, Some samples)
+                Some pixels
             | _ -> None
+    let explicitMask = imageMask |> Option.bind (function PdfStream _ as mask -> Some mask | _ -> None)
+    let maskOverridesState =
+        explicitMask.IsSome || (match imageMask with Some (PdfArray _) -> true | _ -> false)
+    let hasGeometricMask = stencil || maskOverridesState
     match decoded with
     | None -> None
-    | Some (pixels, _) ->
-        let maskObj = Pdf.dictGet doc "SMask" obj |> Option.bind (fun m -> match Pdf.deref doc m with PdfStream _ -> Some m | _ -> None)
-        let maskObj = match maskObj with Some _ -> maskObj | None -> Pdf.dictGet doc "Mask" obj |> Option.bind (fun m -> match Pdf.deref doc m with PdfStream _ -> Some m | _ -> None)
+    | Some pixels ->
+        let geometricPixels =
+            if explicitSoftMask.IsSome && hasGeometricMask then Some pixels else None
+        let colorPixels = if explicitSoftMask.IsSome && hasGeometricMask then Array.copy pixels else pixels
+        let maskObj = explicitSoftMask |> Option.orElse explicitMask
         let mutable maskDecoded = true
         match maskObj with
         | Some mask ->
             match decode decodeJpeg PdfColor.toRgb doc resources mask (Color.rgba 255uy 255uy 255uy 255uy) (depth+1) with
-            | Some (mw,mh,mp) ->
+            | Some (mw,mh,mp,_,_,_) ->
                 let isStencil = match Pdf.dictGet doc "ImageMask" mask |> Option.map (Pdf.deref doc) with Some (PdfBool true) -> true | _ -> false
                 let matte =
                     match space, (Pdf.dictGet doc "Matte" mask |> Option.map (Pdf.deref doc)) with
@@ -257,7 +272,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                         let i = y*w+x
                         let m = mp.[(y*mh/h)*mw + x*mw/w]
                         let a = if isStencil then int (Pixel.a m) else int (Pixel.r m)
-                        let p = pixels.[i]
+                        let p = colorPixels.[i]
                         let scale v = byte ((int v * a + 127)/255)
                         let r,g,b =
                             match matte with
@@ -267,7 +282,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                                     byte (min alpha (max 0 (int v - ((int mv * (255-a) * int (Pixel.a p) + 32512) / 65025))))
                                 unblend (Pixel.r p) mr, unblend (Pixel.g p) mg, unblend (Pixel.b p) mb
                             | None -> scale (Pixel.r p), scale (Pixel.g p), scale (Pixel.b p)
-                        pixels.[i] <- Pixel.pack b g r (scale (Pixel.a p))
+                        colorPixels.[i] <- Pixel.pack b g r (scale (Pixel.a p))
             | None -> maskDecoded <- false
         | None -> ()
-        if maskDecoded then Some (w,h,pixels) else None
+        if maskDecoded then Some (w,h,colorPixels,geometricPixels,explicitSoftMask.IsSome || embeddedSoftMask,maskOverridesState) else None

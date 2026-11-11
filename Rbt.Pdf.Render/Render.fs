@@ -24,6 +24,7 @@ type GraphicsState = {
     DashOffset: float<px>
     FillAlpha: float
     StrokeAlpha: float
+    AlphaIsShape: bool
     FontName: string
     FontSize: float
     CharSpacing: float
@@ -54,6 +55,7 @@ let private defaultState = {
     DashOffset = 0.0<px>
     FillAlpha = 1.0
     StrokeAlpha = 1.0
+    AlphaIsShape = false
     FontName = ""
     FontSize = 12.0
     CharSpacing = 0.0
@@ -252,6 +254,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
             if depth > 32 then invalidOp "PDF content recursion limit exceeded"
             let mutable currentResources = resources
             let mutable defaultCTM = initialState.CTM
+            let mutable defaultAlphaIsShape = initialState.AlphaIsShape
 
             let tokens = tokenize contentData
 
@@ -284,10 +287,27 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                 | "Hue" -> Hue | "Saturation" -> Saturation
                 | "Color" -> ColorMode | "Luminosity" -> Luminosity
                 | _ -> invalidOp ("Unsupported PDF blend mode: " + name)
-            let addPaint command =
+            // Explicit shape is lazy: most objects need only their color pass.
+            // The graphics-state alpha and soft mask affect coverage only with AIS.
+            let addPaint alpha intrinsicShape useSoftMask command =
+                let mask = if useSoftMask then gs.SoftMask else None
+                let masked = match mask with Some commands -> Mask(commands, [command]) | None -> command
                 let mode = blendMode gs.BlendMode
-                let masked = match gs.SoftMask with Some mask -> Mask(mask, [command]) | None -> command
-                cmds.Add(if mode = Normal then masked else Blend(mode, [masked]))
+                let color = if mode = Normal then masked else Blend(mode, [masked])
+                if gs.AlphaIsShape && (alpha <> 1.0 || mask.IsSome) then
+                    let shape = lazy (
+                        let intrinsic =
+                            match intrinsicShape with
+                            | Some (shape: Lazy<Cmd list>) -> shape.Value
+                            | None -> [Cmd.shapeOf command]
+                        let withAlpha = if alpha = 1.0 then intrinsic else [Group(Matrix3x2.identity, alpha, intrinsic)]
+                        match mask with Some commands -> [Mask(commands, withAlpha)] | None -> withAlpha)
+                    cmds.Add(WithShape(shape, [color]))
+                else
+                    match intrinsicShape with
+                    | Some (shape: Lazy<Cmd list>) -> cmds.Add(WithShape(shape, [color]))
+                    | None when mask.IsSome -> cmds.Add(WithShape(lazy [Cmd.shapeOf command], [color]))
+                    | None -> cmds.Add color
             let charBoxes = ResizeArray<CharBox>()
             // Text state
             let mutable textMatrix = Matrix3x2.identity
@@ -348,7 +368,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     match Pdf.deref doc value with PdfInt n -> float n | PdfReal n -> n | _ -> 0.0
                 let get key obj = Pdf.dictGet doc key obj |> Option.map (Pdf.deref doc)
                 match get "Pattern" currentResources |> Option.bind (get name) with
-                | None -> []
+                | None -> [], lazy []
                 | Some pattern ->
                     let matrix =
                         match get "Matrix" pattern with
@@ -362,15 +382,17 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     | Some (PdfInt 2L) ->
                         match get "Shading" pattern with
                         | Some shading ->
-                            Shading.tryRenderObject toTarget doc currentResources shading patternToPage alpha bounds scale |> Option.toList
-                        | None -> []
+                            Shading.tryRenderObject toTarget doc currentResources shading patternToPage 1.0 bounds scale
+                            |> Option.map (fun command -> [Group(Matrix3x2.identity, alpha, [command])], lazy [Cmd.shapeOf command])
+                            |> Option.defaultValue ([], lazy [])
+                        | None -> [], lazy []
                     | Some (PdfInt 1L) ->
                         match get "BBox" pattern, get "XStep" pattern, get "YStep" pattern with
                         | Some (PdfArray [a; b; c; d]), Some xs, Some ys ->
                             let x0, y0, x1, y1 = number a, number b, number c, number d
                             let stepX, stepY = abs (number xs), abs (number ys)
                             let det = patternToPage.M11 * patternToPage.M22 - patternToPage.M12 * patternToPage.M21
-                            if stepX = 0.0 || stepY = 0.0 || x1 <= x0 || y1 <= y0 || abs det < 1e-10 then []
+                            if stepX = 0.0 || stepY = 0.0 || x1 <= x0 || y1 <= y0 || abs det < 1e-10 then [], lazy []
                             else
                                 let bx0, by0, bx1, by1 = bounds
                                 let firstX, lastX = int (ceil (-x1 / stepX)), int (floor ((stepX - x0) / stepX))
@@ -378,7 +400,9 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                 let tileResources = get "Resources" pattern |> Option.defaultValue currentResources
                                 let tileState =
                                     { gs with CTM = Matrix3x2.identity; FillPattern = None; StrokePattern = None
-                                              FillColor = color; StrokeColor = color; FillSource = source; StrokeSource = source; FillAlpha = 1.0; StrokeAlpha = 1.0 }
+                                              FillColor = { color with A = 255uy }; StrokeColor = { color with A = 255uy }
+                                              FillSource = source; StrokeSource = source; FillAlpha = 1.0; StrokeAlpha = 1.0
+                                              BlendMode = "Normal"; SoftMask = None; AlphaIsShape = defaultAlphaIsShape }
                                 let tileViewport =
                                     { viewport with Bounds = (x0, y0, x1, y1); Width = x1 - x0; Height = y1 - y0; Transform = Matrix3x2.identity }
                                 let tileScale = scale * max (sqrt (patternToPage.M11 ** 2.0 + patternToPage.M12 ** 2.0)) (sqrt (patternToPage.M21 ** 2.0 + patternToPage.M22 ** 2.0))
@@ -404,9 +428,12 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                       DX = 0.5 / sx; DY = stepY - 0.5 / sy }
                                 let placement = Matrix3x2.multiply fromPixels patternToPage
                                 let area = [MoveTo(vec2 bx0 by0); LineTo(vec2 bx1 by0); LineTo(vec2 bx1 by1); LineTo(vec2 bx0 by1); Close]
-                                [Group(Matrix3x2.identity, alpha, [FillPath(area, TilingPaint(image, placement, Repeat, Repeat), NonZero)])]
-                        | _ -> []
-                    | _ -> []
+                                let shape = lazy (
+                                    let shapeImage = opts.Rasterize width height [Cmd.shapeOf (Group(toPixels, 1.0, cells))]
+                                    [FillPath(area, TilingPaint(shapeImage, placement, Repeat, Repeat), NonZero)])
+                                [Group(Matrix3x2.identity, alpha, [FillPath(area, TilingPaint(image, placement, Repeat, Repeat), NonZero)])], shape
+                        | _ -> [], lazy []
+                    | _ -> [], lazy []
 
             let paintPath (segments: PathSeg list) fill stroke rule =
                 let bounds () =
@@ -426,8 +453,10 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         min y1 ((points |> List.maxBy (fun p -> p.Y) |> fun p -> float p.Y) + margin)
                 if fill then
                     match gs.FillPattern with
-                    | Some name -> addPaint (Clip(segments, rule, patternCommands name gs.FillColor gs.FillSource gs.FillAlpha (bounds ())))
-                    | None -> addPaint (FillPath(segments, Solid (fillColor gs), rule))
+                    | Some name ->
+                        let color, shape = patternCommands name gs.FillColor gs.FillSource gs.FillAlpha (bounds ())
+                        addPaint gs.FillAlpha (Some (lazy [Clip(segments, rule, shape.Value)])) true (Clip(segments, rule, color))
+                    | None -> addPaint gs.FillAlpha None true (FillPath(segments, Solid (fillColor gs), rule))
                 if stroke && abs (gs.CTM.M11 * gs.CTM.M22 - gs.CTM.M12 * gs.CTM.M21) > 1e-12 then
                     let style = makeStroke gs
                     let strokeCommand paint =
@@ -435,8 +464,10 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         else Group(gs.CTM, 1.0, [StrokePath(transformPath (Matrix3x2.inverse gs.CTM) segments, { style with Paint = paint })])
                     match gs.StrokePattern with
                     | Some name ->
-                        addPaint (Mask([strokeCommand (Solid Color.white)], patternCommands name gs.StrokeColor gs.StrokeSource gs.StrokeAlpha (bounds ())))
-                    | None -> addPaint (strokeCommand style.Paint)
+                        let color, shape = patternCommands name gs.StrokeColor gs.StrokeSource gs.StrokeAlpha (bounds ())
+                        let geometry = strokeCommand (Solid Color.white)
+                        addPaint gs.StrokeAlpha (Some (lazy [Mask([geometry], shape.Value)])) true (Mask([geometry], color))
+                    | None -> addPaint gs.StrokeAlpha None true (strokeCommand style.Paint)
 
             let getFontInfo () =
                 let key = Pdf.dictGet doc "Font" currentResources |> Option.bind (Pdf.dictGet doc gs.FontName)
@@ -573,7 +604,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                            Glyphs = Array.init (finish - first) (fun i -> snd glyphs.[first + i])
                                            Direction = Rbt.Shaper.Shaper.LeftToRight }
                                 first <- finish
-                            addPaint (Group(localToPage, 1.0, [DrawGlyphs(vec2 0.0 0.0, List.ofSeq runs, Solid(fillColor gs))]))
+                            addPaint gs.FillAlpha None true (Group(localToPage, 1.0, [DrawGlyphs(vec2 0.0 0.0, List.ofSeq runs, Solid(fillColor gs))]))
                         elif fill || stroke || clipping then
                             for glyphFont, glyph in glyphs do
                                 let size = fontSize / Text.unitsPerEm glyphFont
@@ -621,7 +652,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     let masks = paths |> List.map (fun segs -> FillPath(segs, Solid Color.white, NonZero))
                     Mask(masks, children)
 
-            let streamStack = Collections.Generic.Stack<Token[] * int * PdfObj * Matrix3x2 * PdfColor.WorkingSpace option * (int * bool * bool * ColorSpaceConversion option) option>()
+            let streamStack = Collections.Generic.Stack<Token[] * int * PdfObj * Matrix3x2 * bool * PdfColor.WorkingSpace option * (int * bool * bool * ColorSpaceConversion option) option>()
             let mutable tokenArr = tokens |> Array.ofList
             let mutable tokenCount = tokenArr.Length
             let mutable i = 0
@@ -633,11 +664,29 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     clipStack.Add(Some (cmds.Count, PathClip(clipSegs, clipRule)))
                 | None -> ()
 
+            let paintImage image =
+                match PdfImages.decode opts.DecodeJpeg toTarget doc currentResources image { (fillColor gs) with A = 255uy } 0 with
+                | Some (w, h, pixels, geometry, softImageMask, geometricMask) ->
+                    let interpolate = Pdf.dictGet doc "Interpolate" image |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                    let ctm, alpha = gs.CTM, gs.FillAlpha
+                    let command = Group(ctm, alpha, [BitmapPaint.command pixels w h interpolate])
+                    let intrinsic =
+                        if softImageMask && not gs.AlphaIsShape then
+                            Some (lazy (
+                                match geometry with
+                                | Some shapePixels -> [Cmd.shapeOf (Group(ctm, 1.0, [BitmapPaint.command shapePixels w h interpolate]))]
+                                | None ->
+                                    let square = [MoveTo(vec2 0.0 0.0); LineTo(vec2 1.0 0.0); LineTo(vec2 1.0 1.0); LineTo(vec2 0.0 1.0); Close]
+                                    [Group(ctm, 1.0, [FillPath(square, Solid Color.white, NonZero)])]))
+                        else None
+                    addPaint alpha intrinsic (not (softImageMask || geometricMask)) command
+                | None -> ()
+
             let mutable loopRunning = true
             while loopRunning do
                 if i >= tokenCount then
                     if streamStack.Count > 0 then
-                        let (prevArr, prevI, prevRes, prevDefaultCTM, prevWorking, groupStart) = streamStack.Pop()
+                        let (prevArr, prevI, prevRes, prevDefaultCTM, prevDefaultAIS, prevWorking, groupStart) = streamStack.Pop()
                         working <- prevWorking
                         if stateStack.Count > 0 then
                             gs <- stateStack.[stateStack.Count - 1]
@@ -657,15 +706,25 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         | Some (start, isolated, knockout, conversion) ->
                             let children = cmds |> Seq.skip start |> Seq.toList
                             cmds.RemoveRange(start, cmds.Count - start)
-                            match conversion with
-                            | Some conversion -> cmds.Add(ColorManagedGroup(conversion, isolated, knockout, gs.FillAlpha, blendMode gs.BlendMode, gs.SoftMask, children))
-                            | None -> cmds.Add(TransparencyGroup(isolated, knockout, gs.FillAlpha, blendMode gs.BlendMode, gs.SoftMask, children))
+                            let group =
+                                match conversion with
+                                | Some conversion -> ColorManagedGroup(conversion, isolated, knockout, gs.FillAlpha, blendMode gs.BlendMode, gs.SoftMask, children)
+                                | None -> TransparencyGroup(isolated, knockout, gs.FillAlpha, blendMode gs.BlendMode, gs.SoftMask, children)
+                            if gs.AlphaIsShape && (gs.FillAlpha <> 1.0 || gs.SoftMask.IsSome) then
+                                let alpha, mask = gs.FillAlpha, gs.SoftMask
+                                let shape = lazy (
+                                    let intrinsic = [Cmd.shapeOf group]
+                                    let withAlpha = if alpha = 1.0 then intrinsic else [Group(Matrix3x2.identity, alpha, intrinsic)]
+                                    match mask with Some commands -> [Mask(commands, withAlpha)] | None -> withAlpha)
+                                cmds.Add(WithShape(shape, [group]))
+                            else cmds.Add group
                         | None -> ()
                         tokenArr <- prevArr
                         tokenCount <- prevArr.Length
                         i <- prevI
                         currentResources <- prevRes
                         defaultCTM <- prevDefaultCTM
+                        defaultAlphaIsShape <- prevDefaultAIS
                     else
                         loopRunning <- false
                 else
@@ -756,7 +815,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                 | Some (PdfInt j) -> gs <- { gs with LineJoin = match int j with 1 -> RoundJoin | 2 -> Bevel | _ -> Miter }
                                 | _ -> ()
                                 match Pdf.dictGet doc "AIS" gsObj |> Option.map (Pdf.deref doc) with
-                                | Some (PdfBool true) -> invalidOp "PDF alpha-is-shape is not supported"
+                                | Some (PdfBool value) -> gs <- { gs with AlphaIsShape = value }
                                 | _ -> ()
                                 let supportedBlend name =
                                     match name with
@@ -1033,8 +1092,10 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
 
                     | "sh" ->
                         let name = popName ()
-                        match Shading.tryRender toTarget doc currentResources name gs.CTM gs.FillAlpha viewport.Bounds scale with
-                        | Some command -> addPaint command
+                        match Shading.tryRender toTarget doc currentResources name gs.CTM 1.0 viewport.Bounds scale with
+                        | Some command ->
+                            let color = if gs.FillAlpha = 1.0 then command else Group(Matrix3x2.identity, gs.FillAlpha, [command])
+                            addPaint gs.FillAlpha None true color
                         | None -> ()
 
                     // ── XObject (Images and Forms) ──
@@ -1049,12 +1110,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                     | Some (PdfName s) -> s
                                     | _ -> ""
                                 match subtype with
-                                | "Image" ->
-                                    match PdfImages.decode opts.DecodeJpeg toTarget doc currentResources xobj { (fillColor gs) with A = 255uy } 0 with
-                                    | Some (w, h, pixels) ->
-                                        let interpolate = Pdf.dictGet doc "Interpolate" xobj |> Option.map (Pdf.deref doc) = Some (PdfBool true)
-                                        addPaint (Group(gs.CTM, gs.FillAlpha, [BitmapPaint.command pixels w h interpolate]))
-                                    | None -> ()
+                                | "Image" -> paintImage xobj
 
                                 | "Form" ->
                                     try
@@ -1084,7 +1140,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                                             else Some (groupConversion parent target))
                                                     child |> Option.orElse working, Some (cmds.Count, isolated, knockout, conversion)
                                                 | _ -> working, None
-                                            streamStack.Push(tokenArr, i, currentResources, defaultCTM, working, groupStart)
+                                            streamStack.Push(tokenArr, i, currentResources, defaultCTM, defaultAlphaIsShape, working, groupStart)
                                             stateStack.Add(gs)
                                             clipStack.Add(None)
                                             gs <- { gs with CTM = Matrix3x2.multiply formMatrix gs.CTM }
@@ -1093,6 +1149,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                                 gs <- { gs with FillAlpha = 1.0; StrokeAlpha = 1.0; BlendMode = "Normal"; SoftMask = None }
                                             gs <- refreshColors gs
                                             defaultCTM <- gs.CTM
+                                            defaultAlphaIsShape <- gs.AlphaIsShape
                                             // Form content is always clipped to its BBox,
                                             // transformed by the form matrix and caller CTM.
                                             match Pdf.dictGet doc "BBox" xobj |> Option.map (Pdf.deref doc) with
@@ -1167,11 +1224,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         match rawData with
                         | Some bytes ->
                             let image = PdfStream(header, bytes)
-                            match PdfImages.decode opts.DecodeJpeg toTarget doc currentResources image { (fillColor gs) with A = 255uy } 0 with
-                            | Some (w, h, pixels) ->
-                                let interpolate = Pdf.dictGet doc "Interpolate" image |> Option.map (Pdf.deref doc) = Some (PdfBool true)
-                                addPaint (Group(gs.CTM, gs.FillAlpha, [BitmapPaint.command pixels w h interpolate]))
-                            | None -> ()
+                            paintImage image
                         | None -> ()
 
                     | _ ->
