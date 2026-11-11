@@ -414,6 +414,39 @@ def icc_inherited_nested_mask():
         setup=setup, page_options="/MediaBox [0 0 200 200]")
 
 
+def icc_luminosity_masks(boundary=False):
+    def setup(pdf):
+        profile = pdf.stream("/N 3", icc_profiles.adobe_rgb())
+        colors = f"/ColorSpace << /Working [/ICCBased {profile} 0 R] >>"
+        transfer = pdf.add("<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>")
+        if boundary:
+            cases = [(isolated, "[1 0 0]", "/Multiply gs 0 0 1 sc", invert)
+                     for invert in (False, True) for isolated in (True, False)]
+        else:
+            cases = [(True, None, "0.5 0.5 0.5 sc", False),
+                     (True, "[1 1 1]", "/Half gs 0 0 0 sc", False),
+                     (False, "[1 1 1]", "/Half gs 0 0 0 sc", False),
+                     (True, "[1 1 1]", "/Half gs 0 0 0 sc", True)]
+        states = []
+        bbox = "[20 20 80 80]" if boundary else "[0 0 100 100]"
+        for i, (isolated, backdrop, paint, invert) in enumerate(cases):
+            mask = pdf.stream(
+                f"/Type /XObject /Subtype /Form /BBox {bbox} "
+                f"/Resources << {colors} /ExtGState << /Half << /ca 0.5 >> "
+                "/Multiply << /BM /Multiply >> >> >> "
+                f"/Group << /S /Transparency /CS /Working /I {str(isolated).lower()} >>",
+                f"/Working cs {paint} 0 0 100 100 re f")
+            bc = f"/BC {backdrop}" if backdrop else ""
+            tr = f"/TR {transfer} 0 R" if invert else ""
+            states.append(f"/M{i} << /SMask << /S /Luminosity /G {mask} 0 R {bc} {tr} >> >>")
+        return "/ExtGState << " + " ".join(states) + " >>"
+    commands = []
+    for i in range(4):
+        x, y = (i % 2) * 100, 100 - (i // 2) * 100
+        commands.append(f"q 1 0 0 1 {x} {y} cm /M{i} gs 1 0 0 rg 0 0 100 100 re f Q")
+    return page(" ".join(commands), setup=setup, page_options="/MediaBox [0 0 200 200]")
+
+
 def many_pages():
     pdf = PDF()
     catalog, pages = pdf.reserve(), pdf.reserve()
@@ -473,6 +506,8 @@ CASES = [
     dict(id="function-cubic-1d", tags=["shading", "function", "sampled", "cubic"], description="Order 3 four-knot grayscale interpolation with Decode headroom for cubic overshoot.", expected="A grayscale hill from black through the 0.8-valued inner knots, peaking near 0.9 (RGB 230) at the center. Linear interpolation incorrectly gives a flat 0.8 plateau. Uses uniform Catmull-Rom with secant endpoint tangents.", page_options="/MediaBox [0 0 100 100]", setup=cubic_sampled_shading, content="q 10 10 80 80 re W n /Cubic sh Q"),
     dict(id="function-cubic-2d", tags=["shading", "function", "sampled", "cubic", "multidimensional"], description="Tensor-product sampled function with cubic four-knot x and linear two-knot y.", expected="Inside an inset square, red rises from zero at both sides to about 230 in the middle, while green rises linearly from bottom to top. The center is near RGB (230,128,0). Samples advance along x first.", page_options="/MediaBox [0 0 100 100]", setup=lambda pdf: cubic_sampled_shading(pdf, True), content="/Cubic sh"),
     dict(id="icc-inherited-nested-mask", tags=["icc", "transparency", "form", "inheritance", "soft-mask", "gamut"], description="Wide-gamut inherited fill provenance, nested nonisolated linear group and boundary alpha mask plus opacity.", expected="Top quadrants match near (0,192,0): inherited Adobe green must not be recovered from clipped sRGB. Bottom-left nested linear groups produce (188,0,188). Bottom-right applies half mask and half opacity exactly once over green, near (47,191,47).", factory=icc_inherited_nested_mask),
+    dict(id="icc-luminosity-components", tags=["icc", "transparency", "soft-mask", "luminosity", "transfer"], description="Adobe RGB luminosity masks composite encoded components before conversion to XYZ Y.", expected="Top-left opaque half-gray, top-right isolated half-black over white BC, and bottom-left nonisolated half-black over white BC all yield pale red near (255,200,200), not (255,128,128). Bottom-right inverts the luminosity through TR and is near (255,55,55).", factory=icc_luminosity_masks),
+    dict(id="icc-luminosity-backdrop", tags=["icc", "transparency", "soft-mask", "luminosity", "bbox", "isolation", "blend-mode"], description="Isolated/nonisolated Multiply inside a bounded ICC luminosity mask over red BC, with and without inverse TR.", expected="Every quadrant has a 60-point inner square. Top-left center is near (255,239,239), top-right center white; both outside rings are near (255,176,176). Bottom-left center is near (255,16,16), bottom-right center red; both rings are near (255,79,79). BC and TR apply outside BBox too.", factory=lambda: icc_luminosity_masks(True)),
 ]
 
 

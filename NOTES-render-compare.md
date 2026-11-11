@@ -99,7 +99,7 @@ matching the document widths. The original is now pinned in the corpus.
 ### Assets, packaging and remaining limits
 
 - Rbt.Image **0.1.2**, Rbt.Text **0.1.7**, and
-  Rbt.Renderer/Core/Canvas **0.1.7** are published through the normal protected
+  Rbt.Renderer/Core/Canvas **0.1.8** are published through the normal protected
   Forge tag actions. The earlier missing-native-package incident was fixed in
   Forge; no manual rollout is needed for these library releases.
 - Codec ports retain Apache-2.0 attribution and the bundled PDF.js license.
@@ -133,10 +133,13 @@ matching the document widths. The original is now pinned in the corpus.
   DeviceRGB and invertible RGB matrix/TRC ICC blending spaces on Raster/Canvas.
   Source paints retain their original components until conversion into the active
   group space; profile conversion belongs to Image and compositing to Renderer.
-  LUT/CMYK group transforms, LUT ICC sources in non-display groups, managed
-  luminosity masks and `AIS true` remain explicitly unsupported. Managed alpha
-  masks and DeviceGray soft masks are supported. GL rejects color-managed groups
-  and custom pixel filters. Knockout shape extraction remains approximate for
+  RGB matrix/TRC luminosity masks composite in the declared group space before
+  XYZ Y extraction and transfer; backdrop color also applies outside the BBox.
+  Managed alpha masks and DeviceGray soft masks remain supported. LUT/CMYK group
+  transforms, LUT ICC sources in non-display groups and `AIS true` remain
+  explicitly unsupported. GL supports color-managed groups through readback
+  compositing, but still rejects custom pixel filters, including PDF luminosity
+  and transfer masks. Knockout shape extraction remains approximate for
   geometry-expanding filters, text masks and intrinsic image alpha. These checks
   are regression evidence, not PDF conformance certification.
 
@@ -238,6 +241,24 @@ not universal latency or adversarial-resource bounds.
   interior samples within two channel values; numeric and visual checks cover
   cubic peaks, wide-gamut inheritance, nested groups, masks and boundary opacity.
   Shared Image's 51 ICC checks and the native PDF regression executable pass.
+
+## ICC luminosity and GL follow-up
+
+- Luminosity masks preserve encoded group components through compositing,
+  honoring isolation, knockout and the opaque group-space backdrop. ICC masks
+  then use D50 XYZ Y; device spaces retain their device-dependent gray rule.
+  Transfer applies after luminosity extraction, including outside the BBox.
+  Alpha-mask transfer outside the BBox uses zero, not backdrop luminosity.
+- The corpus now has 73 documents / 594 pages. All 14 targeted native and
+  Chromium pages completed; new luminosity samples match independent
+  gamma/matrix expectations within two channel values. Native regressions cover
+  knockout, isolation, backdrop defaults, clipping and transfer boundaries.
+- Renderer owns GL managed-group backdrop/contribution conversion; no PDF or
+  ICC parsing was added there. Eleven live Mesa llvmpipe EGL cases passed
+  against independent expectations and Raster probes, covering isolation,
+  knockout, nested groups, mask/opacity, blend mode and clip-state restoration.
+  This verifies software Mesa, not a physical GPU; custom GL pixel filters
+  remain unsupported.
 
 ## Incidental (throwaway scripts, not product bugs)
 - Native PPM writer dropped the R-channel mask (`v >>> 16` without `&&& 0xFFu`),

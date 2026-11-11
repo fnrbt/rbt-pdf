@@ -285,6 +285,40 @@ let main _ =
                 (Pixel.a pixel = 255uy && Pixel.r pixel = 255uy
                  && abs (int (Pixel.g pixel)-128) <= 2 && abs (int (Pixel.b pixel)-128) <= 2))
 
+    test "ICC luminosity masks composite in group space before PCS and transfer" (fun () ->
+        // Adobe RGB (1998), D50 matrix primaries and a 563/256 gamma TRC.
+        let profile = Convert.FromBase64String("AAABVgAAAAACIAAAc2NuclJHQiBYWVogAAAAAAAAAAAAAAAAYWNzcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHd3RwdAAAANgAAAAUclhZWgAAAOwAAAAUZ1hZWgAAAQAAAAAUYlhZWgAAARQAAAAUclRSQwAAASgAAAAOZ1RSQwAAATgAAAAOYlRSQwAAAUgAAAAOWFlaIAAAAAAAAPbWAAEAAAAA0y1YWVogAAAAAAAAnBkAAE+mAAAE/VhZWiAAAAAAAAA0iwAAoCsAAA+XWFlaIAAAAAAAACY0AAAQLwAAvq5jdXJ2AAAAAAAAAAECMwAAY3VydgAAAAAAAAABAjMAAGN1cnYAAAAAAAAAAQIz") |> text
+        let profileObject = $"<</N 3 /Length {profile.Length}>>\nstream\n{profile}\nendstream"
+        let gray = "/Managed cs 0.5 0.5 0.5 sc 0 0 100 100 re f"
+        let halfBlack = "/Managed cs 0 0 0 sc /Half gs 0 0 100 100 re f"
+        let multiplyBlue = "/Managed cs 0 0 1 sc /Multiply gs 0 0 100 100 re f"
+        let inverse = "/TR <</FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1>>"
+        // Expected gray on the white page after painting black through the mask.
+        // Adobe RGB 0.5 has Y ~= 0.218; its blue and red primaries have
+        // Y ~= 0.063 and 0.311, respectively.
+        let cases =
+            [ "encoded half gray", "Luminosity", "true", "false", "/BC [1 1 1]", "", gray, 199, 0
+              "half black over white", "Luminosity", "true", "false", "/BC [1 1 1]", "", halfBlack, 199, 0
+              "isolated Multiply", "Luminosity", "true", "false", "/BC [1 0 0]", "", multiplyBlue, 239, 176
+              "nonisolated Multiply", "Luminosity", "false", "false", "/BC [1 0 0]", "", multiplyBlue, 255, 176
+              "inverse transfer", "Luminosity", "true", "false", "/BC [1 1 1]", inverse, gray, 56, 255
+              "default black backdrop", "Luminosity", "true", "false", "", "", gray, 199, 255
+              "isolated knockout", "Luminosity", "true", "true", "/BC [1 1 1]", "", gray + " " + halfBlack, 199, 0
+              "isolated non-knockout", "Luminosity", "true", "false", "/BC [1 1 1]", "", gray + " " + halfBlack, 243, 0
+              "alpha inverse outside BBox", "Alpha", "false", "false", "", inverse, halfBlack, 128, 0 ]
+        for label, subtype, isolated, knockout, bc, tr, content, inside, outside in cases do
+            let groupResources = "/ColorSpace <</Managed [/ICCBased 6 0 R]>> /ExtGState <</Half <</ca 0.5>> /Multiply <</BM /Multiply>>>>"
+            let group =
+                $"<</Type /XObject /Subtype /Form /BBox [0 0 50 100] /Group <</S /Transparency /CS [/ICCBased 6 0 R] /I {isolated} /K {knockout}>> /Resources <<{groupResources}>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+            let resources = $"/ExtGState <</M <</SMask <</S /{subtype} /G 5 0 R {bc} {tr}>>>>>>"
+            let pixels =
+                renderFixture "/MediaBox [0 0 100 100]" "" resources [5,group; 6,profileObject]
+                    "0 g /M gs 0 0 100 100 re f" 1.0 |> rasterize
+            for location, x, expected in ["inside", 25, inside; "outside", 75, outside] do
+                let p = pixels.[50*100+x]
+                let close c = abs (int c - expected) <= 3
+                check $"{label}: {location}" (Pixel.a p = 255uy && close (Pixel.r p) && close (Pixel.g p) && close (Pixel.b p)))
+
     test "PDF DCT samples use Decode rather than standalone Adobe polarity" (fun () ->
         // One 8x8 MCU with constant CMYK samples (0,128,128,0), unit
         // quantization and DC-only blocks. APP14 declares transform zero.

@@ -549,6 +549,38 @@
       ],
       "description": "Wide-gamut inherited fill provenance, nested nonisolated linear group and boundary alpha mask plus opacity.",
       "expected": "Top quadrants match near (0,192,0): inherited Adobe green must not be recovered from clipped sRGB. Bottom-left nested linear groups produce (188,0,188). Bottom-right applies half mask and half opacity exactly once over green, near (47,191,47)."
+    },
+    {
+      "id": "synth-icc-luminosity-components",
+      "path": "generated/synth-icc-luminosity-components.pdf",
+      "sha256": "31780aa38bf84c4ea4614918bf0e23020c6ad81e968182a745b209547bf6eaf3",
+      "bytes": 2924,
+      "tags": [
+        "icc",
+        "transparency",
+        "soft-mask",
+        "luminosity",
+        "transfer"
+      ],
+      "description": "Adobe RGB luminosity masks composite encoded components before conversion to XYZ Y.",
+      "expected": "Top-left opaque half-gray, top-right isolated half-black over white BC, and bottom-left nonisolated half-black over white BC all yield pale red near (255,200,200), not (255,128,128). Bottom-right inverts the luminosity through TR and is near (255,55,55)."
+    },
+    {
+      "id": "synth-icc-luminosity-backdrop",
+      "path": "generated/synth-icc-luminosity-backdrop.pdf",
+      "sha256": "8fbadac7d58ba020917ff62fab71afc3fb83ff7941e8b0bf010ca81054c5f816",
+      "bytes": 2964,
+      "tags": [
+        "icc",
+        "transparency",
+        "soft-mask",
+        "luminosity",
+        "bbox",
+        "isolation",
+        "blend-mode"
+      ],
+      "description": "Isolated/nonisolated Multiply inside a bounded ICC luminosity mask over red BC, with and without inverse TR.",
+      "expected": "Every quadrant has a 60-point inner square. Top-left center is near (255,239,239), top-right center white; both outside rings are near (255,176,176). Bottom-left center is near (255,16,16), bottom-right center red; both rings are near (255,79,79). BC and TR apply outside BBox too."
     }
   ]
 }

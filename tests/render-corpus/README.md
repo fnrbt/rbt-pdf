@@ -1,14 +1,14 @@
 # PDF rendering corpus
 
-The collection contains **71 PDFs (3,198,409 bytes)**: 30 Mozilla pdf.js
+The collection contains **73 PDFs (3,204,297 bytes)**: 30 Mozilla pdf.js
 fixtures pinned to commit `94a48f3c844d4677b264b6e7c0a1e239c245189f`,
-one PDF Association PDF 2.0 example, and 40 generated fixtures.
+one PDF Association PDF 2.0 example, and 42 generated fixtures.
 
 Coverage includes embedded/subset/Type 3/CID fonts, Arabic and CJK text,
 JPEG/JPEG2000/JBIG2, packed images and masks, transparency/blending,
 shading/patterns, Form XObjects and AcroForms, offset page boxes/rotation,
 text state and clipping, malformed streams, and multipage/performance cases.
-The collection has **592 pages**, including a generated 500-page document for
+The collection has **594 pages**, including a generated 500-page document for
 scrolling, zoom cancellation and offscreen canvas eviction checks.
 
 Two complementary sets:
@@ -254,5 +254,27 @@ the independent expectations within two channel values; both cubic midpoints
 match the expected peak. Native regressions cover the group boundary, knockout,
 mask/opacity, exact `/255` packed source-over and DeviceGray mask compatibility.
 Shared Image ICC checks pass (51 checks). Contact sheets include the original
-Adobe-profile transparency and nonisolated gray-mask documents. GL compiled but
-was not exercised live; it explicitly rejects managed-color groups.
+Adobe-profile transparency and nonisolated gray-mask documents. That pass only
+compiled GL; the subsequent live-GL verification is described below.
+
+## ICC luminosity and live GL follow-up
+
+Two additional fixtures distinguish encoded ICC components from luminosity:
+Adobe RGB half gray has XYZ Y near 0.218, not 0.5. They cover opaque and
+half-transparent paints, white/default-black backdrops, isolated/nonisolated
+Multiply, clipping to the mask BBox, inverse transfer and the backdrop outside
+the BBox. The group composites in its encoded space before final XYZ Y
+extraction and transfer, as required by
+[PDF Reference §§7.4.2 and 7.5.4](https://files.connorslade.com/Books/PDF%201.4%20Refrence/7-Transparency.pdf).
+
+All **14 affected PDFs / 14 pages** completed natively and in the actual
+Chromium worker. New fixture samples agree between those backends and with
+independent gamma/matrix luminosity expectations within two channel values.
+Native regressions additionally cover knockout and alpha-mask transfer outside
+the BBox. The existing transparency/ICC contact sheet was visually inspected.
+
+Shared Renderer GL color-managed groups passed 11 real surfaceless EGL cases
+on Mesa llvmpipe: isolation/knockout, opacity, blend mode, mask, zero opacity,
+nested groups, clipping and following paint. The implementation retains GL's
+CPU readback/compositing path. Custom pixel filters, including PDF luminosity
+and transfer masks, remain unsupported on GL; this is not a hardware-GPU test.

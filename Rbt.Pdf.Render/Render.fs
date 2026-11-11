@@ -800,10 +800,9 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                         else groupDict |> Option.bind (groupWorkingSpace doc maskResources) |> Option.orElse working
                                     let children, _ = renderContent opts doc maskResources (Pdf.getStreamData doc group) maskState maskWorking viewport scale (depth + 1)
                                     let knockout = groupDict |> Option.bind (Pdf.dictGet doc "K") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
-                                    let children =
-                                        match maskWorking with
-                                        | Some target when not target.IsDisplay && not target.IsGray -> [ColorManagedGroup(groupConversion PdfColor.displaySpace target, true, knockout, 1.0, Normal, None, children)]
-                                        | _ -> [TransparencyGroup(true, knockout, 1.0, Normal, None, children)]
+                                    let isolated = groupDict |> Option.bind (Pdf.dictGet doc "I") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                                    // The mask surface holds group-space pixels, not parent-space pixels.
+                                    let children = [TransparencyGroup(isolated, knockout, 1.0, Normal, None, children)]
                                     let bounded =
                                         match Pdf.dictGet doc "BBox" group |> Option.map (Pdf.deref doc) with
                                         | Some (PdfArray [a;b;c;d]) ->
@@ -816,34 +815,49 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                         | Some (PdfName "Alpha") -> false
                                         | Some (PdfName "Luminosity") -> true
                                         | _ -> invalidOp "Unsupported PDF soft-mask subtype"
-                                    match maskWorking with
-                                    | Some target when luminosity && not target.IsDisplay && not target.IsGray ->
-                                        invalidOp "ICC blending-space luminosity soft masks are not supported"
-                                    | _ -> ()
-                                    let backdrop =
-                                        match Pdf.dictGet doc "BC" mask |> Option.map (Pdf.deref doc) with
-                                        | Some (PdfArray values) ->
-                                            let colorSpace = groupDict |> Option.bind (Pdf.dictGet doc "CS") |> Option.defaultValue (PdfName "DeviceRGB")
-                                            match PdfColor.resolve doc maskResources colorSpace with
-                                            | Some space ->
-                                                let struct (r, g, b) = PdfColor.toRgb space (values |> List.map number |> List.toArray)
-                                                0.3 * float r + 0.59 * float g + 0.11 * float b
-                                            | None -> invalidOp "Unsupported PDF soft-mask backdrop color space"
-                                        | _ -> 0.0
                                     let maskCommands =
                                         if not luminosity && transfer.IsNone then bounded
                                         else
+                                            let input =
+                                                if not luminosity then bounded
+                                                else
+                                                    let colorSpace = groupDict |> Option.bind (Pdf.dictGet doc "CS") |> Option.defaultValue (PdfName "DeviceRGB")
+                                                    let space = PdfColor.resolve doc maskResources colorSpace |> Option.defaultWith (fun () -> invalidOp "Unsupported PDF soft-mask backdrop color space")
+                                                    let count = PdfColor.components space
+                                                    let limits = PdfColor.ranges space
+                                                    let values =
+                                                        match Pdf.dictGet doc "BC" mask |> Option.map (Pdf.deref doc) with
+                                                        | None -> Array.zeroCreate count
+                                                        | Some (PdfArray values) when values.Length = count -> values |> List.map number |> List.toArray
+                                                        | _ -> invalidOp "Invalid PDF soft-mask backdrop color"
+                                                    let encodedComponent i =
+                                                        let value = max limits.[2*i] (min limits.[2*i+1] values.[i])
+                                                        byte (int (clamp 0.0 1.0 value * 255.0 + 0.5))
+                                                    let r = encodedComponent 0
+                                                    let g, b = if count = 1 then r, r else encodedComponent 1, encodedComponent 2
+                                                    let backdrop = Pixel.fromColor { R = r; G = g; B = b; A = 255uy }
+                                                    // BC is the group backdrop even outside its BBox. Seed
+                                                    // the whole device surface independently of the CTM.
+                                                    let seed _ _ (pixels: uint32[]) =
+                                                        Array.fill pixels 0 pixels.Length backdrop
+                                                        pixels
+                                                    Filtered([Custom seed], []) :: bounded
                                             let convert _ _ (pixels: uint32[]) =
                                                 pixels |> Array.map (fun pixel ->
                                                     let c = Pixel.toColor pixel
                                                     let value =
-                                                        if luminosity then
-                                                            (0.3 * float c.R + 0.59 * float c.G + 0.11 * float c.B + backdrop * (1.0 - float c.A / 255.0)) / 255.0
-                                                        else float c.A / 255.0
+                                                        if not luminosity then float c.A / 255.0
+                                                        else
+                                                            let r, g, b = float c.R / 255.0, float c.G / 255.0, float c.B / 255.0
+                                                            match maskWorking with
+                                                            | Some target when not target.IsDisplay && not target.IsGray ->
+                                                                let struct(_, y, _) = target.ToPcs r g b
+                                                                clamp 0.0 1.0 y
+                                                            | _ -> 0.3 * r + 0.59 * g + 0.11 * b
                                                     let mapped = match transfer with Some fn -> fn value | None -> value
                                                     let a = byte (clamp 0.0 255.0 (mapped * 255.0))
                                                     Pixel.fromColor { R = a; G = a; B = a; A = a })
-                                            [Filtered([Custom convert], bounded)]
+                                            [Filtered([Custom convert], input)]
                                     gs <- { gs with SoftMask = Some maskCommands }
                                 | None -> ()
                             | None -> ()
