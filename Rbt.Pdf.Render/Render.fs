@@ -33,6 +33,9 @@ type GraphicsState = {
     ColorSpace: string
     StrokeColorSpace: string
     BlendMode: string
+    SoftMask: Cmd list option
+    FillPattern: string option
+    StrokePattern: string option
 }
 
 let private defaultState = {
@@ -58,6 +61,9 @@ let private defaultState = {
     ColorSpace = "DeviceGray"
     StrokeColorSpace = "DeviceGray"
     BlendMode = "Normal"
+    SoftMask = None
+    FillPattern = None
+    StrokePattern = None
 }
 
 // ── Color Conversion ─────────────────────────────────────
@@ -85,29 +91,38 @@ let private pdfColorToColor (cs: string) (components: float list) (alpha: float)
 
 // ── Path Building ────────────────────────────────────────
 
-type private PathBuilder() =
+type private PathBuilder(getTransform: unit -> Matrix3x2) =
     let segs = ResizeArray<PathSeg>()
-    let mutable curX = 0.0
-    let mutable curY = 0.0
+    let mutable current = vec2 0.0 0.0
+    let mutable start = current
 
-    member _.CurrentPoint = (curX, curY)
+    let point x y = Matrix3x2.transformVec2 (getTransform ()) (vec2 x y)
+
     member _.Segments = segs |> Seq.toList
-    member _.Clear() = segs.Clear(); curX <- 0.0; curY <- 0.0
-    member _.IsEmpty = segs.Count = 0
+    member _.Clear() = segs.Clear(); current <- vec2 0.0 0.0; start <- current
 
     member _.MoveTo(x, y) =
-        segs.Add(MoveTo(vec2 x y))
-        curX <- x; curY <- y
+        current <- point x y
+        start <- current
+        segs.Add(MoveTo current)
 
     member _.LineTo(x, y) =
-        segs.Add(LineTo(vec2 x y))
-        curX <- x; curY <- y
+        current <- point x y
+        segs.Add(LineTo current)
 
     member _.CubicTo(x1, y1, x2, y2, x3, y3) =
-        segs.Add(CubicTo(vec2 x1 y1, vec2 x2 y2, vec2 x3 y3))
-        curX <- x3; curY <- y3
+        let endpoint = point x3 y3
+        segs.Add(CubicTo(point x1 y1, point x2 y2, endpoint))
+        current <- endpoint
 
-    member _.Close() = segs.Add(Close)
+    member _.CubicFromCurrent(x2, y2, x3, y3) =
+        let endpoint = point x3 y3
+        segs.Add(CubicTo(current, point x2 y2, endpoint))
+        current <- endpoint
+
+    member _.Close() =
+        segs.Add(Close)
+        current <- start
 
     member this.Rect(x, y, w, h) =
         this.MoveTo(x, y)
@@ -138,11 +153,21 @@ type CharBox = {
     X: float; Y: float
     W: float; H: float
 }
+type private ClipKind =
+    | PathClip of PathSeg list * FillRule
+    | TextClip of PathSeg list list
+
 
 type RenderOptions =
     { FallbackFont: Text.FontData
+      /// Loaded only when a missing Unicode glyph needs the CJK fallback.
+      CjkFont: Lazy<Text.FontData option>
+      /// Predefined PDF CMaps, keyed by their exact resource names.
+      CMaps: Map<string, byte[]>
       /// JPEG (DCTDecode) raw stream bytes -> (w, h, premultiplied BGRA uint32[]). None = skip image.
-      DecodeJpeg: byte[] -> (int * int * uint32[]) option }
+      DecodeJpeg: byte[] -> (int * int * uint32[]) option
+      /// Render a transparent pattern cell using the destination backend.
+      Rasterize: int -> int -> Cmd list -> Framebuffer }
 
 #if !FABLE_COMPILER
 module RenderOptions =
@@ -165,8 +190,28 @@ module RenderOptions =
                     raise (System.IO.FileNotFoundException(
                         "Rbt.Pdf.Render: fallback font NotoSans-Regular.ttf not found; looked in: " + String.concat ", " candidates,
                         "NotoSans-Regular.ttf"))
+            let assetPath relative =
+                [ System.IO.Path.Combine(System.IO.Path.GetDirectoryName fontPath, relative)
+                  System.IO.Path.Combine(System.AppContext.BaseDirectory, "assets", relative)
+                  System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "../resources", relative)) ]
+                |> List.tryFind System.IO.File.Exists
+            let cmaps =
+                [ System.IO.Path.Combine(System.IO.Path.GetDirectoryName fontPath, "cmaps")
+                  System.IO.Path.Combine(System.AppContext.BaseDirectory, "assets", "cmaps")
+                  System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "../resources/cmaps")) ]
+                |> List.filter System.IO.Directory.Exists
+                |> List.collect (fun directory -> System.IO.Directory.GetFiles(directory) |> Array.toList)
+                |> List.rev
+                |> List.fold (fun maps path -> Map.add (System.IO.Path.GetFileName path) (System.IO.File.ReadAllBytes path) maps) Map.empty
             { FallbackFont = Text.loadFontFile fontPath
-              DecodeJpeg = ImageDecode.decode }
+              CjkFont = lazy (assetPath "NotoSansCJKsc-Regular.otf" |> Option.map Text.loadFontFile)
+              CMaps = cmaps
+              DecodeJpeg = ImageDecode.decode
+              Rasterize = fun width height commands ->
+                  let backend = Raster.create ()
+                  backend.Init width height
+                  backend.Submit (Clear (Color.rgba 0uy 0uy 0uy 0uy) :: commands)
+                  backend.Finish () }
 
     /// Options for .NET: the fallback font from fallbackFontCandidates, JPEG decoding by ImageDecode.decode.
     let native () = nativeOpts.Value
@@ -174,45 +219,57 @@ module RenderOptions =
 
 // ── Main Interpreter ─────────────────────────────────────
 
-let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * float * float * CharBox[]) option =
-    match Pdf.getPage doc pageNum with
-    | None -> None
-    | Some pageRef ->
-        let pageObj = Pdf.deref doc pageRef
-        match PageOps.getMediaBox doc pageObj with
-        | None -> None
-        | Some (x0, y0, x1, y1) ->
-            let pageW = (x1 - x0) * scale
-            let pageH = (y1 - y0) * scale
+let private validateGroupColorSpace doc resources group =
+    let rec isRgbSpace depth value =
+        if depth > 16 then false
+        else
+            match Pdf.deref doc value with
+            | PdfName "DeviceRGB" | PdfName "RGB" -> true
+            | PdfName name ->
+                Pdf.dictGet doc "ColorSpace" resources
+                |> Option.bind (Pdf.dictGet doc name)
+                |> Option.exists (isRgbSpace (depth + 1))
+            | _ -> false
+    match Pdf.dictGet doc "CS" group with
+    | Some colorSpace when not (isRgbSpace 0 colorSpace) ->
+        invalidOp "Non-RGB PDF transparency-group blending color spaces are not supported"
+    | _ -> ()
 
-            let mutable currentResources =
-                match Pdf.dictGet doc "Resources" pageObj with
-                | Some r -> r
-                | None ->
-                    match Pdf.getPageInheritable doc pageObj "Resources" with
-                    | Some r -> r
-                    | None -> PdfDict Map.empty
-
-            let contentData = PageOps.getPageContents doc pageObj
-            if contentData.Length = 0 then Some ([], pageW, pageH, [||])
-            else
+let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resources: PdfObj) (contentData: byte[]) (initialState: GraphicsState) (viewport: PageGeometry.Viewport) (scale: float) (depth: int) : Cmd list * CharBox[] =
+            if depth > 32 then invalidOp "PDF content recursion limit exceeded"
+            let mutable currentResources = resources
+            let mutable defaultCTM = initialState.CTM
 
             let tokens = tokenize contentData
 
-            let rawPageH = y1 - y0
-
             // Interpreter state
             let stateStack = ResizeArray<GraphicsState>()
-            let mutable gs = defaultState
-            let path = PathBuilder()
+            let mutable gs = initialState
+            let path = PathBuilder(fun () -> gs.CTM)
             let cmds = ResizeArray<Cmd>()
-            let textCmds = ResizeArray<Cmd>()
+            let blendMode name =
+                match name with
+                | "Normal" | "Compatible" -> Normal
+                | "Multiply" -> Multiply | "Screen" -> Screen | "Overlay" -> Overlay
+                | "Darken" -> Darken | "Lighten" -> Lighten
+                | "ColorDodge" -> ColorDodge | "ColorBurn" -> ColorBurn
+                | "HardLight" -> HardLight | "SoftLight" -> SoftLight
+                | "Difference" -> Difference | "Exclusion" -> Exclusion
+                | "Hue" -> Hue | "Saturation" -> Saturation
+                | "Color" -> ColorMode | "Luminosity" -> Luminosity
+                | _ -> invalidOp ("Unsupported PDF blend mode: " + name)
+            let addPaint command =
+                let mode = blendMode gs.BlendMode
+                let masked = match gs.SoftMask with Some mask -> Mask(mask, [command]) | None -> command
+                cmds.Add(if mode = Normal then masked else Blend(mode, [masked]))
             let charBoxes = ResizeArray<CharBox>()
-
             // Text state
             let mutable textMatrix = Matrix3x2.identity
             let mutable lineMatrix = Matrix3x2.identity
             let mutable inText = false
+            let textClip = ResizeArray<PathSeg list>()
+            let mutable hasTextClip = false
+            let fontCache = Collections.Generic.Dictionary<PdfObj, FontInfo>()
 
             // Clipping state
             let mutable pendingClip: (PathSeg list * FillRule) option = None
@@ -251,234 +308,260 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                 operands.Clear()
                 result
 
-            let getFontInfo () = Fonts.resolve doc currentResources gs.FontName
+            let transformPath matrix segments =
+                let p = Matrix3x2.transformVec2 matrix
+                segments |> List.map (function
+                    | MoveTo a -> MoveTo(p a)
+                    | LineTo a -> LineTo(p a)
+                    | QuadTo (a, b) -> QuadTo(p a, p b)
+                    | CubicTo (a, b, c) -> CubicTo(p a, p b, p c)
+                    | other -> other)
 
-            let decodeTextBytes (stringBytes: byte[]) : string =
-                let fi = getFontInfo ()
-                match fi.ToUnicodeCMap with
-                | Some cmap ->
-                    match Fonts.decodeWithToUnicode cmap stringBytes with
-                    | Some s -> s
-                    | None -> Fonts.decodeByEncoding fi.Encoding stringBytes
-                | None -> Fonts.decodeByEncoding fi.Encoding stringBytes
+            let patternCommands name color alpha bounds =
+                let number value =
+                    match Pdf.deref doc value with PdfInt n -> float n | PdfReal n -> n | _ -> 0.0
+                let get key obj = Pdf.dictGet doc key obj |> Option.map (Pdf.deref doc)
+                match get "Pattern" currentResources |> Option.bind (get name) with
+                | None -> []
+                | Some pattern ->
+                    let matrix =
+                        match get "Matrix" pattern with
+                        | Some (PdfArray [a; b; c; d; e; f]) ->
+                            { M11 = number a; M12 = number b; M21 = number c; M22 = number d; DX = number e; DY = number f }
+                        | _ -> Matrix3x2.identity
+                    // Pattern matrices use the stream's default user space, not
+                    // the CTM at the painting operator.
+                    let patternToPage = Matrix3x2.multiply matrix defaultCTM
+                    match get "PatternType" pattern with
+                    | Some (PdfInt 2L) ->
+                        match get "Shading" pattern with
+                        | Some shading ->
+                            Shading.tryRenderObject doc currentResources shading patternToPage alpha bounds scale |> Option.toList
+                        | None -> []
+                    | Some (PdfInt 1L) ->
+                        match get "BBox" pattern, get "XStep" pattern, get "YStep" pattern with
+                        | Some (PdfArray [a; b; c; d]), Some xs, Some ys ->
+                            let x0, y0, x1, y1 = number a, number b, number c, number d
+                            let stepX, stepY = abs (number xs), abs (number ys)
+                            let det = patternToPage.M11 * patternToPage.M22 - patternToPage.M12 * patternToPage.M21
+                            if stepX = 0.0 || stepY = 0.0 || x1 <= x0 || y1 <= y0 || abs det < 1e-10 then []
+                            else
+                                let bx0, by0, bx1, by1 = bounds
+                                let firstX, lastX = int (ceil (-x1 / stepX)), int (floor ((stepX - x0) / stepX))
+                                let firstY, lastY = int (ceil (-y1 / stepY)), int (floor ((stepY - y0) / stepY))
+                                let tileResources = get "Resources" pattern |> Option.defaultValue currentResources
+                                let tileState =
+                                    { gs with CTM = Matrix3x2.identity; FillPattern = None; StrokePattern = None
+                                              FillColor = color; StrokeColor = color; FillAlpha = 1.0; StrokeAlpha = 1.0 }
+                                let tileViewport =
+                                    { viewport with Bounds = (x0, y0, x1, y1); Width = x1 - x0; Height = y1 - y0; Transform = Matrix3x2.identity }
+                                let tileScale = scale * max (sqrt (patternToPage.M11 ** 2.0 + patternToPage.M12 ** 2.0)) (sqrt (patternToPage.M21 ** 2.0 + patternToPage.M22 ** 2.0))
+                                let tileCommands, _ = renderContent opts doc tileResources (Pdf.getStreamData doc pattern) tileState tileViewport tileScale (depth + 1)
+                                let tileBounds = [MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0); LineTo(vec2 x1 y1); LineTo(vec2 x0 y1); Close]
+                                let cell = [Clip(tileBounds, NonZero, tileCommands)]
+                                // Render a single period, including cells that overlap it.
+                                // Repeating a surface avoids source-over seams between
+                                // adjacent antialiased vector cells at fractional zoom.
+                                let requestedW = max 1.0 (ceil (stepX * tileScale))
+                                let requestedH = max 1.0 (ceil (stepY * tileScale))
+                                let reduction = min 1.0 (sqrt (4000000.0 / (requestedW * requestedH)))
+                                let width, height = max 1 (int (requestedW * reduction)), max 1 (int (requestedH * reduction))
+                                let sx, sy = float width / stepX, float height / stepY
+                                let toPixels = { M11 = sx; M12 = 0.0; M21 = 0.0; M22 = -sy; DX = 0.0; DY = float height }
+                                let cells =
+                                    [ for iy in firstY .. lastY do
+                                        for ix in firstX .. lastX do
+                                            yield Group(Matrix3x2.translate (float ix * stepX) (float iy * stepY), 1.0, cell) ]
+                                let image = opts.Rasterize width height [Group(toPixels, 1.0, cells)]
+                                let fromPixels =
+                                    { M11 = 1.0 / sx; M12 = 0.0; M21 = 0.0; M22 = -1.0 / sy
+                                      DX = 0.5 / sx; DY = stepY - 0.5 / sy }
+                                let placement = Matrix3x2.multiply fromPixels patternToPage
+                                let area = [MoveTo(vec2 bx0 by0); LineTo(vec2 bx1 by0); LineTo(vec2 bx1 by1); LineTo(vec2 bx0 by1); Close]
+                                [Group(Matrix3x2.identity, alpha, [FillPath(area, TilingPaint(image, placement, Repeat, Repeat), NonZero)])]
+                        | _ -> []
+                    | _ -> []
 
-            let fallbackFont = opts.FallbackFont
+            let paintPath (segments: PathSeg list) fill stroke rule =
+                let bounds () =
+                    let points =
+                        segments |> List.collect (function
+                            | MoveTo p | LineTo p -> [p]
+                            | QuadTo (a, b) -> [a; b]
+                            | CubicTo (a, b, c) -> [a; b; c]
+                            | _ -> [])
+                    let x0, y0, x1, y1 = viewport.Bounds
+                    if List.isEmpty points then viewport.Bounds
+                    else
+                        let margin = if stroke then abs gs.LineWidth * max gs.MiterLimit 1.0 * max (abs gs.CTM.M11 + abs gs.CTM.M21) (abs gs.CTM.M12 + abs gs.CTM.M22) else 0.0
+                        max x0 ((points |> List.minBy (fun p -> p.X) |> fun p -> float p.X) - margin),
+                        max y0 ((points |> List.minBy (fun p -> p.Y) |> fun p -> float p.Y) - margin),
+                        min x1 ((points |> List.maxBy (fun p -> p.X) |> fun p -> float p.X) + margin),
+                        min y1 ((points |> List.maxBy (fun p -> p.Y) |> fun p -> float p.Y) + margin)
+                if fill then
+                    match gs.FillPattern with
+                    | Some name -> addPaint (Clip(segments, rule, patternCommands name gs.FillColor gs.FillAlpha (bounds ())))
+                    | None -> addPaint (FillPath(segments, Solid (fillColor gs), rule))
+                if stroke && abs (gs.CTM.M11 * gs.CTM.M22 - gs.CTM.M12 * gs.CTM.M21) > 1e-12 then
+                    let style = makeStroke gs
+                    let strokeCommand paint =
+                        if gs.CTM = Matrix3x2.identity then StrokePath(segments, { style with Paint = paint })
+                        else Group(gs.CTM, 1.0, [StrokePath(transformPath (Matrix3x2.inverse gs.CTM) segments, { style with Paint = paint })])
+                    match gs.StrokePattern with
+                    | Some name ->
+                        addPaint (Mask([strokeCommand (Solid Color.white)], patternCommands name gs.StrokeColor gs.StrokeAlpha (bounds ())))
+                    | None -> addPaint (strokeCommand style.Paint)
 
-            let getRendererFont () =
-                let fi = getFontInfo ()
-                match fi.EmbeddedFont with
-                | Some f -> f
-                | None -> fallbackFont
-
-            let emitTextRun (stringBytes: byte[]) =
-                let fi = getFontInfo ()
-                let text = decodeTextBytes stringBytes
-                if text.Length > 0 || stringBytes.Length > 0 then
-                    let f = getRendererFont ()
-                    let tmScale = sqrt(textMatrix.M21 * textMatrix.M21 + textMatrix.M22 * textMatrix.M22)
-                    let ctmScale = sqrt(gs.CTM.M21 * gs.CTM.M21 + gs.CTM.M22 * gs.CTM.M22)
-                    let fontSize = abs gs.FontSize * tmScale * ctmScale
-                    let th = gs.HorizontalScaling / 100.0
-
-                    let runs, tw =
-                        match fi.EmbeddedFont, fi.ByteToGlyph with
-                        | Some embFont, Some glyphMap ->
-                            let scale = fontSize / Text.unitsPerEm embFont
-                            let tcDevice = gs.CharSpacing * tmScale * ctmScale
-                            let twDevice = gs.WordSpacing * tmScale * ctmScale
-                            let mutable x = 0.0
-                            let glyphs : Text.PositionedGlyph[] =
-                                [| for b in stringBytes do
-                                    let code = int b
-                                    let gid = if code < glyphMap.Length then glyphMap.[code] else 0
-                                    let baseAdv =
-                                        let gw = if gid >= 0 && gid < embFont.ShFont.GlyphWidths.Length then embFont.ShFont.GlyphWidths.[gid] else 0
-                                        if gw > 0 then float gw * scale
-                                        else Fonts.charWidth fi code / 1000.0 * fontSize
-                                    let totalAdv = (baseAdv + tcDevice + (if b = 0x20uy then twDevice else 0.0)) * th
-                                    yield { GlyphId = gid; X = x; Y = 0.0; XAdv = totalAdv }
-                                    x <- x + totalAdv |]
-                            let totalW = glyphs |> Array.sumBy (fun g -> g.XAdv)
-                            let run : Text.GlyphRun = { Font = embFont; FontSize = fontSize; Glyphs = glyphs; Direction = Rbt.Shaper.Shaper.LeftToRight }
-                            [run], totalW
-                        | _ ->
-                            if text.Length > 0 then
-                                let runs = Text.layout f fontSize text
-                                let baseTw = Text.measureWidth f fontSize text
-                                let charCount = float text.Length
-                                let spaceCount = text |> Seq.filter ((=) ' ') |> Seq.length |> float
-                                let tw = (baseTw + (charCount * gs.CharSpacing + spaceCount * gs.WordSpacing) * tmScale * ctmScale) * th
-                                runs, tw
-                            else [], 0.0
-
-                    let combined = Matrix3x2.multiply textMatrix gs.CTM
-                    let screenX = combined.DX
-                    let screenY = rawPageH - combined.DY
-
-                    if runs.Length > 0 && gs.TextRenderMode <> 3 then
-                        let origin = vec2 screenX screenY
-
-                        let fColor = fillColor gs
-                        let sColor = { gs.StrokeColor with A = byte (clamp 0.0 255.0 (gs.StrokeAlpha * 255.0)) }
-
-                        match gs.TextRenderMode with
-                        | 1 -> textCmds.Add(DrawGlyphs(origin, runs, Solid sColor))
-                        | 2 ->
-                            textCmds.Add(DrawGlyphs(origin, runs, Solid fColor))
-                            textCmds.Add(DrawGlyphs(origin, runs, Solid sColor))
-                        | _ -> textCmds.Add(DrawGlyphs(origin, runs, Solid fColor))
-
-                    // Emit CharBoxes for text selection
-                    if runs.Length > 0 then
-                        let asc = fontSize * 0.8
-                        let desc = fontSize * 0.2
-                        let lineH = asc + desc
-                        match fi.EmbeddedFont, fi.ByteToGlyph with
-                        | Some _, Some _ ->
-                            // Glyph-by-glyph path: use decoded text characters
-                            let glyphs = runs.[0].Glyphs
-                            let mutable ci = 0
-                            for g in glyphs do
-                                let ch = if ci < text.Length then string text.[ci] else ""
-                                ci <- ci + 1
-                                charBoxes.Add({
-                                    Char = ch
-                                    X = screenX + g.X; Y = screenY - asc
-                                    W = g.XAdv; H = lineH
-                                })
-                        | _ ->
-                            // Fallback: distribute width across characters
-                            if text.Length > 0 then
-                                let charW = tw / float text.Length
-                                let mutable cx = 0.0
-                                for c in text do
-                                    charBoxes.Add({
-                                        Char = string c
-                                        X = screenX + cx; Y = screenY - asc
-                                        W = charW; H = lineH
-                                    })
-                                    cx <- cx + charW
-
-                    // Text matrix advance in text-space units using PDF formula
-                    let mutable tsWidth = 0.0
-                    for b in stringBytes do
-                        let w0 = Fonts.charWidth fi (int b)
-                        let ws = if b = 0x20uy then gs.WordSpacing else 0.0
-                        tsWidth <- tsWidth + (w0 / 1000.0 * gs.FontSize + gs.CharSpacing + ws) * th
-                    textMatrix <- Matrix3x2.multiply (Matrix3x2.translate tsWidth 0.0) textMatrix
-
-            let emitCompositeTextRun (stringBytes: byte[]) =
-                let fi = getFontInfo ()
-                if stringBytes.Length >= 2 then
-                    let f = getRendererFont ()
-                    let tmScale = sqrt(textMatrix.M21 * textMatrix.M21 + textMatrix.M22 * textMatrix.M22)
-                    let ctmScale = sqrt(gs.CTM.M21 * gs.CTM.M21 + gs.CTM.M22 * gs.CTM.M22)
-                    let fontSize = abs gs.FontSize * tmScale * ctmScale
-                    let th = gs.HorizontalScaling / 100.0
-
-                    match fi.EmbeddedFont with
-                    | Some embFont ->
-                        let scale = fontSize / Text.unitsPerEm embFont
-                        let tcDevice = gs.CharSpacing * tmScale * ctmScale
-                        let mutable x = 0.0
-                        let glyphs = ResizeArray<Text.PositionedGlyph>()
-                        let mutable i = 0
-                        while i + 1 < stringBytes.Length do
-                            let hi = int stringBytes.[i]
-                            let lo = int stringBytes.[i + 1]
-                            let cid = (hi <<< 8) ||| lo
-                            let gid =
-                                match fi.CIDToGIDMap with
-                                | Some map -> if cid < map.Length then map.[cid] else cid
-                                | None -> cid
-                            let w0 = Fonts.charWidth fi cid
-                            let baseAdv = w0 / 1000.0 * fontSize
-                            let totalAdv = (baseAdv + tcDevice) * th
-                            glyphs.Add({ GlyphId = gid; X = x; Y = 0.0; XAdv = totalAdv })
-                            x <- x + totalAdv
-                            i <- i + 2
-
-                        let combined = Matrix3x2.multiply textMatrix gs.CTM
-                        let screenX = combined.DX
-                        let screenY = rawPageH - combined.DY
-
-                        if glyphs.Count > 0 && gs.TextRenderMode <> 3 then
-                            let origin = vec2 screenX screenY
-                            let run : Text.GlyphRun = { Font = embFont; FontSize = fontSize; Glyphs = glyphs.ToArray(); Direction = Rbt.Shaper.Shaper.LeftToRight }
-                            let runs = [run]
-
-                            let fColor = fillColor gs
-                            let sColor = { gs.StrokeColor with A = byte (clamp 0.0 255.0 (gs.StrokeAlpha * 255.0)) }
-
-                            match gs.TextRenderMode with
-                            | 1 -> textCmds.Add(DrawGlyphs(origin, runs, Solid sColor))
-                            | 2 ->
-                                textCmds.Add(DrawGlyphs(origin, runs, Solid fColor))
-                                textCmds.Add(DrawGlyphs(origin, runs, Solid sColor))
-                            | _ -> textCmds.Add(DrawGlyphs(origin, runs, Solid fColor))
-
-                        // Emit CharBoxes for composite text
-                        if glyphs.Count > 0 then
-                            let text = decodeTextBytes stringBytes
-                            let asc = fontSize * 0.8
-                            let desc = fontSize * 0.2
-                            let lineH = asc + desc
-                            let glyphArr = glyphs.ToArray()
-                            let mutable ci = 0
-                            for g in glyphArr do
-                                let ch = if ci < text.Length then string text.[ci] else ""
-                                ci <- ci + 1
-                                charBoxes.Add({
-                                    Char = ch
-                                    X = screenX + g.X; Y = screenY - asc
-                                    W = g.XAdv; H = lineH
-                                })
-
-                        // Text matrix advance
-                        let mutable tsWidth = 0.0
-                        let mutable j = 0
-                        while j + 1 < stringBytes.Length do
-                            let cid = (int stringBytes.[j] <<< 8) ||| int stringBytes.[j + 1]
-                            let w0 = Fonts.charWidth fi cid
-                            tsWidth <- tsWidth + (w0 / 1000.0 * gs.FontSize + gs.CharSpacing) * th
-                            j <- j + 2
-                        textMatrix <- Matrix3x2.multiply (Matrix3x2.translate tsWidth 0.0) textMatrix
-                    | None ->
-                        // Fallback: decode with ToUnicode and use shaper
-                        let text = decodeTextBytes stringBytes
-                        if text.Length > 0 then
-                            let runs = Text.layout f fontSize text
-                            let tw = Text.measureWidth f fontSize text
-                            let combined = Matrix3x2.multiply textMatrix gs.CTM
-                            let screenX = combined.DX
-                            let screenY = rawPageH - combined.DY
-                            if runs.Length > 0 && gs.TextRenderMode <> 3 then
-                                let origin = vec2 screenX screenY
-                                textCmds.Add(DrawGlyphs(origin, runs, Solid (fillColor gs)))
-                            // Emit CharBoxes for fallback composite text
-                            if text.Length > 0 then
-                                let asc = fontSize * 0.8
-                                let lineH = fontSize
-                                let charW = tw / float text.Length
-                                let mutable cx = 0.0
-                                for c in text do
-                                    charBoxes.Add({
-                                        Char = string c
-                                        X = screenX + cx; Y = screenY - asc
-                                        W = charW; H = lineH
-                                    })
-                                    cx <- cx + charW
-                            let advance = if tmScale > 0.001 then tw / tmScale else tw
-                            textMatrix <- Matrix3x2.multiply (Matrix3x2.translate advance 0.0) textMatrix
+            let getFontInfo () =
+                let key = Pdf.dictGet doc "Font" currentResources |> Option.bind (Pdf.dictGet doc gs.FontName)
+                match key with
+                | Some obj ->
+                    match fontCache.TryGetValue obj with
+                    | true, info -> info
+                    | _ ->
+                        let info = Fonts.resolve opts.CMaps doc currentResources gs.FontName
+                        fontCache.[obj] <- info
+                        info
+                | None -> Fonts.resolve opts.CMaps doc currentResources gs.FontName
 
             let emitText (stringBytes: byte[]) =
                 let fi = getFontInfo ()
-                if fi.IsComposite then emitCompositeTextRun stringBytes
-                else emitTextRun stringBytes
+                let codes = Fonts.sourceCodes fi stringBytes
+                let count = codes.Length
+                if count > 0 then
+                    let labels = codes |> Array.map (fun (code, bytes) -> Fonts.label fi code bytes)
+                    let font = fi.EmbeddedFont |> Option.defaultValue opts.FallbackFont
+                    let fontSize = abs gs.FontSize
+                    let sign = if gs.FontSize < 0.0 then -1.0 else 1.0
+                    let horizontal = gs.HorizontalScaling / 100.0
+                    // Glyph outlines use y-down coordinates. The local transform flips
+                    // them into text space, applies rise and horizontal scaling, then
+                    // composes the complete text matrix and graphics CTM.
+                    let localToText =
+                        { M11 = sign * horizontal; M12 = 0.0
+                          M21 = 0.0; M22 = -sign; DX = 0.0; DY = gs.TextRise }
+                    let localToPage =
+                        Matrix3x2.multiply (Matrix3x2.multiply localToText textMatrix) gs.CTM
+                    let glyphs = ResizeArray<Text.FontData * Text.PositionedGlyph>()
+                    let mutable advance = 0.0
+                    let mutable advanceY = 0.0
+                    for i in 0 .. count - 1 do
+                        let sourceCode, bytes = codes.[i]
+                        let code = if fi.IsComposite then Fonts.cid fi sourceCode bytes.Length else sourceCode
+                        let wordSpacing = if bytes.Length = 1 && sourceCode = 32 then gs.WordSpacing else 0.0
+                        let proc =
+                            fi.Type3CharProcs
+                            |> Option.bind (fun procs ->
+                                Pdf.dictGet doc (Fonts.glyphName fi code) procs
+                                |> Option.orElseWith (fun () -> Pdf.dictGet doc ".notdef" procs))
+                            |> Option.map (Pdf.getStreamData doc)
+                        let width, widthY =
+                            if fi.Type3Font.IsSome then
+                                let wx, wy =
+                                    if fi.HasExplicitWidths then Fonts.charWidth fi code, 0.0
+                                    else
+                                        match proc with
+                                        | Some data ->
+                                            match tokenize data with
+                                            | TNumber wx :: TNumber wy :: TOperator "d0" :: _
+                                            | TNumber wx :: TNumber wy :: TNumber _ :: TNumber _ :: TNumber _ :: TNumber _ :: TOperator "d1" :: _ -> wx, wy
+                                            | _ -> 0.0, 0.0
+                                        | None -> 0.0, 0.0
+                                (wx * fi.Type3Matrix.M11 + wy * fi.Type3Matrix.M21) * gs.FontSize,
+                                (wx * fi.Type3Matrix.M12 + wy * fi.Type3Matrix.M22) * gs.FontSize
+                            else Fonts.charWidth fi code / 1000.0 * gs.FontSize, 0.0
+                        let verticalAdvance, originX, originY =
+                            if fi.IsVertical then
+                                let w1y, v1x, v1y = Fonts.verticalMetrics fi code
+                                w1y * gs.FontSize / 1000.0 - gs.CharSpacing - wordSpacing,
+                                v1x * gs.FontSize / 1000.0, v1y * gs.FontSize / 1000.0
+                            else 0.0, 0.0, 0.0
+                        let step = if fi.IsVertical then 0.0 else width + gs.CharSpacing + wordSpacing
+                        let x = (advance - originX) * sign
+                        let y = -(advanceY - originY) * sign
+                        match fi.Type3Font, proc with
+                        | Some _, Some data ->
+                            let glyphText = { M11 = gs.FontSize * horizontal; M12 = 0.0; M21 = 0.0; M22 = gs.FontSize; DX = advance * horizontal; DY = gs.TextRise + advanceY }
+                            let glyphCTM = Matrix3x2.multiply (Matrix3x2.multiply (Matrix3x2.multiply fi.Type3Matrix glyphText) textMatrix) gs.CTM
+                            let glyphResources = fi.Type3Resources |> Option.defaultValue currentResources
+                            let glyphCmds, _ = renderContent opts doc glyphResources data { gs with CTM = glyphCTM } viewport scale (depth + 1)
+                            cmds.AddRange glyphCmds
+                        | _ -> ()
+                        match fi.Type3Font, fi.EmbeddedFont, fi.ByteToGlyph, fi.IsComposite with
+                        | Some _, _, _, _ -> ()
+                        | None, Some _, Some map, false when not fi.UnicodeGlyphs ->
+                            let gid = if code < map.Length then map.[code] else 0
+                            glyphs.Add(font, { GlyphId = gid; X = x; Y = y; XAdv = step * sign })
+                        | None, Some _, _, true ->
+                            let gid =
+                                match fi.CIDToGIDMap with
+                                | Some map -> if code >= 0 && code < map.Length then map.[code] else 0
+                                | None -> code
+                            glyphs.Add(font, { GlyphId = gid; X = x; Y = y; XAdv = step * sign })
+                        | _ ->
+                            // Shape only the Unicode represented by this PDF code;
+                            // positioning between codes always comes from PDF widths.
+                            let runs = Text.layout font fontSize labels.[i]
+                            let missing = List.isEmpty runs || (runs |> List.exists (fun run -> run.Glyphs |> Array.exists (fun glyph -> glyph.GlyphId = 0)))
+                            let selectedFont, selectedRuns =
+                                if fi.EmbeddedFont.IsNone && missing then
+                                    match opts.CjkFont.Value with
+                                    | Some cjk -> cjk, Text.layout cjk fontSize labels.[i]
+                                    | None -> font, runs
+                                else font, runs
+                            for run in selectedRuns do
+                                for glyph in run.Glyphs do
+                                    glyphs.Add(selectedFont, { glyph with X = x + glyph.X; Y = y + glyph.Y })
+
+                        let x2 = x + (if fi.IsVertical then width else step) * sign
+                        let top = if fi.IsVertical then -advanceY * sign else y - 0.8 * fontSize
+                        let bottom = if fi.IsVertical then -(advanceY + verticalAdvance) * sign else y + 0.2 * fontSize
+                        let p0 = Matrix3x2.transformVec2 localToPage (vec2 x top)
+                        let p1 = Matrix3x2.transformVec2 localToPage (vec2 x2 top)
+                        let p2 = Matrix3x2.transformVec2 localToPage (vec2 x bottom)
+                        let p3 = Matrix3x2.transformVec2 localToPage (vec2 x2 bottom)
+                        let minX = float (min (min p0.X p1.X) (min p2.X p3.X))
+                        let maxX = float (max (max p0.X p1.X) (max p2.X p3.X))
+                        let minY = float (min (min p0.Y p1.Y) (min p2.Y p3.Y))
+                        let maxY = float (max (max p0.Y p1.Y) (max p2.Y p3.Y))
+                        charBoxes.Add({ Char = labels.[i]; X = minX; Y = minY; W = maxX - minX; H = maxY - minY })
+                        advance <- advance + step
+                        advanceY <- advanceY + (if fi.IsVertical then verticalAdvance else widthY)
+
+                    if glyphs.Count > 0 then
+                        let mode = gs.TextRenderMode
+                        let fill = mode = 0 || mode = 2 || mode = 4 || mode = 6
+                        let stroke = mode = 1 || mode = 2 || mode = 5 || mode = 6
+                        let clipping = mode >= 4 && mode <= 7
+                        if clipping then hasTextClip <- true
+                        if mode = 0 && gs.FillPattern.IsNone then
+                            // Keep ordinary text on the backends' cached glyph path.
+                            let runs = ResizeArray<Text.GlyphRun>()
+                            let mutable first = 0
+                            while first < glyphs.Count do
+                                let glyphFont = fst glyphs.[first]
+                                let mutable finish = first + 1
+                                while finish < glyphs.Count && (fst glyphs.[finish]).Id = glyphFont.Id do
+                                    finish <- finish + 1
+                                runs.Add { Font = glyphFont; FontSize = fontSize
+                                           Glyphs = Array.init (finish - first) (fun i -> snd glyphs.[first + i])
+                                           Direction = Rbt.Shaper.Shaper.LeftToRight }
+                                first <- finish
+                            addPaint (Group(localToPage, 1.0, [DrawGlyphs(vec2 0.0 0.0, List.ofSeq runs, Solid(fillColor gs))]))
+                        elif fill || stroke || clipping then
+                            for glyphFont, glyph in glyphs do
+                                let size = fontSize / Text.unitsPerEm glyphFont
+                                let segments =
+                                    Text.glyphOutline glyphFont glyph.GlyphId
+                                    |> List.map (Text.translatePathSeg glyph.X glyph.Y size)
+                                    |> transformPath localToPage
+                                if clipping then textClip.Add segments
+                                if fill || stroke then paintPath segments fill stroke NonZero
+                    textMatrix <- Matrix3x2.multiply (Matrix3x2.translate (advance * horizontal) advanceY) textMatrix
 
             let resolveColorSpace (csName: string) =
                 match csName with
-                | "DeviceGray" | "DeviceRGB" | "DeviceCMYK" | "G" | "RGB" | "CMYK" -> csName
+                | "DeviceGray" | "DeviceRGB" | "DeviceCMYK" | "Pattern" -> csName
                 | _ ->
                     match Pdf.dictGet doc "ColorSpace" currentResources with
                     | Some csDict ->
@@ -486,26 +569,14 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                         | Some csObj ->
                             let resolved = Pdf.deref doc csObj
                             match resolved with
-                            | PdfArray items when items.Length >= 2 ->
+                            | PdfArray items when not items.IsEmpty ->
                                 let typeName = match Pdf.deref doc items.[0] with PdfName n -> n | _ -> ""
                                 match typeName with
-                                | "Separation" ->
-                                    if items.Length >= 3 then
-                                        match Pdf.deref doc items.[2] with
-                                        | PdfName alt -> "Separation:" + alt
-                                        | _ -> "DeviceGray"
-                                    else "DeviceGray"
-                                | "ICCBased" ->
-                                    if items.Length >= 2 then
-                                        match Pdf.dictGet doc "N" items.[1] with
-                                        | Some (PdfInt 1L) -> "DeviceGray"
-                                        | Some (PdfInt 3L) -> "DeviceRGB"
-                                        | Some (PdfInt 4L) -> "DeviceCMYK"
-                                        | _ -> "DeviceRGB"
-                                    else "DeviceRGB"
-                                | "CalGray" -> "DeviceGray"
-                                | "CalRGB" | "Lab" -> "DeviceRGB"
-                                | _ -> "DeviceGray"
+                                | "Pattern" ->
+                                    match items with
+                                    | [_; PdfName baseSpace] -> "Pattern:" + baseSpace
+                                    | _ -> "Pattern"
+                                | _ -> csName
                             | PdfName n -> n
                             | _ -> "DeviceGray"
                         | None -> csName
@@ -513,16 +584,18 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
 
             let emitPath (fill: bool) (stroke: bool) (fillRule: FillRule) =
                 let segs = path.Segments
-                if segs.Length > 0 then
-                    if fill then
-                        cmds.Add(FillPath(segs, Solid (fillColor gs), fillRule))
-                    if stroke then
-                        cmds.Add(StrokePath(segs, makeStroke gs))
+                if not segs.IsEmpty then paintPath segs fill stroke fillRule
                 path.Clear()
 
-            let clipStack = ResizeArray<(int * PathSeg list * FillRule) option>()
+            let clipStack = ResizeArray<(int * ClipKind) option>()
+            let wrapClip kind children =
+                match kind with
+                | PathClip (segs, rule) -> Clip(segs, rule, children)
+                | TextClip paths ->
+                    let masks = paths |> List.map (fun segs -> FillPath(segs, Solid Color.white, NonZero))
+                    Mask(masks, children)
 
-            let streamStack = Collections.Generic.Stack<Token[] * int * PdfObj>()
+            let streamStack = Collections.Generic.Stack<Token[] * int * PdfObj * Matrix3x2 * (int * bool * bool) option>()
             let mutable tokenArr = tokens |> Array.ofList
             let mutable tokenCount = tokenArr.Length
             let mutable i = 0
@@ -531,32 +604,39 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                 match pendingClip with
                 | Some (clipSegs, clipRule) ->
                     pendingClip <- None
-                    clipStack.Add(Some (cmds.Count, clipSegs, clipRule))
+                    clipStack.Add(Some (cmds.Count, PathClip(clipSegs, clipRule)))
                 | None -> ()
 
             let mutable loopRunning = true
             while loopRunning do
                 if i >= tokenCount then
                     if streamStack.Count > 0 then
-                        let (prevArr, prevI, prevRes) = streamStack.Pop()
+                        let (prevArr, prevI, prevRes, prevDefaultCTM, groupStart) = streamStack.Pop()
                         if stateStack.Count > 0 then
                             gs <- stateStack.[stateStack.Count - 1]
                             stateStack.RemoveAt(stateStack.Count - 1)
                         let mutable poppingClips2 = true
                         while poppingClips2 && clipStack.Count > 0 do
                             match clipStack.[clipStack.Count - 1] with
-                            | Some (startIdx, segs, rule) ->
+                            | Some (startIdx, kind) ->
                                 let clippedCmds = cmds |> Seq.skip startIdx |> Seq.toList
                                 cmds.RemoveRange(startIdx, cmds.Count - startIdx)
-                                cmds.Add(Clip(segs, rule, clippedCmds))
+                                cmds.Add(wrapClip kind clippedCmds)
                                 clipStack.RemoveAt(clipStack.Count - 1)
                             | None ->
                                 clipStack.RemoveAt(clipStack.Count - 1)
                                 poppingClips2 <- false
+                        match groupStart with
+                        | Some (start, isolated, knockout) ->
+                            let children = cmds |> Seq.skip start |> Seq.toList
+                            cmds.RemoveRange(start, cmds.Count - start)
+                            cmds.Add(TransparencyGroup(isolated, knockout, gs.FillAlpha, blendMode gs.BlendMode, gs.SoftMask, children))
+                        | None -> ()
                         tokenArr <- prevArr
                         tokenCount <- prevArr.Length
                         i <- prevI
                         currentResources <- prevRes
+                        defaultCTM <- prevDefaultCTM
                     else
                         loopRunning <- false
                 else
@@ -587,10 +667,10 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                         let mutable poppingClips = true
                         while poppingClips && clipStack.Count > 0 do
                             match clipStack.[clipStack.Count - 1] with
-                            | Some (startIdx, segs, rule) ->
+                            | Some (startIdx, kind) ->
                                 let clippedCmds = cmds |> Seq.skip startIdx |> Seq.toList
                                 cmds.RemoveRange(startIdx, cmds.Count - startIdx)
-                                cmds.Add(Clip(segs, rule, clippedCmds))
+                                cmds.Add(wrapClip kind clippedCmds)
                                 clipStack.RemoveAt(clipStack.Count - 1)
                             | None ->
                                 clipStack.RemoveAt(clipStack.Count - 1)
@@ -646,63 +726,126 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                                 match Pdf.dictGet doc "LJ" gsObj with
                                 | Some (PdfInt j) -> gs <- { gs with LineJoin = match int j with 1 -> RoundJoin | 2 -> Bevel | _ -> Miter }
                                 | _ -> ()
-                                match Pdf.dictGet doc "BM" gsObj with
-                                | Some (PdfName bm) -> gs <- { gs with BlendMode = bm }
-                                | Some (PdfArray (first :: _)) ->
-                                    match Pdf.deref doc first with
-                                    | PdfName bm -> gs <- { gs with BlendMode = bm }
-                                    | _ -> ()
+                                match Pdf.dictGet doc "AIS" gsObj |> Option.map (Pdf.deref doc) with
+                                | Some (PdfBool true) -> invalidOp "PDF alpha-is-shape is not supported"
                                 | _ -> ()
+                                let supportedBlend name =
+                                    match name with
+                                    | "Normal" | "Compatible" | "Multiply" | "Screen" | "Overlay"
+                                    | "Darken" | "Lighten" | "ColorDodge" | "ColorBurn" | "HardLight"
+                                    | "SoftLight" | "Difference" | "Exclusion" | "Hue" | "Saturation"
+                                    | "Color" | "Luminosity" -> true
+                                    | _ -> false
+                                match Pdf.dictGet doc "BM" gsObj |> Option.map (Pdf.deref doc) with
+                                | Some (PdfName bm) -> gs <- { gs with BlendMode = if supportedBlend bm then bm else "Normal" }
+                                | Some (PdfArray choices) ->
+                                    let selected = choices |> List.tryPick (fun choice ->
+                                        match Pdf.deref doc choice with PdfName bm when supportedBlend bm -> Some bm | _ -> None)
+                                    gs <- { gs with BlendMode = Option.defaultValue "Normal" selected }
+                                | _ -> ()
+                                match Pdf.dictGet doc "SMask" gsObj |> Option.map (Pdf.deref doc) with
+                                | Some (PdfName "None") -> gs <- { gs with SoftMask = None }
+                                | Some mask ->
+                                    let transfer =
+                                        match Pdf.dictGet doc "TR" mask |> Option.map (Pdf.deref doc) with
+                                        | None | Some (PdfName "Identity") -> None
+                                        | Some fn -> Some (Shading.tryEvaluateFunction doc fn |> Option.defaultWith (fun () -> invalidOp "Unsupported PDF soft-mask transfer function"))
+                                    let group = Pdf.dictGet doc "G" mask |> Option.defaultWith (fun () -> invalidOp "PDF soft mask has no group")
+                                    let number value = match Pdf.deref doc value with PdfInt n -> float n | PdfReal n -> n | _ -> 0.0
+                                    let matrix =
+                                        match Pdf.dictGet doc "Matrix" group |> Option.map (Pdf.deref doc) with
+                                        | Some (PdfArray [a;b;c;d;e;f]) ->
+                                            { M11 = number a; M12 = number b; M21 = number c; M22 = number d; DX = number e; DY = number f }
+                                        | _ -> Matrix3x2.identity
+                                    let maskCTM = Matrix3x2.multiply matrix gs.CTM
+                                    let maskResources = Pdf.dictGet doc "Resources" group |> Option.defaultValue currentResources
+                                    let maskState = { gs with CTM = maskCTM; SoftMask = None; BlendMode = "Normal"; FillAlpha = 1.0; StrokeAlpha = 1.0 }
+                                    let children, _ = renderContent opts doc maskResources (Pdf.getStreamData doc group) maskState viewport scale (depth + 1)
+                                    let groupDict = Pdf.dictGet doc "Group" group
+                                    let knockout = groupDict |> Option.bind (Pdf.dictGet doc "K") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                                    let children = [TransparencyGroup(true, knockout, 1.0, Normal, None, children)]
+                                    let bounded =
+                                        match Pdf.dictGet doc "BBox" group |> Option.map (Pdf.deref doc) with
+                                        | Some (PdfArray [a;b;c;d]) ->
+                                            let p x y = Matrix3x2.transformVec2 maskCTM (vec2 x y)
+                                            let x0,y0,x1,y1 = number a,number b,number c,number d
+                                            [Clip([MoveTo(p x0 y0); LineTo(p x1 y0); LineTo(p x1 y1); LineTo(p x0 y1); Close], NonZero, children)]
+                                        | _ -> children
+                                    let luminosity =
+                                        match Pdf.dictGet doc "S" mask |> Option.map (Pdf.deref doc) with
+                                        | Some (PdfName "Alpha") -> false
+                                        | Some (PdfName "Luminosity") -> true
+                                        | _ -> invalidOp "Unsupported PDF soft-mask subtype"
+                                    let backdrop =
+                                        match Pdf.dictGet doc "BC" mask |> Option.map (Pdf.deref doc) with
+                                        | Some (PdfArray values) ->
+                                            let colorSpace = groupDict |> Option.bind (Pdf.dictGet doc "CS") |> Option.defaultValue (PdfName "DeviceRGB")
+                                            match PdfColor.resolve doc maskResources colorSpace with
+                                            | Some space ->
+                                                let struct (r, g, b) = PdfColor.toRgb space (values |> List.map number |> List.toArray)
+                                                0.3 * float r + 0.59 * float g + 0.11 * float b
+                                            | None -> invalidOp "Unsupported PDF soft-mask backdrop color space"
+                                        | _ -> 0.0
+                                    let maskCommands =
+                                        if not luminosity && transfer.IsNone then bounded
+                                        else
+                                            let convert _ _ (pixels: uint32[]) =
+                                                pixels |> Array.map (fun pixel ->
+                                                    let c = Pixel.toColor pixel
+                                                    let value =
+                                                        if luminosity then
+                                                            (0.3 * float c.R + 0.59 * float c.G + 0.11 * float c.B + backdrop * (1.0 - float c.A / 255.0)) / 255.0
+                                                        else float c.A / 255.0
+                                                    let mapped = match transfer with Some fn -> fn value | None -> value
+                                                    let a = byte (clamp 0.0 255.0 (mapped * 255.0))
+                                                    Pixel.fromColor { R = a; G = a; B = a; A = a })
+                                            [Filtered([Custom convert], bounded)]
+                                    gs <- { gs with SoftMask = Some maskCommands }
+                                | None -> ()
                             | None -> ()
                         | None -> ()
 
                     // ── Color ──
-                    | "g" -> let gray = popNum () in gs <- { gs with FillColor = pdfColorToColor "DeviceGray" [gray] gs.FillAlpha; ColorSpace = "DeviceGray" }
-                    | "G" -> let gray = popNum () in gs <- { gs with StrokeColor = pdfColorToColor "DeviceGray" [gray] gs.StrokeAlpha; StrokeColorSpace = "DeviceGray" }
+                    | "g" -> let gray = popNum () in gs <- { gs with FillColor = pdfColorToColor "DeviceGray" [gray] gs.FillAlpha; ColorSpace = "DeviceGray"; FillPattern = None }
+                    | "G" -> let gray = popNum () in gs <- { gs with StrokeColor = pdfColorToColor "DeviceGray" [gray] gs.StrokeAlpha; StrokeColorSpace = "DeviceGray"; StrokePattern = None }
                     | "rg" ->
                         let b = popNum () in let g = popNum () in let r = popNum ()
-                        gs <- { gs with FillColor = pdfColorToColor "DeviceRGB" [r; g; b] gs.FillAlpha; ColorSpace = "DeviceRGB" }
+                        gs <- { gs with FillColor = pdfColorToColor "DeviceRGB" [r; g; b] gs.FillAlpha; ColorSpace = "DeviceRGB"; FillPattern = None }
                     | "RG" ->
                         let b = popNum () in let g = popNum () in let r = popNum ()
-                        gs <- { gs with StrokeColor = pdfColorToColor "DeviceRGB" [r; g; b] gs.StrokeAlpha; StrokeColorSpace = "DeviceRGB" }
+                        gs <- { gs with StrokeColor = pdfColorToColor "DeviceRGB" [r; g; b] gs.StrokeAlpha; StrokeColorSpace = "DeviceRGB"; StrokePattern = None }
                     | "k" ->
                         let k = popNum () in let y = popNum () in let m = popNum () in let c = popNum ()
-                        gs <- { gs with FillColor = pdfColorToColor "DeviceCMYK" [c; m; y; k] gs.FillAlpha; ColorSpace = "DeviceCMYK" }
+                        gs <- { gs with FillColor = pdfColorToColor "DeviceCMYK" [c; m; y; k] gs.FillAlpha; ColorSpace = "DeviceCMYK"; FillPattern = None }
                     | "K" ->
                         let k = popNum () in let y = popNum () in let m = popNum () in let c = popNum ()
-                        gs <- { gs with StrokeColor = pdfColorToColor "DeviceCMYK" [c; m; y; k] gs.StrokeAlpha; StrokeColorSpace = "DeviceCMYK" }
+                        gs <- { gs with StrokeColor = pdfColorToColor "DeviceCMYK" [c; m; y; k] gs.StrokeAlpha; StrokeColorSpace = "DeviceCMYK"; StrokePattern = None }
                     | "cs" ->
                         let csName = popName ()
-                        gs <- { gs with ColorSpace = resolveColorSpace csName }
+                        gs <- { gs with ColorSpace = resolveColorSpace csName; FillPattern = None }
                     | "CS" ->
                         let csName = popName ()
-                        gs <- { gs with StrokeColorSpace = resolveColorSpace csName }
+                        gs <- { gs with StrokeColorSpace = resolveColorSpace csName; StrokePattern = None }
                     | "sc" | "scn" ->
                         let ops = popAllOperands ()
                         let nums = ops |> List.choose (function TNumber n -> Some n | _ -> None)
+                        let space = if gs.ColorSpace.StartsWith("Pattern:") then gs.ColorSpace.Substring(8) else gs.ColorSpace
                         let color =
-                            if gs.ColorSpace.StartsWith("Separation:") then
-                                let alt = gs.ColorSpace.Substring(11)
-                                let tint = match nums with [t] -> t | _ -> 0.0
-                                match alt with
-                                | "DeviceCMYK" -> pdfColorToColor "DeviceCMYK" [tint; tint; tint; tint] gs.FillAlpha
-                                | "DeviceRGB" -> pdfColorToColor "DeviceRGB" [1.0-tint; 1.0-tint; 1.0-tint] gs.FillAlpha
-                                | _ -> pdfColorToColor "DeviceGray" [1.0-tint] gs.FillAlpha
-                            else pdfColorToColor gs.ColorSpace nums gs.FillAlpha
-                        gs <- { gs with FillColor = color }
+                            match PdfColor.resolve doc currentResources (PdfName space) with
+                            | Some resolved -> PdfColor.toColor resolved (List.toArray nums) gs.FillAlpha
+                            | None -> pdfColorToColor space nums gs.FillAlpha
+                        let pattern = if gs.ColorSpace.StartsWith("Pattern") then ops |> List.tryPick (function TName n -> Some n | _ -> None) else None
+                        gs <- { gs with FillColor = color; FillPattern = pattern }
                     | "SC" | "SCN" ->
                         let ops = popAllOperands ()
                         let nums = ops |> List.choose (function TNumber n -> Some n | _ -> None)
+                        let space = if gs.StrokeColorSpace.StartsWith("Pattern:") then gs.StrokeColorSpace.Substring(8) else gs.StrokeColorSpace
                         let color =
-                            if gs.StrokeColorSpace.StartsWith("Separation:") then
-                                let alt = gs.StrokeColorSpace.Substring(11)
-                                let tint = match nums with [t] -> t | _ -> 0.0
-                                match alt with
-                                | "DeviceCMYK" -> pdfColorToColor "DeviceCMYK" [tint; tint; tint; tint] gs.StrokeAlpha
-                                | "DeviceRGB" -> pdfColorToColor "DeviceRGB" [1.0-tint; 1.0-tint; 1.0-tint] gs.StrokeAlpha
-                                | _ -> pdfColorToColor "DeviceGray" [1.0-tint] gs.StrokeAlpha
-                            else pdfColorToColor gs.StrokeColorSpace nums gs.StrokeAlpha
-                        gs <- { gs with StrokeColor = color }
+                            match PdfColor.resolve doc currentResources (PdfName space) with
+                            | Some resolved -> PdfColor.toColor resolved (List.toArray nums) gs.StrokeAlpha
+                            | None -> pdfColorToColor space nums gs.StrokeAlpha
+                        let pattern = if gs.StrokeColorSpace.StartsWith("Pattern") then ops |> List.tryPick (function TName n -> Some n | _ -> None) else None
+                        gs <- { gs with StrokeColor = color; StrokePattern = pattern }
 
                     // ── Path Construction ──
                     | "m" -> let y = popNum () in let x = popNum () in path.MoveTo(x, y)
@@ -715,8 +858,7 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                     | "v" ->
                         let y3 = popNum () in let x3 = popNum ()
                         let y2 = popNum () in let x2 = popNum ()
-                        let (cx, cy) = path.CurrentPoint
-                        path.CubicTo(cx, cy, x2, y2, x3, y3)
+                        path.CubicFromCurrent(x2, y2, x3, y3)
                     | "y" ->
                         let y3 = popNum () in let x3 = popNum ()
                         let y1 = popNum () in let x1 = popNum ()
@@ -751,7 +893,14 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                         inText <- true
                         textMatrix <- Matrix3x2.identity
                         lineMatrix <- Matrix3x2.identity
-                    | "ET" -> inText <- false
+                        textClip.Clear()
+                        hasTextClip <- false
+                    | "ET" ->
+                        inText <- false
+                        if hasTextClip then
+                            clipStack.Add(Some (cmds.Count, TextClip (textClip |> Seq.toList)))
+                        textClip.Clear()
+                        hasTextClip <- false
 
                     | "Tf" ->
                         let size = popNum ()
@@ -820,9 +969,16 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                             | TString s -> emitText s
                             | THexString s -> emitText s
                             | TNumber n ->
-                                let shift = -n / 1000.0 * gs.FontSize * (gs.HorizontalScaling / 100.0)
-                                textMatrix <- Matrix3x2.multiply (Matrix3x2.translate shift 0.0) textMatrix
+                                let shift = -n / 1000.0 * gs.FontSize
+                                let dx, dy = if (getFontInfo ()).IsVertical then 0.0, shift else shift * (gs.HorizontalScaling / 100.0), 0.0
+                                textMatrix <- Matrix3x2.multiply (Matrix3x2.translate dx dy) textMatrix
                             | _ -> ()
+
+                    | "sh" ->
+                        let name = popName ()
+                        match Shading.tryRender doc currentResources name gs.CTM gs.FillAlpha viewport.Bounds scale with
+                        | Some command -> addPaint command
+                        | None -> ()
 
                     // ── XObject (Images and Forms) ──
                     | "Do" ->
@@ -837,229 +993,11 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                                     | _ -> ""
                                 match subtype with
                                 | "Image" ->
-                                    let imgW =
-                                        match Pdf.dictGet doc "Width" xobj with
-                                        | Some (PdfInt n) -> int n | Some (PdfReal n) -> int n | _ -> 1
-                                    let imgH =
-                                        match Pdf.dictGet doc "Height" xobj with
-                                        | Some (PdfInt n) -> int n | Some (PdfReal n) -> int n | _ -> 1
-                                    let bpc =
-                                        match Pdf.dictGet doc "BitsPerComponent" xobj with
-                                        | Some (PdfInt n) -> int n | _ -> 8
-                                    let imgColorSpaceObj = Pdf.dictGet doc "ColorSpace" xobj
-                                    let imgColorSpace, palette =
-                                        match imgColorSpaceObj with
-                                        | Some (PdfName cs) -> cs, None
-                                        | Some csObj ->
-                                            let resolved = Pdf.deref doc csObj
-                                            match resolved with
-                                            | PdfArray items when items.Length >= 1 ->
-                                                let typeName = match Pdf.deref doc items.[0] with PdfName n -> n | _ -> ""
-                                                match typeName with
-                                                | "Indexed" when items.Length >= 4 ->
-                                                    let baseCS =
-                                                        match Pdf.deref doc items.[1] with
-                                                        | PdfName n -> n
-                                                        | PdfArray bItems when bItems.Length >= 1 ->
-                                                            let bType = match Pdf.deref doc bItems.[0] with PdfName n -> n | _ -> ""
-                                                            match bType with
-                                                            | "ICCBased" when bItems.Length >= 2 ->
-                                                                match Pdf.dictGet doc "N" bItems.[1] with
-                                                                | Some (PdfInt 1L) -> "DeviceGray"
-                                                                | Some (PdfInt 3L) -> "DeviceRGB"
-                                                                | Some (PdfInt 4L) -> "DeviceCMYK"
-                                                                | _ -> "DeviceRGB"
-                                                            | _ -> "DeviceRGB"
-                                                        | _ -> "DeviceRGB"
-                                                    let paletteBytes =
-                                                        match Pdf.deref doc items.[3] with
-                                                        | PdfString s -> s
-                                                        | _ -> try Pdf.getStreamData doc items.[3] with _ -> [||]
-                                                    "Indexed", Some (baseCS, paletteBytes)
-                                                | "ICCBased" when items.Length >= 2 ->
-                                                    let cs =
-                                                        match Pdf.dictGet doc "N" items.[1] with
-                                                        | Some (PdfInt 1L) -> "DeviceGray"
-                                                        | Some (PdfInt 3L) -> "DeviceRGB"
-                                                        | Some (PdfInt 4L) -> "DeviceCMYK"
-                                                        | _ -> "DeviceRGB"
-                                                    cs, None
-                                                | "CalGray" -> "DeviceGray", None
-                                                | "CalRGB" | "Lab" -> "DeviceRGB", None
-                                                | _ -> "DeviceRGB", None
-                                            | _ -> "DeviceRGB", None
-                                        | _ -> "DeviceRGB", None
-
-                                    let isImageMask =
-                                        match Pdf.dictGet doc "ImageMask" xobj with
-                                        | Some (PdfBool true) -> true | _ -> false
-
-                                    // Check for JPEG filter
-                                    let filterName =
-                                        match Pdf.dictGet doc "Filter" xobj with
-                                        | Some (PdfName f) -> f
-                                        | Some (PdfArray (f :: _)) ->
-                                            match Pdf.deref doc f with PdfName n -> n | _ -> ""
-                                        | _ -> ""
-
-                                    try
-                                        let imgData = Pdf.getStreamData doc xobj
-
-                                        // Check for SMask
-                                        let smaskAlpha =
-                                            match Pdf.dictGet doc "SMask" xobj with
-                                            | Some smaskObj ->
-                                                try
-                                                    let smW = match Pdf.dictGet doc "Width" smaskObj with Some (PdfInt n) -> int n | Some (PdfReal n) -> int n | _ -> imgW
-                                                    let smH = match Pdf.dictGet doc "Height" smaskObj with Some (PdfInt n) -> int n | Some (PdfReal n) -> int n | _ -> imgH
-                                                    let smData = Pdf.getStreamData doc smaskObj
-                                                    if smData.Length >= smW * smH && smW = imgW && smH = imgH then Some smData
-                                                    else None
-                                                with _ -> None
-                                            | None -> None
-
-                                        // Check for color key mask
-                                        let colorKeyMask =
-                                            match Pdf.dictGet doc "Mask" xobj with
-                                            | Some (PdfArray items) ->
-                                                let nums = items |> List.choose (fun o -> match Pdf.deref doc o with PdfInt n -> Some (int n) | PdfReal f -> Some (int f) | _ -> None)
-                                                if nums.Length >= 2 && nums.Length % 2 = 0 then Some (nums |> Array.ofList)
-                                                else None
-                                            | _ -> None
-
-                                        if isImageMask then
-                                            // 1-bit stencil: each bit=1 paints current fill color
-                                            let fc = fillColor gs
-                                            let pixels = Array.create (imgW * imgH) 0u
-                                            let rowBytes = (imgW + 7) / 8
-                                            for y in 0..imgH - 1 do
-                                                for x in 0..imgW - 1 do
-                                                    let byteIdx = y * rowBytes + x / 8
-                                                    let bitIdx = 7 - (x % 8)
-                                                    if byteIdx < imgData.Length then
-                                                        let bit = (imgData.[byteIdx] >>> bitIdx) &&& 1uy
-                                                        // Decode array: default [0 1] means bit=0 → paint
-                                                        let paint =
-                                                            match Pdf.dictGet doc "Decode" xobj with
-                                                            | Some (PdfArray [a; _]) ->
-                                                                match Pdf.deref doc a with
-                                                                | PdfInt 1L | PdfReal 1.0 -> bit = 1uy
-                                                                | _ -> bit = 0uy
-                                                            | _ -> bit = 0uy
-                                                        if paint then
-                                                            pixels.[y * imgW + x] <- Pixel.pack fc.B fc.G fc.R fc.A
-
-                                            let fb = Framebuffer.ofArray pixels imgW imgH
-                                            let srcR = rect 0.0 0.0 (float imgW) (float imgH)
-                                            let dstR = rect 0.0 0.0 1.0 1.0
-                                            cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
-
-                                        elif filterName = "DCTDecode" then
-                                            // JPEG — use external decoder on raw stream bytes
-                                            let rawData =
-                                                match Pdf.deref doc xobj with
-                                                | PdfStream (_, raw) -> raw
-                                                | _ -> imgData
-                                            match opts.DecodeJpeg rawData with
-                                            | Some (dw, dh, dpixels) ->
-                                                let fb = Framebuffer.ofArray dpixels dw dh
-                                                let srcR = rect 0.0 0.0 (float dw) (float dh)
-                                                let dstR = rect 0.0 0.0 1.0 1.0
-                                                cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
-                                            | None -> ()
-
-                                        else
-
-                                        let pixels = Array.create (imgW * imgH) 0u
-                                        match palette with
-                                        | Some (baseCS, paletteBytes) ->
-                                            // Indexed color space: pixel byte is palette index
-                                            let entrySize = match baseCS with "DeviceGray" -> 1 | "DeviceCMYK" -> 4 | _ -> 3
-                                            for y in 0..imgH - 1 do
-                                                for x in 0..imgW - 1 do
-                                                    let idx = y * imgW + x
-                                                    if idx < imgData.Length then
-                                                        let palIdx = int imgData.[idx]
-                                                        let off = palIdx * entrySize
-                                                        let r, g, b =
-                                                            if off + entrySize - 1 < paletteBytes.Length then
-                                                                match baseCS with
-                                                                | "DeviceGray" -> let v = paletteBytes.[off] in (v, v, v)
-                                                                | "DeviceCMYK" ->
-                                                                    let c = float paletteBytes.[off] / 255.0
-                                                                    let m = float paletteBytes.[off+1] / 255.0
-                                                                    let yy = float paletteBytes.[off+2] / 255.0
-                                                                    let k = float paletteBytes.[off+3] / 255.0
-                                                                    (byte ((1.0-c)*(1.0-k)*255.0), byte ((1.0-m)*(1.0-k)*255.0), byte ((1.0-yy)*(1.0-k)*255.0))
-                                                                | _ -> (paletteBytes.[off], paletteBytes.[off+1], paletteBytes.[off+2])
-                                                            else (255uy, 255uy, 255uy)
-                                                        pixels.[idx] <- Pixel.pack b g r 255uy
-                                        | None ->
-                                            let channelsPerPixel =
-                                                match imgColorSpace with
-                                                | "DeviceGray" -> 1
-                                                | "DeviceRGB" -> 3
-                                                | "DeviceCMYK" -> 4
-                                                | _ -> 3
-
-                                            for y in 0..imgH - 1 do
-                                                for x in 0..imgW - 1 do
-                                                    let idx = (y * imgW + x) * channelsPerPixel
-                                                    let r, g, b =
-                                                        if idx + channelsPerPixel - 1 < imgData.Length then
-                                                            match imgColorSpace with
-                                                            | "DeviceGray" ->
-                                                                let v = imgData.[idx]
-                                                                (v, v, v)
-                                                            | "DeviceCMYK" ->
-                                                                let c = float imgData.[idx] / 255.0
-                                                                let m = float imgData.[idx + 1] / 255.0
-                                                                let yy = float imgData.[idx + 2] / 255.0
-                                                                let k = float imgData.[idx + 3] / 255.0
-                                                                (byte ((1.0 - c) * (1.0 - k) * 255.0),
-                                                                 byte ((1.0 - m) * (1.0 - k) * 255.0),
-                                                                 byte ((1.0 - yy) * (1.0 - k) * 255.0))
-                                                            | _ ->
-                                                                (imgData.[idx], imgData.[idx + 1], imgData.[idx + 2])
-                                                        else (255uy, 255uy, 255uy)
-                                                    pixels.[y * imgW + x] <- Pixel.pack b g r 255uy
-
-                                        // Apply SMask alpha
-                                        match smaskAlpha with
-                                        | Some smData ->
-                                            for i in 0..imgW * imgH - 1 do
-                                                let px = pixels.[i]
-                                                let a = Pixel.a px
-                                                let sa = smData.[i]
-                                                let newA = byte (int a * int sa / 255)
-                                                // Re-premultiply with new alpha
-                                                let r = byte (int (Pixel.r px) * int sa / 255)
-                                                let g = byte (int (Pixel.g px) * int sa / 255)
-                                                let b = byte (int (Pixel.b px) * int sa / 255)
-                                                pixels.[i] <- Pixel.pack b g r newA
-                                        | None -> ()
-
-                                        // Apply color key mask
-                                        match colorKeyMask with
-                                        | Some ranges ->
-                                            let channelsPerPixel = match imgColorSpace with "DeviceGray" -> 1 | "DeviceCMYK" -> 4 | _ -> 3
-                                            let numRanges = ranges.Length / 2
-                                            if numRanges = channelsPerPixel then
-                                                for i in 0..imgW * imgH - 1 do
-                                                    let srcIdx = i * channelsPerPixel
-                                                    if srcIdx + channelsPerPixel - 1 < imgData.Length then
-                                                        let mutable masked = true
-                                                        for c in 0..channelsPerPixel - 1 do
-                                                            let v = int imgData.[srcIdx + c]
-                                                            if v < ranges.[c * 2] || v > ranges.[c * 2 + 1] then masked <- false
-                                                        if masked then pixels.[i] <- 0u
-                                        | None -> ()
-
-                                        let fb = Framebuffer.ofArray pixels imgW imgH
-                                        let srcR = rect 0.0 0.0 (float imgW) (float imgH)
-                                        let dstR = rect 0.0 0.0 1.0 1.0
-                                        cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
-                                    with _ -> ()
+                                    match PdfImages.decode opts.DecodeJpeg doc currentResources xobj { (fillColor gs) with A = 255uy } 0 with
+                                    | Some (w, h, pixels) ->
+                                        let interpolate = Pdf.dictGet doc "Interpolate" xobj |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                                        addPaint (Group(gs.CTM, gs.FillAlpha, [BitmapPaint.command pixels w h interpolate]))
+                                    | None -> ()
 
                                 | "Form" ->
                                     try
@@ -1076,105 +1014,100 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                                         let formData = Pdf.getStreamData doc xobj
                                         let formTokens = tokenize formData |> Array.ofList
                                         if formTokens.Length > 0 then
-                                            streamStack.Push(tokenArr, i, currentResources)
+                                            let groupStart =
+                                                match Pdf.dictGet doc "Group" xobj with
+                                                | Some group when Pdf.dictGet doc "S" group |> Option.map (Pdf.deref doc) = Some (PdfName "Transparency") ->
+                                                    validateGroupColorSpace doc formResources group
+                                                    let knockout = Pdf.dictGet doc "K" group |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                                                    let isolated = Pdf.dictGet doc "I" group |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                                                    Some (cmds.Count, isolated, knockout)
+                                                | _ -> None
+                                            streamStack.Push(tokenArr, i, currentResources, defaultCTM, groupStart)
                                             stateStack.Add(gs)
                                             clipStack.Add(None)
                                             gs <- { gs with CTM = Matrix3x2.multiply formMatrix gs.CTM }
+                                            if groupStart.IsSome then
+                                                gs <- { gs with FillAlpha = 1.0; StrokeAlpha = 1.0; BlendMode = "Normal"; SoftMask = None }
+                                            defaultCTM <- gs.CTM
+                                            // Form content is always clipped to its BBox,
+                                            // transformed by the form matrix and caller CTM.
+                                            match Pdf.dictGet doc "BBox" xobj |> Option.map (Pdf.deref doc) with
+                                            | Some (PdfArray [a; b; c; d]) ->
+                                                let x0, y0, x1, y1 = fl (Pdf.deref doc a), fl (Pdf.deref doc b), fl (Pdf.deref doc c), fl (Pdf.deref doc d)
+                                                let p x y = Matrix3x2.transformVec2 gs.CTM (vec2 x y)
+                                                let bounds = [ MoveTo(p x0 y0); LineTo(p x1 y0); LineTo(p x1 y1); LineTo(p x0 y1); Close ]
+                                                clipStack.Add(Some (cmds.Count, PathClip(bounds, NonZero)))
+                                            | _ -> ()
                                             currentResources <- formResources
                                             tokenArr <- formTokens
                                             tokenCount <- formTokens.Length
                                             i <- 0
-                                    with _ -> ()
+                                    with _ -> reraise ()
                                 | _ -> ()
                             | None -> ()
                         | None -> ()
 
                     // ── Inline Image (BI/ID/EI) ──
                     | "BI" ->
-                        // Collect dictionary key/value pairs until TInlineImageData
-                        let iiDict = Collections.Generic.Dictionary<string, Token>()
-                        let mutable iiKey = ""
-                        let mutable iiData: byte[] option = None
-                        let mutable iiDone = false
-                        while i < tokenCount && not iiDone do
+                        let mutable header = Map.empty
+                        let mutable rawData = None
+                        let rec readValue () =
+                            if i >= tokenCount then PdfNull else
+                            let token = tokenArr.[i]
+                            i <- i + 1
+                            match token with
+                            | TNumber n -> PdfReal n
+                            | TName n -> PdfName n
+                            | TBool b -> PdfBool b
+                            | TString b | THexString b -> PdfString b
+                            | TArrayStart ->
+                                let values = ResizeArray<PdfObj>()
+                                while i < tokenCount && tokenArr.[i] <> TArrayEnd do
+                                    values.Add(readValue ())
+                                if i < tokenCount then i <- i + 1
+                                PdfArray (values |> Seq.toList)
+                            | TOperator "<<" ->
+                                let mutable entries = Map.empty
+                                while i < tokenCount && tokenArr.[i] <> TOperator ">>" do
+                                    match tokenArr.[i] with
+                                    | TName key ->
+                                        i <- i + 1
+                                        entries <- Map.add key (readValue ()) entries
+                                    | _ -> i <- i + 1
+                                if i < tokenCount then i <- i + 1
+                                PdfDict entries
+                            | _ -> PdfNull
+                        let rec expandColorSpace = function
+                            | PdfName "G" -> PdfName "DeviceGray"
+                            | PdfName "RGB" -> PdfName "DeviceRGB"
+                            | PdfName "CMYK" -> PdfName "DeviceCMYK"
+                            | PdfName "I" -> PdfName "Indexed"
+                            | PdfArray values -> PdfArray (List.map expandColorSpace values)
+                            | value -> value
+                        let mutable doneImage = false
+                        while i < tokenCount && not doneImage do
                             match tokenArr.[i] with
-                            | TInlineImageData d -> iiData <- Some d; i <- i + 1
-                            | TOperator "EI" -> i <- i + 1; iiDone <- true
-                            | TName k -> iiKey <- k; i <- i + 1
-                            | v ->
-                                if iiKey.Length > 0 then iiDict.[iiKey] <- v; iiKey <- ""
+                            | TInlineImageData bytes -> rawData <- Some bytes; i <- i + 1
+                            | TOperator "EI" -> i <- i + 1; doneImage <- true
+                            | TName key ->
                                 i <- i + 1
-                        // Skip EI if not yet consumed
-                        if not iiDone && i < tokenCount then
-                            match tokenArr.[i] with TOperator "EI" -> i <- i + 1 | _ -> ()
-
-                        match iiData with
-                        | Some rawData ->
-                            // Normalize abbreviated keys
-                            let getII (key: string) (abbrev: string) =
-                                match iiDict.TryGetValue(key) with
-                                | true, v -> Some v
-                                | _ -> match iiDict.TryGetValue(abbrev) with true, v -> Some v | _ -> None
-                            let iiW = match getII "Width" "W" with Some (TNumber n) -> int n | _ -> 0
-                            let iiH = match getII "Height" "H" with Some (TNumber n) -> int n | _ -> 0
-                            let iiBpc = match getII "BitsPerComponent" "BPC" with Some (TNumber n) -> int n | _ -> 8
-                            let iiCS =
-                                match getII "ColorSpace" "CS" with
-                                | Some (TName cs) ->
-                                    match cs with
-                                    | "G" -> "DeviceGray" | "RGB" -> "DeviceRGB" | "CMYK" -> "DeviceCMYK"
-                                    | _ -> resolveColorSpace cs
-                                | _ -> "DeviceRGB"
-                            let iiFilter =
-                                match getII "Filter" "F" with
-                                | Some (TName f) ->
-                                    match f with
-                                    | "Fl" | "FlateDecode" -> "FlateDecode"
-                                    | "DCT" | "DCTDecode" -> "DCTDecode"
-                                    | "AHx" | "ASCIIHexDecode" -> "ASCIIHexDecode"
-                                    | "A85" | "ASCII85Decode" -> "ASCII85Decode"
-                                    | _ -> f
-                                | _ -> ""
-
-                            if iiW > 0 && iiH > 0 then
-                                try
-                                    if iiFilter = "DCTDecode" then
-                                        match opts.DecodeJpeg rawData with
-                                        | Some (dw, dh, dpixels) ->
-                                            let fb = Framebuffer.ofArray dpixels dw dh
-                                            let srcR = rect 0.0 0.0 (float dw) (float dh)
-                                            let dstR = rect 0.0 0.0 1.0 1.0
-                                            cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
-                                        | None -> ()
-                                    else
-                                        let imgData =
-                                            if iiFilter.Length > 0 && iiFilter <> "DCTDecode" then
-                                                try Rbt.Pdf.Streams.decompress iiFilter rawData with _ -> rawData
-                                            else rawData
-
-                                        let pixels = Array.create (iiW * iiH) 0u
-                                        let channelsPerPixel = match iiCS with "DeviceGray" -> 1 | "DeviceCMYK" -> 4 | _ -> 3
-                                        for y in 0..iiH - 1 do
-                                            for x in 0..iiW - 1 do
-                                                let idx = (y * iiW + x) * channelsPerPixel
-                                                let r, g, b =
-                                                    if idx + channelsPerPixel - 1 < imgData.Length then
-                                                        match iiCS with
-                                                        | "DeviceGray" -> let v = imgData.[idx] in (v, v, v)
-                                                        | "DeviceCMYK" ->
-                                                            let c = float imgData.[idx] / 255.0
-                                                            let m = float imgData.[idx+1] / 255.0
-                                                            let yy = float imgData.[idx+2] / 255.0
-                                                            let k = float imgData.[idx+3] / 255.0
-                                                            (byte ((1.0-c)*(1.0-k)*255.0), byte ((1.0-m)*(1.0-k)*255.0), byte ((1.0-yy)*(1.0-k)*255.0))
-                                                        | _ -> (imgData.[idx], imgData.[idx+1], imgData.[idx+2])
-                                                    else (255uy, 255uy, 255uy)
-                                                pixels.[y * iiW + x] <- Pixel.pack b g r 255uy
-                                        let fb = Framebuffer.ofArray pixels iiW iiH
-                                        let srcR = rect 0.0 0.0 (float iiW) (float iiH)
-                                        let dstR = rect 0.0 0.0 1.0 1.0
-                                        cmds.Add(Group(gs.CTM, 1.0, [DrawImage(fb, srcR, dstR, true)]))
-                                with _ -> ()
+                                let key =
+                                    match key with
+                                    | "W" -> "Width" | "H" -> "Height" | "BPC" -> "BitsPerComponent"
+                                    | "CS" -> "ColorSpace" | "F" -> "Filter" | "D" -> "Decode"
+                                    | "DP" -> "DecodeParms" | "IM" -> "ImageMask" | "I" -> "Interpolate"
+                                    | _ -> key
+                                let value = readValue ()
+                                header <- Map.add key (if key = "ColorSpace" then expandColorSpace value else value) header
+                            | _ -> i <- i + 1
+                        match rawData with
+                        | Some bytes ->
+                            let image = PdfStream(header, bytes)
+                            match PdfImages.decode opts.DecodeJpeg doc currentResources image { (fillColor gs) with A = 255uy } 0 with
+                            | Some (w, h, pixels) ->
+                                let interpolate = Pdf.dictGet doc "Interpolate" image |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                                addPaint (Group(gs.CTM, gs.FillAlpha, [BitmapPaint.command pixels w h interpolate]))
+                            | None -> ()
                         | None -> ()
 
                     | _ ->
@@ -1183,32 +1116,50 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
             // Close remaining clip scopes
             while clipStack.Count > 0 do
                 match clipStack.[clipStack.Count - 1] with
-                | Some (startIdx, segs, rule) ->
+                | Some (startIdx, kind) ->
                     let clippedCmds = cmds |> Seq.skip startIdx |> Seq.toList
                     cmds.RemoveRange(startIdx, cmds.Count - startIdx)
-                    cmds.Add(Clip(segs, rule, clippedCmds))
+                    cmds.Add(wrapClip kind clippedCmds)
                 | None -> ()
                 clipStack.RemoveAt(clipStack.Count - 1)
 
-            let pathCmdList = cmds |> Seq.toList
-            let textCmdList = textCmds |> Seq.toList
+            cmds |> Seq.toList, charBoxes.ToArray()
 
-            let flipMatrix = { M11 = 1.0; M12 = 0.0; M21 = 0.0; M22 = -1.0; DX = 0.0; DY = rawPageH }
-            let scaledCmds =
-                if scale <> 1.0 then
-                    let scaleMatrix = Matrix3x2.scale scale scale
-                    let flipScaled = Matrix3x2.multiply flipMatrix scaleMatrix
-                    let flippedPaths = [Group(flipScaled, 1.0, pathCmdList)]
-                    let scaledText = [Group(scaleMatrix, 1.0, textCmdList)]
-                    flippedPaths @ scaledText
-                else
-                    [Group(flipMatrix, 1.0, pathCmdList)] @ textCmdList
-
-            // Scale charboxes (text coords are already in screen space, just need scaling)
-            let scaledCharBoxes =
-                charBoxes.ToArray()
-                |> Array.map (fun cb ->
-                    { cb with X = cb.X * scale; Y = cb.Y * scale
-                              W = cb.W * scale; H = cb.H * scale })
-
-            Some (scaledCmds, pageW, pageH, scaledCharBoxes)
+let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * float * float * CharBox[]) option =
+    match Pdf.getPage doc pageNum with
+    | None -> None
+    | Some pageRef ->
+        let pageObj = Pdf.deref doc pageRef
+        match PageGeometry.tryGet doc pageObj with
+        | None -> None
+        | Some viewport ->
+            let pageW = viewport.Width * scale
+            let pageH = viewport.Height * scale
+            let pageTransform = Matrix3x2.multiply viewport.Transform (Matrix3x2.scale scale scale)
+            let resources = Pdf.getPageInheritable doc pageObj "Resources" |> Option.defaultValue (PdfDict Map.empty)
+            let contentData = PageOps.getPageContents doc pageObj
+            if contentData.Length = 0 then Some ([], pageW, pageH, [||])
+            else
+                let pageCommands, charBoxes = renderContent opts doc resources contentData defaultState viewport scale 0
+                let x0, y0, x1, y1 = viewport.Bounds
+                let pageClip =
+                    [ MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0)
+                      LineTo(vec2 x1 y1); LineTo(vec2 x0 y1); Close ]
+                let pageKnockout =
+                    match Pdf.dictGet doc "Group" pageObj with
+                    | Some group when Pdf.dictGet doc "S" group |> Option.map (Pdf.deref doc) = Some (PdfName "Transparency") ->
+                        Pdf.dictGet doc "K" group |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                    | _ -> false
+                // A PDF page blends against its own initially transparent backdrop,
+                // not the caller's canvas/background (ISO 32000 page group).
+                // Preserve the existing RGB page output path. A declared page ICC
+                // profile is not yet a profile-space compositing implementation.
+                let pageGroup = TransparencyGroup(true, pageKnockout, 1.0, Normal, None, pageCommands)
+                let scaledCmds = [Group(pageTransform, 1.0, [Clip(pageClip, NonZero, [pageGroup])])]
+                let scaledCharBoxes =
+                    charBoxes |> Array.map (fun cb ->
+                        let p0 = Matrix3x2.transformVec2 pageTransform (vec2 cb.X cb.Y)
+                        let p1 = Matrix3x2.transformVec2 pageTransform (vec2 (cb.X + cb.W) (cb.Y + cb.H))
+                        { cb with X = float (min p0.X p1.X); Y = float (min p0.Y p1.Y)
+                                  W = float (abs (p1.X - p0.X)); H = float (abs (p1.Y - p0.Y)) })
+                Some (scaledCmds, pageW, pageH, scaledCharBoxes)

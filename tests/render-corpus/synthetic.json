@@ -1,0 +1,460 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    {
+      "id": "synth-paths-basic",
+      "path": "generated/synth-paths-basic.pdf",
+      "sha256": "9cfcaf5c9cb011355b72f1fe5d775e71417d006cbc5e72b3bc7a489d953eb986",
+      "bytes": 691,
+      "tags": [
+        "paths",
+        "fill",
+        "stroke"
+      ],
+      "description": "Basic filled and stroked path primitives.",
+      "expected": "A red rectangle, a blue triangle, and a thick green cubic curve on white."
+    },
+    {
+      "id": "synth-path-ctm",
+      "path": "generated/synth-path-ctm.pdf",
+      "sha256": "ff1492dda52ec90328c4221f118ad9af39fe7987feb487e07a80ea89d4c54053",
+      "bytes": 630,
+      "tags": [
+        "paths",
+        "ctm"
+      ],
+      "description": "A translated path with the CTM set before path construction.",
+      "expected": "A red trapezoid has bottom vertices (30,50), (110,50) and top vertices (210,180), (30,180); the translation applies to the entire path."
+    },
+    {
+      "id": "synth-clip-restore",
+      "path": "generated/synth-clip-restore.pdf",
+      "sha256": "40f8e42fd407eb23aa0bc957a99bede3757214743236376bc72f6f9e18d05063",
+      "bytes": 670,
+      "tags": [
+        "clip",
+        "graphics-state"
+      ],
+      "description": "Clipping set inside q/Q and restored afterward.",
+      "expected": "A red diamond on the left and a separate blue rectangle to its right; the blue rectangle remains entirely visible after Q."
+    },
+    {
+      "id": "synth-clip-nested-evenodd",
+      "path": "generated/synth-clip-nested-evenodd.pdf",
+      "sha256": "3d2b65150653467ba59d51c57cbd04fe63d9bfab60617040b19e37695701a3c2",
+      "bytes": 689,
+      "tags": [
+        "clip",
+        "evenodd",
+        "graphics-state"
+      ],
+      "description": "Nested clips with an even-odd hole and restoration of the inner clip.",
+      "expected": "A red left half of a rectangular ring and a blue right half; the center hole and everything outside the outer rectangle remain white."
+    },
+    {
+      "id": "synth-closepath-v",
+      "path": "generated/synth-closepath-v.pdf",
+      "sha256": "9c92dd719fd5d0835c6e361a3cf60dbd60ba6f0e7bab26ecdd5d80e94779b441",
+      "bytes": 621,
+      "tags": [
+        "paths",
+        "bezier",
+        "closepath"
+      ],
+      "description": "The v cubic shorthand immediately follows closepath.",
+      "expected": "A dark triangular outline with a curved lobe rising from its starting point; the curve begins at the point restored by h."
+    },
+    {
+      "id": "synth-text-paint-order",
+      "path": "generated/synth-text-paint-order.pdf",
+      "sha256": "6fb5647e1cdf98b41a99bde0294bfb49004766c4f0efe968545f4b6e2fc71d6d",
+      "bytes": 778,
+      "tags": [
+        "text",
+        "paint-order",
+        "clip"
+      ],
+      "description": "Text alternates with opaque painting, including path clipping.",
+      "expected": "The red bar hides the middle of the large black BACK text; blue FRONT text is drawn above it. Green CLIPPED text is visible only inside the narrow rectangular clip."
+    },
+    {
+      "id": "synth-media-offset",
+      "path": "generated/synth-media-offset.pdf",
+      "sha256": "bb95fd26d79a2de4eb65017f030a21eca9827e22896b167bdbe76ffce32fc4e6",
+      "bytes": 626,
+      "tags": [
+        "page-box",
+        "mediabox"
+      ],
+      "description": "A page whose MediaBox has a nonzero lower-left corner.",
+      "expected": "A 240 by 160 page with a red rectangle inset 20 points from its lower-left corner and a blue rectangle inset 20 points from its upper-right corner."
+    },
+    {
+      "id": "synth-crop-offset",
+      "path": "generated/synth-crop-offset.pdf",
+      "sha256": "0372de6d869d40e13fa1a671a5992fe8146dc192deebd1d381e02475233a1cd5",
+      "bytes": 638,
+      "tags": [
+        "page-box",
+        "cropbox"
+      ],
+      "description": "CropBox selects an offset subrectangle of a larger MediaBox.",
+      "expected": "The visible page is 200 by 140 points: a green rectangle sits inside it, while a red rectangle outside the CropBox is not visible."
+    },
+    {
+      "id": "synth-rotate-inherited",
+      "path": "generated/synth-rotate-inherited.pdf",
+      "sha256": "5423b713c758d6c922a2c18d72e2163918656bc647c907e9a38ca63da053e40e",
+      "bytes": 678,
+      "tags": [
+        "page-box",
+        "rotate",
+        "inheritance"
+      ],
+      "description": "Page rotation inherited from its Pages parent.",
+      "expected": "A landscape page is displayed as portrait, rotated clockwise 90 degrees; the red lower-left and blue upper-right markers move with the page."
+    },
+    {
+      "id": "synth-text-transform",
+      "path": "generated/synth-text-transform.pdf",
+      "sha256": "181c1a55fd81d00edcb922f1fedd74d1f978e856de4264b2e39a74c0bef1deb8",
+      "bytes": 749,
+      "tags": [
+        "text",
+        "matrix",
+        "rise",
+        "scaling",
+        "spacing"
+      ],
+      "description": "Text matrix rotation, text rise, horizontal scaling and character/word spacing.",
+      "expected": "A diagonal ROTATED label, a BASE label with a raised UP, and a wide-spaced, horizontally compressed A B C line."
+    },
+    {
+      "id": "synth-text-render-modes",
+      "path": "generated/synth-text-render-modes.pdf",
+      "sha256": "87d4ea7159d0d352960fd8f1f8cd3282af6fdc9f14c84791691436860cd67a7d",
+      "bytes": 828,
+      "tags": [
+        "text",
+        "render-mode",
+        "clip"
+      ],
+      "description": "Fill, stroke, fill-and-stroke, invisible, and text-as-clip rendering modes.",
+      "expected": "Top row shows black filled FILL, outlined STROKE and red-filled blue-outlined BOTH. INVISIBLE is absent; the bottom shows a green rectangle only inside large CLIP glyphs."
+    },
+    {
+      "id": "synth-form-matrix-bbox",
+      "path": "generated/synth-form-matrix-bbox.pdf",
+      "sha256": "da52d6e714d45547f2d62293d2ac7c03e85712992c0dc664ef6cc7f788a8e985",
+      "bytes": 913,
+      "tags": [
+        "form",
+        "xobject",
+        "matrix",
+        "clip"
+      ],
+      "description": "A Form XObject with its own shear matrix and bounding-box clip, drawn twice.",
+      "expected": "Two sheared blue frames enclosing white and red rectangles; the oversized blue form content is clipped to each form's transformed bounding box."
+    },
+    {
+      "id": "synth-images-packed",
+      "path": "generated/synth-images-packed.pdf",
+      "sha256": "aac48b930f4f097ddf83e96187683ffcfede59c3a1bde6176d2f004c658b9680",
+      "bytes": 1451,
+      "tags": [
+        "image",
+        "packed",
+        "decode"
+      ],
+      "description": "One-, two-, and four-bit grayscale images with padded rows and Decode arrays.",
+      "expected": "Three enlarged two-row, five-column grayscale grids. The 1-bit grid alternates black and white; the 2-bit grid has four levels; the 4-bit grid has five levels reversed by Decode."
+    },
+    {
+      "id": "synth-image-stencil",
+      "path": "generated/synth-image-stencil.pdf",
+      "sha256": "02be85792ba994125e271939048866c86d6bc6d68f1bc3213ed77536b63865f0",
+      "bytes": 837,
+      "tags": [
+        "image",
+        "stencil",
+        "mask"
+      ],
+      "description": "A one-bit image mask painted with the current fill color.",
+      "expected": "A large red pixelated square-ring pattern over a pale blue background, with the background visible through unpainted mask pixels."
+    },
+    {
+      "id": "synth-image-soft-mask",
+      "path": "generated/synth-image-soft-mask.pdf",
+      "sha256": "af4c420cb1fe41627c4d774fff570599de45c377bf272e31a581f2b183f9b564",
+      "bytes": 1053,
+      "tags": [
+        "image",
+        "soft-mask",
+        "transparency"
+      ],
+      "description": "An RGB image with a grayscale soft mask of four alpha levels.",
+      "expected": "Four red image columns over a blue rectangle transition from fully transparent blue through two blended purples to opaque red."
+    },
+    {
+      "id": "synth-alpha-overlap",
+      "path": "generated/synth-alpha-overlap.pdf",
+      "sha256": "770c3372b6d2f709d1a1ed4d2b6ca84af7ff8be484291ce7ba08f8f74a8420c8",
+      "bytes": 723,
+      "tags": [
+        "transparency",
+        "graphics-state"
+      ],
+      "description": "Nonstroking alpha applied to overlapping opaque-colored rectangles.",
+      "expected": "A half-transparent red rectangle and a half-transparent blue rectangle overlap on white; their overlap is darker and purple, with blue composited on top."
+    },
+    {
+      "id": "synth-axial-gradient",
+      "path": "generated/synth-axial-gradient.pdf",
+      "sha256": "63407b1a98a072c96fc2b2598b31907a5496b84a0e88d3ebcd05e633dff762bb",
+      "bytes": 874,
+      "tags": [
+        "shading",
+        "gradient"
+      ],
+      "description": "An axial shading with a type 2 interpolation function.",
+      "expected": "A broad horizontal gradient inside a rectangle changes smoothly from red on the left to blue on the right, with white outside."
+    },
+    {
+      "id": "synth-images-fax",
+      "path": "generated/synth-images-fax.pdf",
+      "sha256": "48f1ec260e3f97c9146834731ec737c5cfb80f0a207b04acd2419a7a686c2f7c",
+      "bytes": 1282,
+      "tags": [
+        "image",
+        "ccitt",
+        "group3",
+        "group4"
+      ],
+      "description": "CCITT one-dimensional Group 3 and two-dimensional Group 4 image streams.",
+      "expected": "Two bordered panels have black top halves and white bottom halves, labelled G3 and G4."
+    },
+    {
+      "id": "synth-blend-modes",
+      "path": "generated/synth-blend-modes.pdf",
+      "sha256": "38bc1e332ff2eaeda0946238677ed78cd286b6a25abcc7492f2cb19a5a6f9b49",
+      "bytes": 3911,
+      "tags": [
+        "transparency",
+        "blend-mode",
+        "graphics-state"
+      ],
+      "description": "All sixteen PDF blend modes with partial source alpha.",
+      "expected": "A labelled 4x4 grid blends orange over cyan using each named mode; the overlap differs by mode and q/Q prevents state leaking into the next panel."
+    },
+    {
+      "id": "synth-transparency-groups",
+      "path": "generated/synth-transparency-groups.pdf",
+      "sha256": "0c528f49070ff14a0055bba6bc274a03431c698c2d1b7bc0a79c0333bd6ff0b2",
+      "bytes": 2413,
+      "tags": [
+        "transparency",
+        "group",
+        "isolation",
+        "knockout"
+      ],
+      "description": "Isolated/non-isolated groups with and without knockout over an opaque blue backdrop.",
+      "expected": "Four labelled panels apply group opacity once. Isolated groups retain red/green; non-isolated Multiply uses the blue backdrop. Knockout removes the first member under the second member's shape."
+    },
+    {
+      "id": "synth-graphics-soft-masks",
+      "path": "generated/synth-graphics-soft-masks.pdf",
+      "sha256": "1b46f93902817d81bfa5d878d8ca2fc58b2d969ac27fba1f7ac8ea40de1ce546",
+      "bytes": 1353,
+      "tags": [
+        "transparency",
+        "soft-mask",
+        "luminosity",
+        "graphics-state"
+      ],
+      "description": "ExtGState alpha and luminosity masks from the same colored transparent form.",
+      "expected": "The Alpha panel has uniform half-opacity orange over blue. Luminosity is weaker on the red-mask left half than on the white-mask right half. Blue outside each masked rectangle remains unchanged."
+    },
+    {
+      "id": "synth-vertical-cid",
+      "path": "generated/synth-vertical-cid.pdf",
+      "sha256": "73876997b52fcefbb3256bb26b5d675b2b8d0788ecadc2b462c509c93ff84c8b",
+      "bytes": 1707,
+      "tags": [
+        "text",
+        "cid",
+        "vertical",
+        "cmap"
+      ],
+      "description": "Inherited mixed-width CMap with explicit W2 and DW2 metrics.",
+      "expected": "A, B, C and D descend vertically, with unequal advances and horizontal offsets from W2; the child CMap overrides its parent CID mapping."
+    },
+    {
+      "id": "synth-vertical-cid-default",
+      "path": "generated/synth-vertical-cid-default.pdf",
+      "sha256": "c758def9d4e45eac8f7f7dfe41afc5c394d646b0abca4c8384f284e1dadbc1f1",
+      "bytes": 1691,
+      "tags": [
+        "text",
+        "cid",
+        "vertical",
+        "cmap"
+      ],
+      "description": "Vertical CID text with implicit DW2 metrics for the final glyph.",
+      "expected": "The first three glyphs match vertical-cid; D uses the default vertical origin and 1000-unit downward advance."
+    },
+    {
+      "id": "synth-icc-gray-linear",
+      "path": "generated/synth-icc-gray-linear.pdf",
+      "sha256": "4cfdd9c93dfc3369139e1bb64934bb9b3710594b8363b1107a71ce0476ca640a",
+      "bytes": 1573,
+      "tags": [
+        "icc",
+        "image",
+        "shading",
+        "color"
+      ],
+      "description": "Linear Gray ICC conversion shared by image, fill, stroke and shading.",
+      "expected": "The three top paints are the same light gray (near RGB 188), not device gray 128; the lower gradient has a light, not dark, midpoint."
+    },
+    {
+      "id": "synth-icc-rgb-swapped",
+      "path": "generated/synth-icc-rgb-swapped.pdf",
+      "sha256": "6aceca0e493d57470ac9722a871d62869bafcb1cec9865b018030caad7aff22c",
+      "bytes": 1709,
+      "tags": [
+        "icc",
+        "image",
+        "shading",
+        "color"
+      ],
+      "description": "RGB ICC matrix/TRC profile with red and green primaries exchanged.",
+      "expected": "All three top paints are green despite red source samples; the gradient runs green to red."
+    },
+    {
+      "id": "synth-icc-cmyk-mft1",
+      "path": "generated/synth-icc-cmyk-mft1.pdf",
+      "sha256": "0fc9f83b81ac4c60d084c2dc9b615cc4f68f2a84bf4fa79b2e7cd581263cfcd9",
+      "bytes": 3475,
+      "tags": [
+        "icc",
+        "image",
+        "shading",
+        "lut"
+      ],
+      "description": "CMYK ICC lut8 profile mapping increasing K from Lab black to white.",
+      "expected": "The three top paints are mid-gray near RGB 119; the gradient runs black to white, opposite naive CMYK K."
+    },
+    {
+      "id": "synth-icc-cmyk-mft2",
+      "path": "generated/synth-icc-cmyk-mft2.pdf",
+      "sha256": "21149b4acd8841be132a17a3539ecbfb7cc09d3b1cbe2be3564f6121aa364235",
+      "bytes": 1762,
+      "tags": [
+        "icc",
+        "image",
+        "shading",
+        "lut"
+      ],
+      "description": "CMYK ICC legacy lut16 Lab encoding with slightly tinted neutral components.",
+      "expected": "The top paints agree near mid-gray with a small warm tint; the gradient runs black to near-white using legacy 0xff00 L encoding."
+    },
+    {
+      "id": "synth-icc-range-decode",
+      "path": "generated/synth-icc-range-decode.pdf",
+      "sha256": "22397e553bff18d6c31731203f4c323200d3a1b04d2fd1a6f20ef3e81fb59bd2",
+      "bytes": 1491,
+      "tags": [
+        "icc",
+        "image",
+        "decode",
+        "range"
+      ],
+      "description": "ICCBased Range bounds values without renormalizing them; explicit Decode reverses image samples.",
+      "expected": "The default image and 0.2 vector paint use the lower valid component; reversed Decode and the 0.8 vector paint match lighter gray. Poppler may ignore Range for default image Decode; the PDF default is the declared Range."
+    },
+    {
+      "id": "synth-function-sampled-2d",
+      "path": "generated/synth-function-sampled-2d.pdf",
+      "sha256": "b8ab7358cccaaf38c3c83bccdd48a0ce746399478184695a8697be5ea9179bac",
+      "bytes": 920,
+      "tags": [
+        "shading",
+        "function",
+        "sampled",
+        "multidimensional"
+      ],
+      "description": "Type 1 shading driven by a two-input sampled RGB function.",
+      "expected": "An 80 by 80 square inset 10 points transitions from black at lower-left to red at lower-right, green at upper-left and yellow at upper-right; the surrounding border is white."
+    },
+    {
+      "id": "synth-function-calculator-2d",
+      "path": "generated/synth-function-calculator-2d.pdf",
+      "sha256": "585946ef7531355a24bca772687fb1b3637544879999082543f508462d2cfae5",
+      "bytes": 883,
+      "tags": [
+        "shading",
+        "function",
+        "calculator",
+        "matrix"
+      ],
+      "description": "The same two-dimensional shading evaluated by a calculator function returning x, y and zero.",
+      "expected": "The square and white border match function-sampled-2d, including all interior colors."
+    },
+    {
+      "id": "synth-function-calculator-branches",
+      "path": "generated/synth-function-calculator-branches.pdf",
+      "sha256": "c781fed79c8b80c9abfa22e53dab9a1b6172c12b30f1d9c045827c3c52cf69fb",
+      "bytes": 943,
+      "tags": [
+        "shading",
+        "function",
+        "calculator",
+        "conditional"
+      ],
+      "description": "A calculator axial gradient chooses different RGB output expressions on either side of its midpoint.",
+      "expected": "Inside the clipped panel the left half runs black to red; the right half starts cyan and runs to blue, with a sharp red-to-cyan boundary at x=160. Outside the panel is white."
+    },
+    {
+      "id": "synth-many-pages",
+      "path": "generated/synth-many-pages.pdf",
+      "sha256": "588bf01c3af7bdbf144b535f7391ac62b74dfc6125a50c098b6a19f5e4349f05",
+      "bytes": 161143,
+      "tags": [
+        "multipage",
+        "performance",
+        "text",
+        "worker"
+      ],
+      "description": "Five hundred individually numbered pages for scrolling, zoom and worker lifecycle checks.",
+      "expected": "Each 320 by 240 page has its own Page NNNN label and a large blue rectangle on odd pages or red rectangle on even pages. Page 0500 is red; navigating back to Page 0001 restores blue."
+    },
+    {
+      "id": "synth-page-blend-backdrop",
+      "path": "generated/synth-page-blend-backdrop.pdf",
+      "sha256": "f5109fba67536f9a499678577bed5a89a157f307b7e9351266e84077da953a92",
+      "bytes": 911,
+      "tags": [
+        "transparency",
+        "page-group",
+        "blend-mode",
+        "form"
+      ],
+      "description": "Direct painting above and a nested non-isolated Form below use Difference over painted and initially transparent parts of an isolated page.",
+      "expected": "The entire left half is magenta (blue Difference red); the entire right half is blue, not yellow from the external white background. The direct upper half and nested Form lower half must match."
+    },
+    {
+      "id": "synth-thin-strokes",
+      "path": "generated/synth-thin-strokes.pdf",
+      "sha256": "f1cde7d4e5edf9f69f553220900bd757a2ed3d42b5389bbb12e469f2dfa34cb1",
+      "bytes": 1917,
+      "tags": [
+        "stroke",
+        "ctm",
+        "hairline",
+        "subpixel"
+      ],
+      "description": "Positive 0.3-unit strokes and zero-width hairlines under a 0.35 scale transform.",
+      "expected": "Two labelled panels of horizontal black lines. Subpixel lines on the left have much less coverage than the one-device-pixel hairlines on the right; positive widths must not be promoted to hairlines."
+    }
+  ]
+}

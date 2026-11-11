@@ -2,13 +2,140 @@
 
 Date: 2026-09-11. Ground truth: `pdftoppm -r 96`. Ours: headless Chromium screenshots + canvas pixel reads.
 
-## Closed (not bugs)
+Current reproducible corpus: [tests/render-corpus/README.md](tests/render-corpus/README.md).
+It contains 31 pinned upstream fixtures plus 34 generated feature cases, fetch
+and generation scripts, and a native-versus-Poppler rendering driver. Its initial
+verification section records visual mismatches and a Poppler JPX crash; successful
+process exits must not be treated as visual passes.
+
+## Resolved comparisons
 
 ### wiki "gray bars" — NOT A BUG
 What looked like thick gray bars in screenshots are 1px-tall table rules/underlines
 rendered correctly. Verified by reading live canvas pixels (bars are h:1) and by
 dumping the Cmd list (GRAY FillPaths with h=1.0 at correct positions). The
 screenshot downscale made them look thick. No action.
+
+### PDF 2.0 "Hello World" spacing — fixed
+The PDF Association's original sample has an explicit width array starting at
+character 33. Space (32) uses its FontDescriptor's `/MissingWidth 0`, not a
+600-unit fallback. Native regressions cover inline and indirect width/descriptor
+objects; the actual packaged Chromium worker places `World` at **154.672 pt**,
+matching the document widths. The original is now pinned in the corpus.
+
+## Renderer fixes (2026-11-11)
+
+- Path coordinates now capture the CTM when each segment is constructed,
+  including rectangles, curves and clipping paths. Stroke pen/dash metrics
+  still use the CTM at paint time.
+- `h` restores the current point to the subpath start, including for a following
+  `v` curve.
+- Text is emitted in content-stream order and participates in path clipping;
+  later opaque graphics can cover earlier text.
+- Verification: `dotnet run --project tests/Rbt.Pdf.Tests` passes synthetic-PDF
+  geometry/order regressions and native raster pixel checks for transformed
+  fills/clips, `Q` restoration, text overpainting and text clipping. Browser
+  screenshots were not checked in this pass.
+
+## Corpus-driven fixes (2026-11-11)
+
+- Shared page geometry now applies inherited CropBox and Rotate, intersects crop
+  with MediaBox, and translates nonzero page origins. Browser placeholders,
+  rendered commands and selection bounds use the same viewport.
+- Text uses the full text matrix and CTM, including rise, horizontal scaling,
+  reflection and spacing. Glyph positions and subsequent `Tj`/`TJ` advances use
+  the PDF widths rather than mixing them with substitute-font advances.
+- Form XObjects clip their content to their transformed BBox.
+- `sh` supports axial DeviceGray/RGB/CMYK gradients with type 2/type 3 functions,
+  component-function arrays, Domain, Extend and BBox. Nonlinear functions use
+  sampled gradient stops. Canvas now paints the emitted linear gradients.
+- Fable restores use the dependency packages' FSharp.Core minimum version.
+- The original `synth-path-ctm` fixture placed `cm` inside path construction.
+  That is invalid PDF syntax, not a reliable visual oracle; the fixture and
+  regression now set the CTM before constructing the path. See the
+  [PDF Association ruling](https://github.com/pdf-association/pdf-issues/issues/563).
+- Verification: regression executable passed; 12 affected corpus PDFs / 16
+  sampled pages completed in native and Poppler renderers. Paired images confirm
+  the corrected path fixture, page origin, text transforms and axial gradient.
+  Chromium screenshots/pixels verified gradient clipping, transformed text and
+  rotated pages; crop/origin/rotation canvas sizes match browser layout.
+- Radial/mesh shading, patterns, text rendering modes and image/font gaps were
+  addressed in the subsequent pass below. Substitute glyph outlines can still
+  differ from the document font.
+
+## Codec, font and paint coverage
+
+- Added radial and mesh shadings (types 3–7), colored/uncolored tiling patterns,
+  shading patterns, and patterned strokes. Tiling cells are rasterized once per
+  paint and repeated as a surface, avoiding fractional-zoom cell-edge seams.
+- Text rendering modes now stroke outlines and accumulate the union of text
+  clipping glyphs until `ET`. Ordinary solid fill text retains glyph batching.
+  Type 3 charprocs use their FontMatrix, and font resolution no longer aliases
+  different font objects/documents with the same BaseFont name.
+- Image decoding covers packed and 16-bit samples, Decode arrays, Indexed and
+  CMYK samples, explicit JPEG ColorTransform, stencils, color-key/soft masks and
+  Matte unblending. Native image placement preserves arbitrary affine transforms
+  and `/Interpolate false`; alpha is not premultiplied twice.
+- CCITT Group 3/4, JBIG2 and JPX filters have managed F# implementations usable
+  natively and through Fable. Existing JPEG and bit-reader primitives come from
+  Rbt.Image; the reusable MQ arithmetic decoder was added there. PDF filter
+  parameters, codec integration and image semantics remain in rbt-pdf. No
+  Render.NET or pdf.js runtime dependency was added.
+- Mixed-length CID CMaps, Differences names and bundled Japanese/Chinese maps
+  resolve text; Noto Sans CJK supplies missing Unicode glyphs.
+- Verification: 23 affected documents / 25 sampled pages completed in native and
+  Poppler; six image cases were rerendered after CMYK/alpha/sampling corrections.
+  Native-only `bug_jpx.pdf` also renders; its known Poppler crash was not rerun.
+  Native/Poppler contact sheets were visually inspected. Chromium checks covered
+  text modes, radial/mesh shading, tiling patterns, CMYK JPEG, JPX alpha, JBIG2,
+  CCITT and Japanese text. Browser canvas captures must be composited over the
+  viewer's white page background, not interpreted as opaque raw RGB.
+- `jpx-smaskindata.pdf` is not a reliable Poppler alpha oracle: extracted JPX
+  samples match FFmpeg exactly, but Poppler displays incorrect embedded-alpha
+  colors. With associated alpha and Matte, use `(C' - (1-a)M) / a` before color
+  conversion and final premultiplication (PDF 32000-1 §11.6.5.3). The first
+  half-transparent white sample over gray is RGB 191,191,191, not green.
+
+### Assets, packaging and remaining limits
+
+- Rbt.Image **0.1.1**, Rbt.Text **0.1.7**, and
+  Rbt.Renderer/Core/Canvas **0.1.6** are published. Fresh-cache registry-only
+  native regressions and the Fable package build pass. The earlier 0.1.5
+  missing-native-package incident was fixed in Forge; 0.1.6 published through
+  the normal protected tag actions.
+- Codec ports retain Apache-2.0 attribution and the bundled PDF.js license.
+  Adobe CMaps retain their upstream redistribution notices.
+- [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk/blob/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf)
+  is bundled with its OFL license; SHA-256:
+  `2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b`.
+  Workers fetch and parse this font only after encountering a missing CJK glyph;
+  Latin-only documents do not download it, and zooming reuses it.
+- Custom RenderOptions now supply a `Rasterize` callback for transparent pattern
+  cells; native options and the browser app provide their respective backends.
+- Shading functions support types 0/2/3/4, including two-input function-based
+  shading type 1 with Domain, Matrix and BBox. Sampled functions support all legal
+  sample bit depths, linear interpolation, Encode/Decode and range clipping;
+  cubic `/Order 3` remains unsupported. Calculator functions use bounded parsing,
+  typed operands and reusable execution storage. Limits include eight sampled
+  dimensions, one million grid points, 64 outputs, and a 1,024-entry calculator
+  stack with 100,000 execution steps. Patch meshes still use fixed 16×16
+  tessellation; shading/pattern surfaces are capped at four million pixels.
+- ICC support covers Gray/RGB matrix/TRC and RGB/CMYK `mft1`/`mft2` A2B0 profiles,
+  plus calibrated Gray/RGB/Lab spaces. Unsupported profiles use the PDF Alternate;
+  this is not a complete ICC implementation.
+- JPX does not support every profile: COC, ROI, progression changes, packed
+  headers, palettes/component mappings and some codeblock styles are rejected.
+- The 36 bundled CMaps remain a selected subset. Vertical CID `W2`/`DW2`,
+  inherited CMaps and mixed-width codes now have focused regressions.
+- Transparency supports the standard blend modes, isolated/non-isolated and
+  knockout groups, and alpha/luminosity soft masks. Form-group blending requires
+  DeviceRGB; other declared group color spaces and `AIS true` are rejected.
+  Page groups retain the existing RGB compositing path: an ICC page profile does
+  not select a profile-space compositor. Full ICC-space blending remains a gap.
+  Knockout shape extraction remains approximate for geometry-expanding filters,
+  text masks and intrinsic image alpha. GL rejects custom pixel filters; raster
+  and Canvas handle PDF soft masks. These checks are regression evidence, not
+  PDF conformance certification.
 
 ## Open gaps (cause not positively identified — do not fix blind)
 
@@ -25,22 +152,72 @@ Suspects (unconfirmed): pattern fills via `/Pattern` colorspace resolving to wro
 color; low-alpha fills via `gs` that CanvasBackend ignores; Type3 glyphs.
 Next step: dump `cs`/`sc` operands + `gs` dicts in the header region of the content
 stream and see what colorspace the icon paths use.
+The original document's URL/hash/local copy could not be recovered in the current
+checkout, local files or available history. Public lookalikes do not establish
+the cause. Recover the original PDF before choosing a reduced regression.
 
-### 2. pdf20-simple "Hello World" vs "HelloWorld" spacing
-Ours inserts a visible gap between "Hello" and "World"; poppler renders them
-adjacent. Both come from the same content stream, so this is a glyph-advance or
-text-positioning difference (our advances slightly wider, or Tc/Tw handling).
-Could also be font-metrics (our embedded-font widths vs poppler's). Needs a
-glyph-by-glyph X-position dump vs poppler's text extraction to localize. Not
-investigated further.
 
-### 3. CPU pegging on dense/multi-page docs (tracemonkey 14pp, css-spec 430pp)
-`renderPage` is fully synchronous (parse already done; content-stream interp +
-glyph outline building + Path2D construction all on main thread). One-page-per-rAF
-helps but each page is still a multi-100ms main-thread block; 430 pages also means
-430 IntersectionObserver entries + 430 canvases. This is the v2-worker motivation;
-no incremental fix attempted. The eviction logic (canvas.width=0 on scroll-out) is
-correct and does not loop (page divs keep explicit height + flex:none).
+## Dense-document rendering — moved to workers
+PDF parsing, font loading, interpretation and Canvas painting now run in a module
+worker. The UI receives transferred ImageBitmaps and primitive text-box tuples;
+it does not import the PDF renderer to reconstruct selection records.
+Generation checks discard stale zoom results; replacing or disposing a viewer
+terminates its worker. Offscreen pages retain layout but release canvas pixels.
+A dense mesh document rendered while a 16 ms UI heartbeat continued: 60 ticks,
+maximum observed gap 19.3 ms. A separate 500-page scenario reached the last page,
+returned to the first through rapid zoom changes, and evicted offscreen canvas
+pixels; its largest observed heartbeat gap was 26.8 ms. These are scenario checks,
+not universal latency or adversarial-resource bounds.
+
+## Shared graphics ownership and current proof
+
+- `rbt-image` owns arithmetic decoding and ICC/profile color conversion.
+- `rbt-renderer` owns affine image sampling, premultiplied paint handling,
+  blend/group compositing, explicit closed-stroke joins, and the reusable
+  `Rbt.Renderer.Canvas` backend (including worker-safe canvas/glyph utilities).
+- `rbt-pdf` retains PDF codecs/filter parameters, color-space dictionaries,
+  transparency interpretation, CMaps/metrics, worker lifecycle and selection UI.
+- Fifteen affected native/Poppler pages completed. Thirteen pages were also
+  captured from the packaged worker viewer; native/Canvas color samples agree,
+  including tinted ICC LUT16 Lab values. All 16 blend overlap samples differ by
+  at most one byte between native and Canvas.
+- Poppler ignores knockout in the generated group fixture and ignores ICC
+  `/Range` for its default image Decode. Use the declared fixture mathematics,
+  not those reference pixels. Native and Canvas agree on the corrected results.
+- LittleCMS supplies independent ICC expectations: 50 shared-library checks pass.
+  Native and browser vertical text agree; Poppler lacks the fixture's substitute
+  glyphs, so selection metrics are checked directly rather than against its boxes.
+- Final worker lifecycle checks preserve vertical `ABCD` selection, reject a
+  superseded open, retain one replacement worker, and leave zero workers/canvases
+  after disposal. Multipage scrolling releases offscreen canvas pixels. A main
+  target CDP script inventory contains no PDF renderer scripts; worker resource
+  requests alone must not be mistaken for main-thread script execution.
+
+## Current font and graphics fixes
+
+- Rbt.Text **0.1.7** accepts glyph-indexed TrueType subsets without `cmap`.
+  Arabic CID text retains its actual outlines instead of falling back after a
+  font-load exception. Explicit empty or short CIDToGIDMap streams map missing
+  entries to glyph zero; only absent or Identity maps imply identity.
+- PDF pages blend inside an isolated page group, not against the caller's
+  background. Page knockout is honored. Shared Renderer **0.1.6** preserves the
+  working/initial backdrop through nested transparency groups, including their
+  own blend mode, opacity and mask.
+- Canvas no longer promotes positive fractional strokes to hairlines. Native
+  zero-width outlines now retain a device hairline under shrinking transforms.
+  The dense Form and reduced stroke fixtures distinguish these two defects.
+- PDF JPEG `/Decode` maps the decoded components directly; standalone Adobe
+  JPEG polarity conventions must not invert them again. The original CMYK
+  photograph now retains its colors, with explicit/default Decode regressions.
+- Core PDF Flate decoding reuses Rbt.Image's bounded inflater on both backends,
+  retaining actual decoded prefixes from damaged streams rather than feeding
+  compressed bytes to the content parser. Indirect `/Contents` arrays are
+  dereferenced before concatenation. The original truncated-stream document now
+  paints its recovered text in native and browser output.
+- Chromium completed all **65 documents / 74 sampled pages** through the actual
+  packaged worker. Original Arabic text, PDF 2.0 spacing, transparency and dense
+  Forms have targeted visual/pixel evidence. Completion alone is not conformance
+  or pixel-perfect parity with Poppler.
 
 ## Incidental (throwaway scripts, not product bugs)
 - Native PPM writer dropped the R-channel mask (`v >>> 16` without `&&& 0xFFu`),

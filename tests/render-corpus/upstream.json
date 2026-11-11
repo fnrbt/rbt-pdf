@@ -1,0 +1,585 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    {
+      "id": "upstream-pdf20-simple",
+      "path": "downloads/pdf20-simple.pdf",
+      "url": "https://raw.githubusercontent.com/pdf-association/pdf20examples/ee0a78a87a58108e28f0f1cfb7a0e8cb6814a1bc/Simple%20PDF%202.0%20file.pdf",
+      "sha256": "296d2a0b2ce19b606f29265694f194a754fbc61783982b5b8d730e8637482236",
+      "bytes": 5211,
+      "tags": ["document", "pdf-2.0", "fonts", "missing-width", "text-spacing"],
+      "description": "PDF Association's original Hello World sample; space lies outside explicit widths and uses MissingWidth 0, so World starts at x=154.672 pt.",
+      "provenance": {
+        "project": "PDF Association pdf20examples",
+        "revision": "ee0a78a87a58108e28f0f1cfb7a0e8cb6814a1bc",
+        "path": "Simple PDF 2.0 file.pdf"
+      },
+      "license": "Embedded XMP declares Copyright 2017 PDF Association, Creative Commons Attribution-ShareAlike 4.0 (CC BY-SA 4.0)."
+    },
+    {
+      "id": "upstream-tracemonkey",
+      "path": "downloads/tracemonkey.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/tracemonkey.pdf",
+      "sha256": "3662ff519e485810520552bf301d8c3b2b917fd2f83303f4965d7abed367e113",
+      "bytes": 1016315,
+      "tags": [
+        "document",
+        "multipage",
+        "embedded-fonts"
+      ],
+      "description": "Fourteen-page research paper with embedded subset Type 1 and TrueType fonts; useful multipage workload.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/tracemonkey.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-arabiccidtruetype",
+      "path": "downloads/ArabicCIDTrueType.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/ArabicCIDTrueType.pdf",
+      "sha256": "1cad1de912ba29f89a6d8b08bc5b0f84382874ffedab2c8f9e05ef608c265bb1",
+      "bytes": 39370,
+      "tags": [
+        "fonts",
+        "cid",
+        "arabic",
+        "embedded-fonts"
+      ],
+      "description": "Arabic CID TrueType sample with embedded subset fonts (as reported by pdffonts).",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/ArabicCIDTrueType.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-90ms-rksj-h-sample",
+      "path": "downloads/90ms_rksj_h_sample.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/90ms_rksj_h_sample.pdf",
+      "sha256": "d50ad3b93685e9d6061f5cc9957c49ca232a0dd0771aad71e4a615f87f2674be",
+      "bytes": 1039,
+      "tags": [
+        "fonts",
+        "cid",
+        "cjk",
+        "nonembedded-fonts"
+      ],
+      "description": "Japanese 90ms-RKSJ-H CID font sample; the font is not embedded.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/90ms_rksj_h_sample.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-embedded-font",
+      "path": "downloads/Embedded_font.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/Embedded_font.pdf",
+      "sha256": "4b7588e070cd37c7cfa2ce0a493ba9ec6d57fb36a2ca3c6ab50c74a7818a2f9a",
+      "bytes": 3323,
+      "tags": [
+        "fonts",
+        "cid",
+        "cjk",
+        "embedded-fonts"
+      ],
+      "description": "Embedded subset NotoSansTC CID Type 0C font.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/Embedded_font.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-mixedfonts",
+      "path": "downloads/mixedfonts.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/mixedfonts.pdf",
+      "sha256": "04f17b84112d8130d75601f8f9c2027481a19df595aacb753ca3f9f3b08b2350",
+      "bytes": 405432,
+      "tags": [
+        "fonts",
+        "cid",
+        "cjk",
+        "nonembedded-fonts"
+      ],
+      "description": "Mixed embedded DejaVu CID and nonembedded UniJIS font resources.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/mixedfonts.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-simpletype3font",
+      "path": "downloads/simpletype3font.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/simpletype3font.pdf",
+      "sha256": "a5697cbc51c19816944658b91e3a41f86e98ae63fbd1007798994b073385aef1",
+      "bytes": 1624,
+      "tags": [
+        "fonts",
+        "type3"
+      ],
+      "description": "A simple embedded Type 3 font.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/simpletype3font.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-cmykjpeg",
+      "path": "downloads/cmykjpeg.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/cmykjpeg.pdf",
+      "sha256": "659d6b19912f63db988b0b26b9bde0e6d8100667ef162051a4a84ea8e5b90272",
+      "bytes": 374080,
+      "tags": [
+        "images",
+        "jpeg",
+        "cmyk",
+        "soft-mask"
+      ],
+      "description": "JPEG image fixture containing DCTDecode and a soft mask.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/cmykjpeg.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-bug-jpx",
+      "path": "downloads/bug_jpx.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/bug_jpx.pdf",
+      "sha256": "4010d808557a72278368c05518367735ed186cbdd04974b8506275f9ac40f999",
+      "bytes": 5451,
+      "tags": [
+        "images",
+        "jpeg2000"
+      ],
+      "description": "JPXDecode image regression fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/bug_jpx.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-jpx-smaskindata",
+      "path": "downloads/jpx_smaskindata.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/jpx_smaskindata.pdf",
+      "sha256": "a82813559c74f074b0caf92c80875fc018acb737269a2af5508c7e083b2a5fd3",
+      "bytes": 2515,
+      "tags": [
+        "images",
+        "jpeg2000",
+        "soft-mask"
+      ],
+      "description": "JPXDecode image fixture with SMaskInData.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/jpx_smaskindata.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-jbig2-symbol-offset",
+      "path": "downloads/jbig2_symbol_offset.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/jbig2_symbol_offset.pdf",
+      "sha256": "305b71c67829ef0bb8bddab9fa3ee763dcecd173f5fd996740d17212888fa97d",
+      "bytes": 1157,
+      "tags": [
+        "images",
+        "jbig2"
+      ],
+      "description": "JBIG2Decode symbol-offset regression fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/jbig2_symbol_offset.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-colorkeymask",
+      "path": "downloads/colorkeymask.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/colorkeymask.pdf",
+      "sha256": "655a470881a3bc4fac682abe88522c86c11ff41d08ecf94fae2f53ecd0c2d27c",
+      "bytes": 161533,
+      "tags": [
+        "images",
+        "mask"
+      ],
+      "description": "Image/color-key mask fixture containing a Mask entry.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/colorkeymask.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-perf-images-stencil-masks",
+      "path": "downloads/perf_images_stencil_masks.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/perf_images_stencil_masks.pdf",
+      "sha256": "d471acf5d4b0e4eb3b780b22ebc68cbd64d70ebab323a24239ccde9194677f0e",
+      "bytes": 21575,
+      "tags": [
+        "images",
+        "mask",
+        "performance"
+      ],
+      "description": "Performance fixture containing image masks.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/perf_images_stencil_masks.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-blendmode",
+      "path": "downloads/blendmode.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/blendmode.pdf",
+      "sha256": "39ce34c2d32738c7c94970fd76559ecb9efd671f5ab99e515a853674e7a824ce",
+      "bytes": 50567,
+      "tags": [
+        "transparency",
+        "blend"
+      ],
+      "description": "Blend-mode fixture with transparency group and soft mask resources.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/blendmode.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-nonisolated-blend-smask",
+      "path": "downloads/nonisolated_blend_smask.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/nonisolated_blend_smask.pdf",
+      "sha256": "866d8d75177357eb29cf330a0c30676cc07e22c9e5bd759fbb29f1de79e51f33",
+      "bytes": 3258,
+      "tags": [
+        "transparency",
+        "blend",
+        "soft-mask"
+      ],
+      "description": "Non-isolated blend and soft-mask fixture with group resources.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/nonisolated_blend_smask.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-transparency-group",
+      "path": "downloads/transparency_group.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/transparency_group.pdf",
+      "sha256": "029dd50635adee0711836095b76aab62226ca8731f6642a9454b25e2668226dd",
+      "bytes": 347690,
+      "tags": [
+        "transparency",
+        "shading"
+      ],
+      "description": "Transparency group fixture with soft masks and shading.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/transparency_group.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-gradientfill",
+      "path": "downloads/gradientfill.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/gradientfill.pdf",
+      "sha256": "47df49b25adf1cc4048c3ec2051f1b304535b5d99090bbfb6eaf2f7a45e0bb14",
+      "bytes": 1444,
+      "tags": [
+        "shading",
+        "gradient"
+      ],
+      "description": "Gradient fixture containing shading and pattern resources.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/gradientfill.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-radial-gradients",
+      "path": "downloads/radial_gradients.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/radial_gradients.pdf",
+      "sha256": "4ff43a6591900d190a5c48dace581028a47f4d9bc8a2ae151e8d5805ead7ddc0",
+      "bytes": 11851,
+      "tags": [
+        "shading",
+        "gradient",
+        "multipage"
+      ],
+      "description": "Five-page radial gradient shading fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/radial_gradients.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-function-based-shading",
+      "path": "downloads/function_based_shading.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/function_based_shading.pdf",
+      "sha256": "21a0d4951f2d45f86d90dd9bac824805b54b2bd2fefe6efad763d227d484ed64",
+      "bytes": 3869,
+      "tags": [
+        "shading"
+      ],
+      "description": "Function-based shading fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/function_based_shading.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-tiling-patterns-variations",
+      "path": "downloads/tiling_patterns_variations.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/tiling_patterns_variations.pdf",
+      "sha256": "2b7b9cccccef7407c18690cf4f007a04fc8a013b868738d025a71113a4700350",
+      "bytes": 2326,
+      "tags": [
+        "patterns"
+      ],
+      "description": "Tiling pattern variations fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/tiling_patterns_variations.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-showtext-shadingpattern",
+      "path": "downloads/ShowText-ShadingPattern.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/ShowText-ShadingPattern.pdf",
+      "sha256": "13ac785e8445fbf01d5a8200e0e899daa204cdbe723b02f38f8af61ac48707bb",
+      "bytes": 4671,
+      "tags": [
+        "patterns",
+        "shading",
+        "text",
+        "embedded-fonts"
+      ],
+      "description": "Text/shading pattern fixture with an embedded subset Type 1C font.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/ShowText-ShadingPattern.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-file-pdfjs-form",
+      "path": "downloads/file_pdfjs_form.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/file_pdfjs_form.pdf",
+      "sha256": "808af1e794952475e8af824ad1ee6ac41d6646de122e5ac91975e75b0951c80b",
+      "bytes": 8586,
+      "tags": [
+        "forms",
+        "acroform"
+      ],
+      "description": "PDF.js AcroForm fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/file_pdfjs_form.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-form-two-pages",
+      "path": "downloads/form_two_pages.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/form_two_pages.pdf",
+      "sha256": "6d7c608d0102fa1e1b3cbc2c3b0a989783e90f84ff1a7fe7cbdb6dc2a1b60fbd",
+      "bytes": 23136,
+      "tags": [
+        "forms",
+        "acroform",
+        "multipage",
+        "embedded-fonts"
+      ],
+      "description": "Two-page AcroForm with embedded subset CID fonts.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/form_two_pages.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-hello-world-rotated",
+      "path": "downloads/hello_world_rotated.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/hello_world_rotated.pdf",
+      "sha256": "ab0cb700cd5e5338fd676dfca25becae800acd2be03a4e57856485b8cfd2d28b",
+      "bytes": 1324,
+      "tags": [
+        "geometry",
+        "rotation",
+        "multipage"
+      ],
+      "description": "Five-page hello-world fixture; first page is rotated 90 degrees.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/hello_world_rotated.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-rotated",
+      "path": "downloads/rotated.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/rotated.pdf",
+      "sha256": "08c31db1ebd2345d1dcdcd3ee2baffe47845db76e9911a823ad9ed8638b5a294",
+      "bytes": 12963,
+      "tags": [
+        "geometry",
+        "rotation"
+      ],
+      "description": "Rotated-content regression fixture with an embedded subset font.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/rotated.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-issue22044",
+      "path": "downloads/issue22044.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/issue22044.pdf",
+      "sha256": "b063906295390806d56afdb4abb15c3736958d2007778aa935aa323da0602f0d",
+      "bytes": 682,
+      "tags": [
+        "malformed",
+        "compression"
+      ],
+      "description": "Upstream test manifest describes a truncated FlateDecode content stream; pdfinfo recognizes one page.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/issue22044.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-perf-structure-forms",
+      "path": "downloads/perf_structure_forms.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/perf_structure_forms.pdf",
+      "sha256": "ca5755a52655abc11fbcc8c18bab9cbaea68f285fb9364145700565969b94bd2",
+      "bytes": 103794,
+      "tags": [
+        "forms",
+        "performance"
+      ],
+      "description": "Form XObject structure performance fixture; not an AcroForm.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/perf_structure_forms.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-perf-shadings-mesh-patches",
+      "path": "downloads/perf_shadings_mesh_patches.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/perf_shadings_mesh_patches.pdf",
+      "sha256": "9de0b276f305ef92c36cf4e7f4baae321ddc4c3d439e7ff2caaeb7e8ef5aca96",
+      "bytes": 23546,
+      "tags": [
+        "shading",
+        "mesh",
+        "performance"
+      ],
+      "description": "Mesh-patch shading performance fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/perf_shadings_mesh_patches.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-perf-codecs-jbig2",
+      "path": "downloads/perf_codecs_jbig2.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/perf_codecs_jbig2.pdf",
+      "sha256": "c7cdfb036282939f6a5461d67c34c895910856266c598f118cc41c9b7ca1d82e",
+      "bytes": 9909,
+      "tags": [
+        "images",
+        "jbig2",
+        "performance"
+      ],
+      "description": "JBIG2Decode performance fixture.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/perf_codecs_jbig2.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-perf-text-cjk-nonembedded",
+      "path": "downloads/perf_text_cjk_nonembedded.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/perf_text_cjk_nonembedded.pdf",
+      "sha256": "347456be3aceb9131bceaec25ef8eef9565c32335bdc1f50f22d53b9aeaa2775",
+      "bytes": 7521,
+      "tags": [
+        "text",
+        "cjk",
+        "cid",
+        "nonembedded-fonts",
+        "performance"
+      ],
+      "description": "CJK text performance fixture with nonembedded Japanese and Chinese CID fonts.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/perf_text_cjk_nonembedded.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "upstream-160f-2019",
+      "path": "downloads/160F-2019.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/94a48f3c844d4677b264b6e7c0a1e239c245189f/test/pdfs/160F-2019.pdf",
+      "sha256": "f41f0818365ffd14ca4e55c0556355193bd76632b970d60cc2dec554cac6f379",
+      "bytes": 328400,
+      "tags": [
+        "document",
+        "forms",
+        "acroform",
+        "embedded-fonts"
+      ],
+      "description": "One-page AcroForm document with embedded subset TrueType fonts.",
+      "provenance": {
+        "project": "Mozilla pdf.js",
+        "revision": "94a48f3c844d4677b264b6e7c0a1e239c245189f",
+        "path": "test/pdfs/160F-2019.pdf"
+      },
+      "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    }
+  ]
+}

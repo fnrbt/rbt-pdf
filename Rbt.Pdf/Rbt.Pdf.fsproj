@@ -6,10 +6,11 @@
   <ItemGroup>
     <Compile Include="Rbt.Pdf.fs" />
   </ItemGroup>
-  <!-- OpenType comes from the package registry: the cross-platform Core package,
-       which carries its F# sources for a Fable build. -->
+  <!-- Font utilities and image/stream codecs come from shared packages, including
+       their F# sources for Fable builds. PDF-specific recovery policy stays here. -->
   <ItemGroup>
     <PackageReference Include="Rbt.OpenType.Core" Version="$(RbtTextPackageVersion)" />
+    <PackageReference Include="Rbt.Image" Version="$(RbtImagePackageVersion)" />
   </ItemGroup>
   <!-- Ship the F# sources under fable/ so Fable can compile this library from
        the NuGet package alone (for example in a Forge build sandbox). -->

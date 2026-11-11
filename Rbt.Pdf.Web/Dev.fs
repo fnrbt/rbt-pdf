@@ -6,7 +6,7 @@ module Rbt.Pdf.Web.Dev
 open Fable.Core
 open Fable.Core.JsInterop
 open Browser.Types
-open Rbt.Pdf.Web.WebApi
+open Rbt.Renderer.CanvasApi
 open Rbt.Pdf.Web.App
 
 [<Emit("fetch($0).then(function(r){ if(!r.ok) throw new Error('fetch '+$0+': '+r.status); return r.arrayBuffer(); }).then(function(b){ return new Uint8Array(b); })")>]

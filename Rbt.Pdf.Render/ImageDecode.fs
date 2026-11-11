@@ -16,12 +16,21 @@ let private soi (data: byte[]) =
         if data.[i] = 0xFFuy && data.[i + 1] = 0xD8uy then found <- i
         i <- i + 1
     max 0 found
+/// Decode PDF JPEG samples before conversion to BGRA, retaining component polarity.
+let decodeComponents (imageBytes: byte[]) (colorTransform: int option) =
+    if isNull imageBytes || imageBytes.Length < 4 then None
+    else
+        let start = soi imageBytes
+        let ctx = DecodeContext({ DecodeOptions.Default with ApplyOrientation = false })
+        match Codec.run (fun () -> Jpeg.decodeStream imageBytes start (imageBytes.Length - start) ctx colorTransform) with
+        | Ok components -> Some components
+        | Error _ -> None
 
-/// Decode a DCTDecode stream to (width, height, premultiplied BGRA pixels); None when the
-/// stream cannot be decoded. Grey and RGB/YCbCr as coded. CMYK has no colour profile here,
-/// as in browsers: an Adobe-marked stream stores inverted ink (Photoshop), r = c * k / 255;
-/// a stream without the Adobe marker stores plain ink values. EXIF orientation is ignored
-/// (PDF places the image with its own matrix).
+/// Decode a standalone-JPEG preview to premultiplied BGRA. Normal PDF images use
+/// decodeComponents and apply their own color space and Decode array instead.
+/// This fallback follows standalone Adobe CMYK polarity conventions; they must
+/// not be applied again to PDF component samples. EXIF orientation is ignored
+/// because PDF places the image with its own matrix.
 let decode (imageBytes: byte[]) : (int * int * uint32[]) option =
     if isNull imageBytes || imageBytes.Length < 4 then None
     else

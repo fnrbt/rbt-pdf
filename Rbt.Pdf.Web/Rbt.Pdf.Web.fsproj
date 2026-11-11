@@ -6,10 +6,9 @@
     <RootNamespace>Rbt.Pdf.Web</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="WebApi.fs" />
-    <Compile Include="GlyphCache.fs" />
     <Compile Include="ImageSource.fs" />
-    <Compile Include="CanvasBackend.fs" />
+    <Compile Include="WorkerRuntime.fs" />
+    <Compile Include="WorkerClient.fs" />
     <Compile Include="TextLayer.fs" />
     <Compile Include="PageView.fs" />
     <Compile Include="App.fs" />
@@ -17,6 +16,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Rbt.Pdf.Render/Rbt.Pdf.Render.fsproj" />
+    <PackageReference Include="Rbt.Renderer.Canvas" Version="$(RbtRendererCorePackageVersion)" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Fable.Core" Version="4.3.0" />

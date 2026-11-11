@@ -6,3 +6,7 @@ Rbt.Pdf.Web/.generated/
 Rbt.Pdf.Web/public/assets/
 .pnpm-store/
 assets/
+tests/render-corpus/downloads/
+tests/render-corpus/generated/
+tests/render-corpus/results/
+tests/render-corpus/__pycache__/

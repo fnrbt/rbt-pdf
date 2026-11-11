@@ -624,28 +624,25 @@ module Streams =
     let decompress (filter: string) (data: byte[]) =
         match filter with
         | "FlateDecode" | "Fl" ->
-#if FABLE_COMPILER
-            try Rbt.OpenType.Inflate.inflate data with _ -> data
-#else
-            try
-                use input = new MemoryStream(data)
-                // Skip zlib header (2 bytes)
-                input.ReadByte() |> ignore
-                input.ReadByte() |> ignore
-                use deflate = new DeflateStream(input, CompressionMode.Decompress)
-                use output = new MemoryStream()
-                deflate.CopyTo(output)
-                output.ToArray()
-            with _ ->
-                // Try without skipping header
-                use input = new MemoryStream(data)
-                use deflate = new DeflateStream(input, CompressionMode.Decompress)
-                use output = new MemoryStream()
-                try
-                    deflate.CopyTo(output)
-                    output.ToArray()
-                with _ -> data
-#endif
+            // A damaged PDF can end midway through a DEFLATE block. The shared
+            // inflater retains only bytes decoded before truncation/corruption;
+            // returning the compressed input instead loses even valid text.
+            // RFC 1950 zlib is normal for PDF; retain the raw-DEFLATE fallback
+            // for streams that have no zlib header.
+            let zlib =
+                data.Length >= 2
+                && int data.[0] &&& 0x0F = 8
+                && (int data.[0] * 256 + int data.[1]) % 31 = 0
+            // DEFLATE cannot expand beyond roughly 1032:1. Bound damaged
+            // streams as well as valid ones instead of inflating indefinitely.
+            let maxOutput = int (min 0x7FFF_FFFFL (int64 data.Length * 1032L + 65536L))
+            let result =
+                Rbt.Image.Codecs.Inflate.toArray
+                    (Rbt.Image.Codecs.DecodeContext()) zlib data 0 data.Length maxOutput
+            if not result.Complete && result.Length = 0 then
+                failwith "FlateDecode stream has no decodable data"
+            if result.Length = result.Output.Length then result.Output
+            else Array.sub result.Output 0 result.Length
         | "ASCIIHexDecode" | "AHx" ->
             // Hex digits until '>' EOD; whitespace ignored; odd trailing nibble padded with 0.
             let out = ResizeArray<byte>(data.Length / 2)
@@ -1443,13 +1440,14 @@ module PageOps =
             Some newDoc
         | None -> None
 
+    /// Decode a page's stream or inline/indirect array of content streams.
     let getPageContents (doc: PdfDocument) (pageRef: PdfObj) =
         match Pdf.dictGet doc "Contents" pageRef with
-        | Some (PdfArray contents) ->
-            contents
-            |> List.map (Pdf.getStreamData doc)
-            |> Array.concat
-        | Some stream -> Pdf.getStreamData doc stream
+        | Some contents ->
+            match Pdf.deref doc contents with
+            | PdfArray streams ->
+                streams |> List.map (Pdf.getStreamData doc) |> Array.concat
+            | stream -> Pdf.getStreamData doc stream
         | None -> Array.empty
 
     let getMediaBox (doc: PdfDocument) (pageRef: PdfObj) =
@@ -1617,6 +1615,10 @@ module ContentStream =
                 | Some 60uy ->
                     if pos + 1 < len && data.[pos + 1] = 60uy then advance (); advance (); tokens.Add(TOperator "<<")
                     else tokens.Add(readHexString ())
+                | Some 62uy ->
+                    advance ()
+                    if pos < len && data.[pos] = 62uy then advance ()
+                    tokens.Add(TOperator ">>")
                 | _ ->
                     let ksb = Text.StringBuilder()
                     let mutable kcont = true
@@ -1627,7 +1629,9 @@ module ContentStream =
                     let kw = ksb.ToString()
                     if kw = "ID" then
                         foundID <- true
-                        if pos < len then advance ()
+                        if pos < len && data.[pos] = 13uy && pos + 1 < len && data.[pos + 1] = 10uy then
+                            pos <- pos + 2
+                        elif pos < len && isWhitespace data.[pos] then advance ()
                         let startPos = pos
                         let mutable foundEI = false
                         while not foundEI && pos < len do
@@ -1635,12 +1639,14 @@ module ContentStream =
                                 let prevOk = pos = startPos || isWhitespace data.[pos - 1]
                                 let nextOk = pos + 2 >= len || isWhitespace data.[pos + 2] || isDelimiter data.[pos + 2]
                                 if prevOk && nextOk then
-                                    let imgData = data.[startPos .. pos - 1]
-                                    let trimmed =
-                                        let mutable e = imgData.Length - 1
-                                        while e >= 0 && isWhitespace imgData.[e] do e <- e - 1
-                                        if e < imgData.Length - 1 then imgData.[0..e] else imgData
-                                    tokens.Add(TInlineImageData trimmed)
+                                    // EI has a whitespace separator, not arbitrary trailing
+                                    // whitespace: those preceding bytes may be image samples.
+                                    let mutable endPos = pos
+                                    if endPos > startPos && isWhitespace data.[endPos - 1] then
+                                        endPos <- endPos - 1
+                                        if data.[endPos] = 10uy && endPos > startPos && data.[endPos - 1] = 13uy then
+                                            endPos <- endPos - 1
+                                    tokens.Add(TInlineImageData data.[startPos .. endPos - 1])
                                     pos <- pos + 2
                                     tokens.Add(TOperator "EI")
                                     foundEI <- true
@@ -1833,7 +1839,7 @@ module FontResolve =
 
     // ── Glyph Name Tables ───────────────────────────────────
 
-    let private glyphNameForByte (encoding: string) (code: int) : string =
+    let glyphNameForByte (encoding: string) (code: int) : string =
         let asciiNames = [|
             "space";"exclam";"quotedbl";"numbersign";"dollar";"percent";"ampersand";"quotesingle"
             "parenleft";"parenright";"asterisk";"plus";"comma";"hyphen";"period";"slash"
@@ -2089,7 +2095,6 @@ module FontResolve =
 
     // ── Font Helpers ────────────────────────────────────────
 
-    let private fontCache = Collections.Generic.Dictionary<string, PdfFontData * int[] option>()
 
     let private parseFontCmap (data: byte[]) : int[] option =
         try
@@ -2214,18 +2219,18 @@ module FontResolve =
         | _ ->
             try
                 let data = Pdf.getStreamData doc obj
-                if data.Length >= 2 then
-                    let count = data.Length / 2
-                    let map = Array.create count 0
-                    for i in 0..count-1 do
-                        map.[i] <- (int data.[i * 2] <<< 8) ||| int data.[i * 2 + 1]
-                    Some map
-                else None
+                let count = data.Length / 2
+                let map = Array.zeroCreate count
+                for i in 0 .. count - 1 do
+                    map.[i] <- (int data.[i * 2] <<< 8) ||| int data.[i * 2 + 1]
+                // An explicit empty map maps every CID to .notdef; only an
+                // absent map or /Identity signifies CID = GID.
+                Some map
             with _ -> None
 
     // ── Font Resolution ─────────────────────────────────────
 
-    let private resolveType0 (doc: PdfDocument) (fontObj: PdfObj) (toUnicode: byte[] option) (baseFontName: string) : PdfFontInfo =
+    let private resolveType0 (doc: PdfDocument) (fontObj: PdfObj) (toUnicode: byte[] option) : PdfFontInfo =
         try
             let descendantFonts =
                 match Pdf.dictGet doc "DescendantFonts" fontObj with
@@ -2249,33 +2254,27 @@ module FontResolve =
                     | None -> None
 
                 let fontData =
-                    match fontCache.TryGetValue(baseFontName) with
-                    | true, (fd, _) -> fd
-                    | _ ->
-                        let fd =
-                            match Pdf.dictGet doc "FontDescriptor" cidFont with
-                            | Some fdRef ->
-                                let fdObj = Pdf.deref doc fdRef
-                                let ff2 = Pdf.dictGet doc "FontFile2" fdObj
-                                let ff3 = Pdf.dictGet doc "FontFile3" fdObj
-                                let fontStream = ff2 |> Option.orElse ff3
-                                let isCff = ff3.IsSome && ff2.IsNone
-                                match fontStream with
-                                | Some s ->
-                                    try
-                                        let data = Pdf.getStreamData doc s
-                                        if data.Length > 0 then
-                                            if isCff then
-                                                let ascender, descender = getMetrics doc fdObj
-                                                CffFontData (data, [||], ascender, descender)
-                                            else
-                                                TrueTypeFontData data
-                                        else NoFontData
-                                    with _ -> NoFontData
-                                | None -> NoFontData
-                            | None -> NoFontData
-                        fontCache.[baseFontName] <- (fd, None)
-                        fd
+                    match Pdf.dictGet doc "FontDescriptor" cidFont with
+                    | Some fdRef ->
+                        let fdObj = Pdf.deref doc fdRef
+                        let ff2 = Pdf.dictGet doc "FontFile2" fdObj
+                        let ff3 = Pdf.dictGet doc "FontFile3" fdObj
+                        let fontStream = ff2 |> Option.orElse ff3
+                        let isCff = ff3.IsSome && ff2.IsNone
+                        match fontStream with
+                        | Some s ->
+                            try
+                                let data = Pdf.getStreamData doc s
+                                if data.Length > 0 then
+                                    if isCff then
+                                        let ascender, descender = getMetrics doc fdObj
+                                        CffFontData (data, [||], ascender, descender)
+                                    else
+                                        TrueTypeFontData data
+                                else NoFontData
+                            with _ -> NoFontData
+                        | None -> NoFontData
+                    | None -> NoFontData
 
                 { ToUnicodeCMap = toUnicode; Widths = None; FirstChar = 0; Encoding = "Identity-H"
                   EncodingDiffs = Map.empty; ByteToGlyph = None
@@ -2303,7 +2302,7 @@ module FontResolve =
                     | Some (PdfName n) -> n | _ -> fontName
 
                 if subtype = "Type0" then
-                    resolveType0 doc fontObj toUnicode baseFontName
+                    resolveType0 doc fontObj toUnicode
                 else
 
                 let firstChar =
@@ -2353,66 +2352,60 @@ module FontResolve =
                 let pdfHasEncoding = (Pdf.dictGet doc "Encoding" fontObj).IsSome
 
                 let fontData, byteToGlyph =
-                    match fontCache.TryGetValue(baseFontName) with
-                    | true, (fd, bg) -> fd, bg
-                    | _ ->
-                        let fd, bg =
-                            match Pdf.dictGet doc "FontDescriptor" fontObj with
-                            | Some fdRef ->
-                                let fdObj = Pdf.deref doc fdRef
-                                let ff2 = Pdf.dictGet doc "FontFile2" fdObj
-                                let ff3 = Pdf.dictGet doc "FontFile3" fdObj
-                                let ff1 = Pdf.dictGet doc "FontFile" fdObj
-                                let fontStream = ff2 |> Option.orElse ff3 |> Option.orElse ff1
-                                let isCff = ff3.IsSome && ff2.IsNone
-                                match fontStream with
-                                | Some s ->
-                                    try
-                                        let data = Pdf.getStreamData doc s
-                                        if data.Length > 0 then
-                                            if isCff then
-                                                let nameToGlyph, numGlyphs = Rbt.OpenType.Cff.getCffNameToGlyph data 0
-                                                // Fall back to the CFF built-in encoding when the PDF has none.
-                                                let enc, diffs =
-                                                    if not pdfHasEncoding then
-                                                        let builtin = Rbt.OpenType.Cff.getCffBuiltinEncoding data 0
-                                                        if not builtin.IsEmpty then "", builtin
-                                                        else encoding, encodingDiffs
-                                                    else encoding, encodingDiffs
-                                                let byteMap = buildNameBasedByteMap enc diffs nameToGlyph
-                                                let glyphWidths = buildGlyphWidths numGlyphs widths firstChar byteMap
-                                                let ascender, descender = getMetrics doc fdObj
-                                                CffFontData (data, glyphWidths, ascender, descender), Some byteMap
-                                            elif ff1.IsSome then
-                                                let streamObj = Pdf.deref doc ff1.Value
-                                                let length1 =
-                                                    match Pdf.dictGet doc "Length1" streamObj with
-                                                    | Some (PdfInt n) -> int n | _ -> 0
-                                                let length2 =
-                                                    match Pdf.dictGet doc "Length2" streamObj with
-                                                    | Some (PdfInt n) -> int n | _ -> 0
-                                                try
-                                                    let t1 = Rbt.OpenType.Type1.parseType1 data length1 length2
-                                                    let nameToGlyph = Rbt.OpenType.Type1.nameToGlyphIndex t1
-                                                    let numGlyphs = t1.CharStrings.Length
-                                                    // Fall back to the Type1 built-in encoding when the PDF has none.
-                                                    let enc, diffs =
-                                                        if not pdfHasEncoding && not t1.BuiltinEncoding.IsEmpty then "", t1.BuiltinEncoding
-                                                        else encoding, encodingDiffs
-                                                    let byteMap = buildNameBasedByteMap enc diffs nameToGlyph
-                                                    let glyphWidths = buildGlyphWidths numGlyphs widths firstChar byteMap
-                                                    let ascender, descender = getMetrics doc fdObj
-                                                    Type1FontData (data, length1, length2, glyphWidths, ascender, descender), Some byteMap
-                                                with _ -> NoFontData, None
-                                            else
-                                                let gm = parseFontCmap data
-                                                TrueTypeFontData data, gm
-                                        else NoFontData, None
-                                    with _ -> NoFontData, None
-                                | None -> NoFontData, None
-                            | None -> NoFontData, None
-                        fontCache.[baseFontName] <- (fd, bg)
-                        fd, bg
+                    match Pdf.dictGet doc "FontDescriptor" fontObj with
+                    | Some fdRef ->
+                        let fdObj = Pdf.deref doc fdRef
+                        let ff2 = Pdf.dictGet doc "FontFile2" fdObj
+                        let ff3 = Pdf.dictGet doc "FontFile3" fdObj
+                        let ff1 = Pdf.dictGet doc "FontFile" fdObj
+                        let fontStream = ff2 |> Option.orElse ff3 |> Option.orElse ff1
+                        let isCff = ff3.IsSome && ff2.IsNone
+                        match fontStream with
+                        | Some s ->
+                            try
+                                let data = Pdf.getStreamData doc s
+                                if data.Length > 0 then
+                                    if isCff then
+                                        let nameToGlyph, numGlyphs = Rbt.OpenType.Cff.getCffNameToGlyph data 0
+                                        // Fall back to the CFF built-in encoding when the PDF has none.
+                                        let enc, diffs =
+                                            if not pdfHasEncoding then
+                                                let builtin = Rbt.OpenType.Cff.getCffBuiltinEncoding data 0
+                                                if not builtin.IsEmpty then "", builtin
+                                                else encoding, encodingDiffs
+                                            else encoding, encodingDiffs
+                                        let byteMap = buildNameBasedByteMap enc diffs nameToGlyph
+                                        let glyphWidths = buildGlyphWidths numGlyphs widths firstChar byteMap
+                                        let ascender, descender = getMetrics doc fdObj
+                                        CffFontData (data, glyphWidths, ascender, descender), Some byteMap
+                                    elif ff1.IsSome then
+                                        let streamObj = Pdf.deref doc ff1.Value
+                                        let length1 =
+                                            match Pdf.dictGet doc "Length1" streamObj with
+                                            | Some (PdfInt n) -> int n | _ -> 0
+                                        let length2 =
+                                            match Pdf.dictGet doc "Length2" streamObj with
+                                            | Some (PdfInt n) -> int n | _ -> 0
+                                        try
+                                            let t1 = Rbt.OpenType.Type1.parseType1 data length1 length2
+                                            let nameToGlyph = Rbt.OpenType.Type1.nameToGlyphIndex t1
+                                            let numGlyphs = t1.CharStrings.Length
+                                            // Fall back to the Type1 built-in encoding when the PDF has none.
+                                            let enc, diffs =
+                                                if not pdfHasEncoding && not t1.BuiltinEncoding.IsEmpty then "", t1.BuiltinEncoding
+                                                else encoding, encodingDiffs
+                                            let byteMap = buildNameBasedByteMap enc diffs nameToGlyph
+                                            let glyphWidths = buildGlyphWidths numGlyphs widths firstChar byteMap
+                                            let ascender, descender = getMetrics doc fdObj
+                                            Type1FontData (data, length1, length2, glyphWidths, ascender, descender), Some byteMap
+                                        with _ -> NoFontData, None
+                                    else
+                                        let gm = parseFontCmap data
+                                        TrueTypeFontData data, gm
+                                else NoFontData, None
+                            with _ -> NoFontData, None
+                        | None -> NoFontData, None
+                    | None -> NoFontData, None
 
                 { ToUnicodeCMap = toUnicode; Widths = widths; FirstChar = firstChar; Encoding = encoding
                   EncodingDiffs = encodingDiffs; ByteToGlyph = byteToGlyph

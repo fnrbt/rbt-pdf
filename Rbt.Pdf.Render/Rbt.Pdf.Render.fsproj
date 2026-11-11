@@ -5,8 +5,30 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="ImageDecode.fs" />
+    <Compile Include="BitmapPaint.fs" />
+    <Compile Include="CcittDecode.fs" />
+    <Compile Include="Jbig2Huffman.fs" />
+    <Compile Include="Jbig2Bitmaps.fs" />
+    <Compile Include="Jbig2Symbols.fs" />
+    <Compile Include="Jbig2Segments.fs" />
+    <Compile Include="Jbig2Decode.fs" />
+    <Compile Include="JpxTagTrees.fs" />
+    <Compile Include="JpxBitplane.fs" />
+    <Compile Include="JpxWavelets.fs" />
+    <Compile Include="JpxPackets.fs" />
+    <Compile Include="JpxDecode.fs" />
+    <Compile Include="PdfColor.fs" />
+    <Compile Include="PdfImages.fs" />
     <Compile Include="Fonts.fs" />
+    <Compile Include="PageGeometry.fs" />
+    <Compile Include="PdfCalculator.fs" />
+    <Compile Include="PdfSampled.fs" />
+    <Compile Include="Shading.fs" />
     <Compile Include="Render.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="../resources/**/*" Link="assets/%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" Pack="true" PackagePath="assets/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Rbt.Pdf/Rbt.Pdf.fsproj" />

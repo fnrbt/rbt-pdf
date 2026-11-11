@@ -1,8 +1,8 @@
-// Copy the run-time assets the viewer loads (default font, Unicode data) into
-// a directory. They come from the restored NuGet packages.
+// Stage package-provided core assets and the bundled PDF CMaps/CJK fallback.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const target = path.resolve(process.argv[2] ?? "assets");
 const packages = process.env.NUGET_PACKAGES ?? path.join(os.homedir(), ".nuget", "packages");
@@ -29,3 +29,4 @@ for (const asset of assets) {
   }
   fs.copyFileSync(source, path.join(target, asset.file));
 }
+fs.cpSync(fileURLToPath(new URL("../resources/", import.meta.url)), target, { recursive: true });

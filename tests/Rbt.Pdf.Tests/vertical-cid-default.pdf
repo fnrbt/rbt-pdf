@@ -1,0 +1,81 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 54  >>
+stream
+BT /F1 20 Tf 1 0 0 1 100 250 Tm <41814081418142> Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type0 /BaseFont /Fixture /Encoding 7 0 R /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Fixture /FontDescriptor 10 0 R /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 1000 /W [3 [800 1000 1200 600]] /W2 [3 [-900 400 850 -1100 500 900] 5 5 -1200 600 950] /CIDToGIDMap /Identity >>
+endobj
+7 0 obj
+<< /Length 32 /UseCMap 8 0 R >>
+stream
+1 begincidchar
+<41> 3
+endcidchar
+endstream
+endobj
+8 0 obj
+<< /Length 132  >>
+stream
+/WMode 1 def
+2 begincodespacerange
+<00> <7f>
+<8100> <81ff>
+endcodespacerange
+2 begincidrange
+<41> <41> 2
+<8140> <8142> 4
+endcidrange
+endstream
+endobj
+9 0 obj
+<< /Length 141  >>
+stream
+2 begincodespacerange
+<00> <7f>
+<8100> <81ff>
+endcodespacerange
+4 beginbfchar
+<41> <0041>
+<8140> <0042>
+<8141> <0043>
+<8142> <0044>
+endbfchar
+endstream
+endobj
+10 0 obj
+<< /Type /FontDescriptor /FontName /Fixture /Flags 4 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000352 00000 n 
+0000000478 00000 n 
+0000000764 00000 n 
+0000000861 00000 n 
+0000001045 00000 n 
+0000001238 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+1404
+%%EOF

@@ -97,36 +97,45 @@
     const status = document.getElementById('status');
 
     let viewer = null;
-
+    let loadSequence = 0;
     function updateZoomLabel() {
       if (viewer) zoomLabel.textContent = Math.round(viewer.zoom * 100) + '%';
     }
 
-    async function loadFromBytes(bytes, name) {
+    async function loadFromBytes(bytes, name, token = ++loadSequence) {
+      if (token !== loadSequence) return;
       if (viewer) { viewer.dispose(); viewer = null; }
       root.innerHTML = '';
       status.textContent = `Parsing ${(bytes.length / 1024).toFixed(0)} KB...`;
       try {
-        viewer = await openPdf(root, bytes, './assets');
+        const opened = await openPdf(root, bytes, './assets');
+        if (token !== loadSequence) { opened.dispose(); return; }
+        viewer = opened;
         status.textContent = `${name} \u2014 ${viewer.pageCount} pages`;
         updateZoomLabel();
       } catch (e) {
-        status.textContent = 'Error: ' + e.message;
-        console.error(e);
+        if (token === loadSequence) {
+          status.textContent = 'Error: ' + e.message;
+          console.error(e);
+        }
       }
     }
 
     async function loadPdf(url) {
+      const token = ++loadSequence;
       status.textContent = 'Fetching...';
       try {
         const resp = await fetch(url);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const bytes = new Uint8Array(await resp.arrayBuffer());
+        if (token !== loadSequence) return;
         const name = url.split('/').pop();
-        await loadFromBytes(bytes, name);
+        await loadFromBytes(bytes, name, token);
       } catch (e) {
-        status.textContent = 'Error: ' + e.message;
-        console.error(e);
+        if (token === loadSequence) {
+          status.textContent = 'Error: ' + e.message;
+          console.error(e);
+        }
       }
     }
 
@@ -134,8 +143,16 @@
     document.getElementById('open-file-btn').addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', () => {
       if (fileInput.files.length > 0) {
+        const token = ++loadSequence;
         const file = fileInput.files[0];
-        file.arrayBuffer().then(buf => loadFromBytes(new Uint8Array(buf), file.name));
+        file.arrayBuffer()
+          .then(buf => loadFromBytes(new Uint8Array(buf), file.name, token))
+          .catch(e => {
+            if (token === loadSequence) {
+              status.textContent = 'Error: ' + e.message;
+              console.error(e);
+            }
+          });
       }
     });
 
