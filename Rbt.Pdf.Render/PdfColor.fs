@@ -105,7 +105,8 @@ let tryWorkingSpace = function
     | Rgb -> Some displaySpace
     | Icc (profile, _) ->
         match Icc.tryToPcs profile, Icc.tryFromPcs profile with
-        | Some forward, Some inverse -> Some { IsDisplay = false; IsGray = false; ToPcs = forward; FromPcs = inverse }
+        | Some forward, Some inverse when Icc.components profile = 3 ->
+            Some { IsDisplay = false; IsGray = false; ToPcs = (fun r g b -> forward r g b 0.0); FromPcs = inverse }
         | _ -> None
     | _ -> None
 
@@ -133,9 +134,12 @@ let rec private toPcs space (values: float[]) =
         Icc.adaptXYZToD50 white x y z
     | Icc (profile,limits) ->
         match Icc.tryToPcs profile with
-        | Some forward when Icc.components profile = 3 ->
-            forward (iccComponent limits values 0) (iccComponent limits values 1) (iccComponent limits values 2)
-        | Some forward when Icc.components profile = 1 -> forward (iccComponent limits values 0) 0.0 0.0
+        | Some forward ->
+            let count = Icc.components profile
+            forward (iccComponent limits values 0)
+                (if count > 1 then iccComponent limits values 1 else 0.0)
+                (if count > 2 then iccComponent limits values 2 else 0.0)
+                (if count > 3 then iccComponent limits values 3 else 0.0)
         | _ -> invalidOp "Unsupported source ICC PCS transform for transparency blending"
     | Indexed (hi,baseSpace,palette) ->
         let index = max 0 (min hi (int (values.[0]+0.5)))

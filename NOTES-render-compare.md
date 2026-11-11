@@ -98,8 +98,8 @@ matching the document widths. The original is now pinned in the corpus.
 
 ### Assets, packaging and remaining limits
 
-- Rbt.Image **0.1.2**, Rbt.Text **0.1.7**, and
-  Rbt.Renderer/Core/Canvas **0.1.8** are published through the normal protected
+- Rbt.Image **0.1.3**, Rbt.Text **0.1.7**, and
+  Rbt.Renderer/Core/Canvas **0.1.9** are published through the normal protected
   Forge tag actions. The earlier missing-native-package incident was fixed in
   Forge; no manual rollout is needed for these library releases.
 - Codec ports retain Apache-2.0 attribution and the bundled PDF.js license.
@@ -135,11 +135,12 @@ matching the document widths. The original is now pinned in the corpus.
   group space; profile conversion belongs to Image and compositing to Renderer.
   RGB matrix/TRC luminosity masks composite in the declared group space before
   XYZ Y extraction and transfer; backdrop color also applies outside the BBox.
-  Managed alpha masks and DeviceGray soft masks remain supported. LUT/CMYK group
-  transforms, LUT ICC sources in non-display groups and `AIS true` remain
-  explicitly unsupported. GL supports color-managed groups through readback
-  compositing, but still rejects custom pixel filters, including PDF luminosity
-  and transfer masks. Knockout shape extraction remains approximate for
+  Managed alpha masks and DeviceGray soft masks remain supported. RGB/CMYK
+  `mft1`/`mft2` ICC sources convert directly through unclipped D50 XYZ into managed
+  RGB groups. LUT/CMYK group transforms and `AIS true` remain unsupported.
+  GL supports managed groups and custom pixel filters through CPU readback
+  compositing, including PDF luminosity and transfer masks. Knockout shape
+  extraction remains approximate for
   geometry-expanding filters, text masks and intrinsic image alpha. These checks
   are regression evidence, not PDF conformance certification.
 
@@ -257,8 +258,24 @@ not universal latency or adversarial-resource bounds.
   ICC parsing was added there. Eleven live Mesa llvmpipe EGL cases passed
   against independent expectations and Raster probes, covering isolation,
   knockout, nested groups, mask/opacity, blend mode and clip-state restoration.
-  This verifies software Mesa, not a physical GPU; custom GL pixel filters
-  remain unsupported.
+  That pass verified software Mesa, not a physical GPU; custom GL pixel filters
+  were still unsupported at that release.
+
+## LUT source colors and GL filters follow-up
+
+- Image exposes unclipped D50 XYZ PCS for supported RGB/CMYK lut8/lut16 A2B0
+  profiles, including XYZ and legacy Lab encodings. PDF supplies all source
+  components and converts into the managed RGB blending space before blending.
+- Renderer owns full-frame custom GL callbacks, nested stencil preservation and
+  balanced gradient interval selection. PDF-specific mask and color semantics
+  remain here; profile interpretation remains in Image.
+- The corpus has 78 documents / 599 pages. Fourteen targeted documents rendered
+  on native Raster, live Mesa llvmpipe GL and Chromium Canvas. Independent pixel
+  checks cover LUT colors, masks, nested clips and knockout combinations; dense
+  CMYK gradients match native within one channel value across 640 samples.
+  Ten generic live EGL callback scenarios and 77 Image ICC checks also passed.
+- LUT inverse transforms, four-component CMYK group blending and `/AIS true`
+  remain unsupported. GL callbacks use CPU readback/upload, not GPU execution.
 
 ## Incidental (throwaway scripts, not product bugs)
 - Native PPM writer dropped the R-channel mask (`v >>> 16` without `&&& 0xFFu`),

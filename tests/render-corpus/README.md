@@ -1,14 +1,14 @@
 # PDF rendering corpus
 
-The collection contains **73 PDFs (3,204,297 bytes)**: 30 Mozilla pdf.js
+The collection contains **78 PDFs (3,219,336 bytes)**: 30 Mozilla pdf.js
 fixtures pinned to commit `94a48f3c844d4677b264b6e7c0a1e239c245189f`,
-one PDF Association PDF 2.0 example, and 42 generated fixtures.
+one PDF Association PDF 2.0 example, and 47 generated fixtures.
 
 Coverage includes embedded/subset/Type 3/CID fonts, Arabic and CJK text,
 JPEG/JPEG2000/JBIG2, packed images and masks, transparency/blending,
 shading/patterns, Form XObjects and AcroForms, offset page boxes/rotation,
 text state and clipping, malformed streams, and multipage/performance cases.
-The collection has **594 pages**, including a generated 500-page document for
+The collection has **599 pages**, including a generated 500-page document for
 scrolling, zoom cancellation and offscreen canvas eviction checks.
 
 Two complementary sets:
@@ -276,5 +276,37 @@ the BBox. The existing transparency/ICC contact sheet was visually inspected.
 Shared Renderer GL color-managed groups passed 11 real surfaceless EGL cases
 on Mesa llvmpipe: isolation/knockout, opacity, blend mode, mask, zero opacity,
 nested groups, clipping and following paint. The implementation retains GL's
-CPU readback/compositing path. Custom pixel filters, including PDF luminosity
-and transfer masks, remain unsupported on GL; this is not a hardware-GPU test.
+CPU readback/compositing path. At that release, custom pixel filters including
+PDF luminosity and transfer masks were unsupported on GL.
+
+## LUT source colors and GL pixel callbacks
+
+Four fixtures place CMYK lut8/lut16 sources with XYZ/Lab PCS inside an Adobe RGB
+page blending space. Each compares vector, image, shading and pattern paints.
+LittleCMS independently converts source components into Adobe RGB before
+compositing and converting the resulting group to display RGB. Lab fixtures
+produce approximately `(173,89,89)` and `(173,87,87)`; both wide-gamut XYZ
+fixtures produce `(0,140,0)`. Native, browser and GL samples match these expectations.
+The fourth device component and out-of-sRGB-gamut PCS values must survive.
+
+`synth-nested-clip-paints` intersects rectangular and diamond clips around
+consecutive fills and shading, then checks parent restoration with blue and
+magenta paints. Independent geometric samples distinguish a lost clip from
+ordinary antialiasing differences.
+
+GL custom callbacks use full-frame, top-left premultiplied pixels with CPU
+readback/upload. They support empty-child backdrop seeding, mixed CPU/GPU filter
+ordering, masks and transfer functions; they are not GPU-native arbitrary code.
+ICC LUT sources are supported in managed RGB groups, but LUT inverse transforms
+and four-component CMYK group blending remain outside this change.
+
+Fourteen targeted documents completed on native Raster, live Mesa llvmpipe GL
+and Chromium Canvas. Pixel expectations cover the LUT quadrants, luminosity and
+backdrop masks, nested clipping, and isolated/non-isolated knockout groups.
+The old CMYK lut8/lut16 fixtures also exposed a dense-gradient shader failure:
+balanced interval selection preserves all 129 stops and eliminates the black
+tail. Their 640 interior ramp samples match native within one channel value.
+Ten additional live EGL cases verify callback ordering, replacement/in-place
+arrays, premultiplication/orientation, empty seeding, transformed clips, masks,
+backdrop filters, shadow order and exception propagation. These are software
+Mesa checks, not physical-GPU verification.

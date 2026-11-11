@@ -407,6 +407,47 @@ let main _ =
         check "cyclic usecmap retains reachable mappings"
             (cyclic.IsVertical && Rbt.Pdf.Render.Fonts.cid cyclic 0x41 1 = 9))
 
+    test "CMYK ICC source PCS retains range and wide gamut" (fun () ->
+        // ICC lut16 u1.15 XYZ: the fourth input selects X=0 or X=1.5.
+        let offset, header, entries, channels = 144, 52, 2, 4
+        let size = offset + header + 2*(channels*entries + 16*3 + 3*entries)
+        let bytes = Array.zeroCreate<byte> size
+        let u16 p n = bytes.[p] <- byte (n >>> 8); bytes.[p+1] <- byte n
+        let u32 p n =
+            bytes.[p] <- byte (n >>> 24); bytes.[p+1] <- byte (n >>> 16)
+            bytes.[p+2] <- byte (n >>> 8); bytes.[p+3] <- byte n
+        let sigAt p (s: string) = for i in 0..3 do bytes.[p+i] <- byte s.[i]
+        u32 0 size; sigAt 12 "scnr"; sigAt 16 "CMYK"; sigAt 20 "XYZ "; sigAt 36 "acsp"
+        u32 128 1; sigAt 132 "A2B0"; u32 136 offset; u32 140 (size-offset)
+        sigAt offset "mft2"
+        bytes.[offset+8] <- 4uy; bytes.[offset+9] <- 3uy; bytes.[offset+10] <- 2uy
+        for i in 0..2 do u32 (offset+12+16*i) 65536
+        u16 (offset+48) 2; u16 (offset+50) 2
+        let mutable pos = offset+header
+        let sample n = u16 pos n; pos <- pos+2
+        for _ in 1..4 do sample 0; sample 65535
+        for corner in 0..15 do
+            sample (if corner &&& 1 = 1 then 49152 else 0)
+            sample 8192
+            sample 4096
+        for _ in 1..3 do sample 0; sample 65535
+        let doc = Pdf.openData (build normal onePage 1)
+        let range = [0.0;1.0;0.0;1.0;0.0;1.0;0.25;0.75] |> List.map PdfReal |> PdfArray
+        let stream = PdfStream (Map.ofList ["N", PdfInt 4L; "Range", range], bytes)
+        let spec = PdfArray [PdfName "ICCBased"; stream]
+        let space = Rbt.Pdf.Render.PdfColor.resolve doc PdfNull spec |> Option.get
+        check "LUT CMYK is not a blending space" (Rbt.Pdf.Render.PdfColor.tryWorkingSpace space |> Option.isNone)
+        let target: Rbt.Pdf.Render.PdfColor.WorkingSpace =
+            { IsDisplay = false; IsGray = false
+              ToPcs = fun r g b -> struct(r,g,b)
+              FromPcs = fun x y z -> struct(x/2.0,y,z) }
+        let convert k = Rbt.Pdf.Render.PdfColor.toWorkingRgb target space [|0.0;0.0;0.0;k|]
+        // Range clips K without rescaling: X=1.5*K, then target R=X/2.
+        let struct(r0,g0,b0) = convert 0.0
+        let struct(r1,g1,b1) = convert 1.0
+        check "ICC Range clips low fourth input" (r0 = 48uy && g0 = 64uy && b0 = 32uy)
+        check "ICC Range clips high fourth input without display clipping" (r1 = 143uy && g1 = 64uy && b1 = 32uy))
+
     test "ICC range bounds and image Decode preserve component values" (fun () ->
         let profile = Convert.FromBase64String("AAAAvAAAAAACIAAAc2NuckdSQVlYWVogAAAAAAAAAAAAAAAAYWNzcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACd3RwdAAAAJwAAAAUa1RSQwAAALAAAAAMWFlaIAAAAAAAAPbWAAEAAAAA0y1jdXJ2AAAAAAAAAAA=") |> text
         let profileObject = $"<</N 1 /Range [0.2 0.8] /Length {profile.Length}>>\nstream\n{profile}\nendstream"

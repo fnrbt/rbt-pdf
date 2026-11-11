@@ -581,6 +581,91 @@
       ],
       "description": "Isolated/nonisolated Multiply inside a bounded ICC luminosity mask over red BC, with and without inverse TR.",
       "expected": "Every quadrant has a 60-point inner square. Top-left center is near (255,239,239), top-right center white; both outside rings are near (255,176,176). Bottom-left center is near (255,16,16), bottom-right center red; both rings are near (255,79,79). BC and TR apply outside BBox too."
+    },
+    {
+      "id": "synth-icc-lut8-lab-managed-source",
+      "path": "generated/synth-icc-lut8-lab-managed-source.pdf",
+      "sha256": "a0441ae0528696391e41dcd9151feda3c83dae9c962df825c651bb88b4cd22c7",
+      "bytes": 4358,
+      "tags": [
+        "icc",
+        "lut",
+        "lab",
+        "transparency",
+        "image",
+        "shading",
+        "pattern"
+      ],
+      "description": "CMYK lut8 Lab source paints inside an Adobe RGB page blending space.",
+      "expected": "All four quadrants agree: neutral half-K source at 75 percent opacity over Adobe red. The fourth source component drives Lab lightness; vector, image, shading and pattern must use the same PCS conversion."
+    },
+    {
+      "id": "synth-icc-lut16-lab-managed-source",
+      "path": "generated/synth-icc-lut16-lab-managed-source.pdf",
+      "sha256": "048d54b4f2bec2ec0c147535a2b0ac5785505d215b1033eb9664797ee127a9a4",
+      "bytes": 2645,
+      "tags": [
+        "icc",
+        "lut",
+        "lab",
+        "transparency",
+        "image",
+        "shading",
+        "pattern"
+      ],
+      "description": "CMYK legacy lut16 Lab source paints inside an Adobe RGB page blending space.",
+      "expected": "All four quadrants agree, with the profile's slight warm Lab tint retained before Adobe-space compositing over red."
+    },
+    {
+      "id": "synth-icc-lut8-xyz-managed-source",
+      "path": "generated/synth-icc-lut8-xyz-managed-source.pdf",
+      "sha256": "7fc4d8385e7637fd2a03215d7d7bbc21421a24f634f7728fcd15e17f55cda77b",
+      "bytes": 4358,
+      "tags": [
+        "icc",
+        "lut",
+        "xyz",
+        "gamut",
+        "transparency",
+        "image",
+        "shading",
+        "pattern"
+      ],
+      "description": "CMYK lut8 XYZ wide-gamut source paints inside an Adobe RGB page.",
+      "expected": "All four quadrants agree: half-K attenuated Adobe green at 75 percent opacity over red. Source XYZ must not roundtrip through clipped sRGB before blending; independent profile-to-profile conversion supplies the color oracle."
+    },
+    {
+      "id": "synth-icc-lut16-xyz-managed-source",
+      "path": "generated/synth-icc-lut16-xyz-managed-source.pdf",
+      "sha256": "3e7474a706e6ff4524883552ea014a1e96eeec7759d1e23018cf563418127385",
+      "bytes": 2645,
+      "tags": [
+        "icc",
+        "lut",
+        "xyz",
+        "gamut",
+        "transparency",
+        "image",
+        "shading",
+        "pattern"
+      ],
+      "description": "CMYK lut16 XYZ wide-gamut source paints inside an Adobe RGB page.",
+      "expected": "All four quadrants agree with the higher precision version of lut8-xyz-managed-source, preserving out-of-sRGB gamut coordinates and the fourth input component."
+    },
+    {
+      "id": "synth-nested-clip-paints",
+      "path": "generated/synth-nested-clip-paints.pdf",
+      "sha256": "fbaa9e5ce134f9c2fffff911716cc0c003ef8f84b8a7c2ad7043b78e09a3b790",
+      "bytes": 1033,
+      "tags": [
+        "clip",
+        "nested",
+        "path",
+        "shading",
+        "graphics-state"
+      ],
+      "description": "A rectangular clip intersects a diamond clip across consecutive fills and a third shading clip; Q restores each parent.",
+      "expected": "A red-left/green-right diamond clipped to an inset square contains a cyan central region. A later blue bar spans the outer clip's top even outside the diamond; the final magenta strip lies outside all prior clips. Corners excluded by the diamond remain white."
     }
   ]
 }

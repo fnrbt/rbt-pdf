@@ -9,8 +9,8 @@
        Fable build uses carry their F# sources under fable/. -->
   <PropertyGroup>
     <RbtTextPackageVersion Condition="'$(RbtTextPackageVersion)' == ''">0.1.7</RbtTextPackageVersion>
-    <RbtRendererCorePackageVersion Condition="'$(RbtRendererCorePackageVersion)' == ''">0.1.8</RbtRendererCorePackageVersion>
-    <RbtRendererPackageVersion Condition="'$(RbtRendererPackageVersion)' == ''">0.1.8</RbtRendererPackageVersion>
-    <RbtImagePackageVersion Condition="'$(RbtImagePackageVersion)' == ''">0.1.2</RbtImagePackageVersion>
+    <RbtRendererCorePackageVersion Condition="'$(RbtRendererCorePackageVersion)' == ''">0.1.9</RbtRendererCorePackageVersion>
+    <RbtRendererPackageVersion Condition="'$(RbtRendererPackageVersion)' == ''">0.1.9</RbtRendererPackageVersion>
+    <RbtImagePackageVersion Condition="'$(RbtImagePackageVersion)' == ''">0.1.3</RbtImagePackageVersion>
   </PropertyGroup>
 </Project>

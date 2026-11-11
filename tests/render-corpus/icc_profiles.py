@@ -142,6 +142,30 @@ def cmyk_lut(bits):
     return profile('CMYK', 'Lab ', [('wtpt', xyz(*D50)), ('A2B0', bytes(tag))])
 
 
+def cmyk_xyz_lut(bits):
+    # Deliberately map C/M/Y to linear Adobe RGB primaries, attenuated by K.
+    # Green lies outside sRGB: converting through display RGB loses information.
+    tag = lut_header(b'mft1' if bits == 8 else b'mft2')
+    if bits == 16:
+        tag.extend(u16(2) + u16(2))
+    for _ in range(4):
+        tag.extend(bytes(range(256)) if bits == 8 else u16(0) + u16(65535))
+    primaries = ((.6097559, .3111242, .0194811),
+                 (.2052401, .6256560, .0608902),
+                 (.1492240, .0632197, .7448387))
+    scale = 128 if bits == 8 else 32768
+    for c in range(2):
+        for m in range(2):
+            for y in range(2):
+                for k in range(2):
+                    for axis in range(3):
+                        value = round((1-k) * sum(v*p[axis] for v, p in zip((c,m,y), primaries)) * scale)
+                        tag.extend(bytes((value,)) if bits == 8 else u16(value))
+    for _ in range(3):
+        tag.extend(bytes(range(256)) if bits == 8 else u16(0) + u16(65535))
+    return profile('CMYK', 'XYZ ', [('wtpt', xyz(*D50)), ('A2B0', bytes(tag))])
+
+
 def lcms_oracle(profiles, samples):
     libname = ctypes.util.find_library('lcms2')
     if not libname:

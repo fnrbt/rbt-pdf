@@ -447,6 +447,40 @@ def icc_luminosity_masks(boundary=False):
     return page(" ".join(commands), setup=setup, page_options="/MediaBox [0 0 200 200]")
 
 
+def icc_lut_source_blending(bits, xyz=False):
+    sample = (0, 255 if xyz else 0, 0, 128)
+    components = " ".join(str(v/255) for v in sample)
+    def setup(pdf):
+        source = pdf.stream("/N 4", icc_profiles.cmyk_xyz_lut(bits) if xyz else icc_profiles.cmyk_lut(bits))
+        working = pdf.stream("/N 3", icc_profiles.adobe_rgb())
+        colors = f"/ColorSpace << /Source [/ICCBased {source} 0 R] /Working [/ICCBased {working} 0 R] >>"
+        image = pdf.stream(f"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                           f"/ColorSpace [/ICCBased {source} 0 R] /BitsPerComponent 8", bytes(sample))
+        function = pdf.add(f"<< /FunctionType 2 /Domain [0 1] /C0 [{components}] /C1 [{components}] /N 1 >>")
+        shade = pdf.add(f"<< /ShadingType 2 /ColorSpace [/ICCBased {source} 0 R] "
+                        f"/Coords [0 0 100 0] /Function {function} 0 R /Extend [true true] >>")
+        pattern = pdf.stream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 "
+                             f"/BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << {colors} >>",
+                             f"/Source cs {components} sc 0 0 10 10 re f")
+        return (f"{colors} /XObject << /Im {image} 0 R >> /Shading << /Shade {shade} 0 R >> "
+                f"/Pattern << /Tile {pattern} 0 R >> /ExtGState << /Alpha << /ca 0.75 >> >>")
+    return page(
+        "/Working cs 1 0 0 sc 0 0 200 200 re f /Alpha gs "
+        f"/Source cs {components} sc 0 100 100 100 re f "
+        "q 100 0 0 100 100 100 cm /Im Do Q "
+        "q 0 0 100 100 re W n /Shade sh Q "
+        "/Pattern cs /Tile scn 100 0 100 100 re f",
+        setup=setup, page_options="/MediaBox [0 0 200 200] "
+        "/Group << /S /Transparency /CS /Working /I true >>")
+
+
+
+def nested_clip_paints(pdf):
+    function = pdf.add("<< /FunctionType 2 /Domain [0 1] /C0 [0 1 1] /C1 [0 1 1] /N 1 >>")
+    shade = pdf.add("<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [40 40 160 40] "
+                    f"/Function {function} 0 R /Extend [true true] >>")
+    return f"/Shading << /Cyan {shade} 0 R >>"
+
 def many_pages():
     pdf = PDF()
     catalog, pages = pdf.reserve(), pdf.reserve()
@@ -508,6 +542,11 @@ CASES = [
     dict(id="icc-inherited-nested-mask", tags=["icc", "transparency", "form", "inheritance", "soft-mask", "gamut"], description="Wide-gamut inherited fill provenance, nested nonisolated linear group and boundary alpha mask plus opacity.", expected="Top quadrants match near (0,192,0): inherited Adobe green must not be recovered from clipped sRGB. Bottom-left nested linear groups produce (188,0,188). Bottom-right applies half mask and half opacity exactly once over green, near (47,191,47).", factory=icc_inherited_nested_mask),
     dict(id="icc-luminosity-components", tags=["icc", "transparency", "soft-mask", "luminosity", "transfer"], description="Adobe RGB luminosity masks composite encoded components before conversion to XYZ Y.", expected="Top-left opaque half-gray, top-right isolated half-black over white BC, and bottom-left nonisolated half-black over white BC all yield pale red near (255,200,200), not (255,128,128). Bottom-right inverts the luminosity through TR and is near (255,55,55).", factory=icc_luminosity_masks),
     dict(id="icc-luminosity-backdrop", tags=["icc", "transparency", "soft-mask", "luminosity", "bbox", "isolation", "blend-mode"], description="Isolated/nonisolated Multiply inside a bounded ICC luminosity mask over red BC, with and without inverse TR.", expected="Every quadrant has a 60-point inner square. Top-left center is near (255,239,239), top-right center white; both outside rings are near (255,176,176). Bottom-left center is near (255,16,16), bottom-right center red; both rings are near (255,79,79). BC and TR apply outside BBox too.", factory=lambda: icc_luminosity_masks(True)),
+    dict(id="icc-lut8-lab-managed-source", tags=["icc", "lut", "lab", "transparency", "image", "shading", "pattern"], description="CMYK lut8 Lab source paints inside an Adobe RGB page blending space.", expected="All four quadrants agree: neutral half-K source at 75 percent opacity over Adobe red. The fourth source component drives Lab lightness; vector, image, shading and pattern must use the same PCS conversion.", factory=lambda: icc_lut_source_blending(8)),
+    dict(id="icc-lut16-lab-managed-source", tags=["icc", "lut", "lab", "transparency", "image", "shading", "pattern"], description="CMYK legacy lut16 Lab source paints inside an Adobe RGB page blending space.", expected="All four quadrants agree, with the profile's slight warm Lab tint retained before Adobe-space compositing over red.", factory=lambda: icc_lut_source_blending(16)),
+    dict(id="icc-lut8-xyz-managed-source", tags=["icc", "lut", "xyz", "gamut", "transparency", "image", "shading", "pattern"], description="CMYK lut8 XYZ wide-gamut source paints inside an Adobe RGB page.", expected="All four quadrants agree: half-K attenuated Adobe green at 75 percent opacity over red. Source XYZ must not roundtrip through clipped sRGB before blending; independent profile-to-profile conversion supplies the color oracle.", factory=lambda: icc_lut_source_blending(8, True)),
+    dict(id="icc-lut16-xyz-managed-source", tags=["icc", "lut", "xyz", "gamut", "transparency", "image", "shading", "pattern"], description="CMYK lut16 XYZ wide-gamut source paints inside an Adobe RGB page.", expected="All four quadrants agree with the higher precision version of lut8-xyz-managed-source, preserving out-of-sRGB gamut coordinates and the fourth input component.", factory=lambda: icc_lut_source_blending(16, True)),
+    dict(id="nested-clip-paints", tags=["clip", "nested", "path", "shading", "graphics-state"], description="A rectangular clip intersects a diamond clip across consecutive fills and a third shading clip; Q restores each parent.", expected="A red-left/green-right diamond clipped to an inset square contains a cyan central region. A later blue bar spans the outer clip's top even outside the diamond; the final magenta strip lies outside all prior clips. Corners excluded by the diamond remain white.", page_options="/MediaBox [0 0 200 200]", setup=nested_clip_paints, content="q 20 20 160 160 re W n q 100 10 m 190 100 l 100 190 l 10 100 l h W n 1 0 0 rg 0 0 200 200 re f 0 1 0 rg 100 0 100 200 re f q 40 40 120 120 re W n /Cyan sh Q Q 0 0 1 rg 20 160 160 20 re f Q 1 0 1 rg 0 0 15 200 re f"),
 ]
 
 
