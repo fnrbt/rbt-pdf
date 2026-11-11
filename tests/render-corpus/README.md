@@ -1,14 +1,14 @@
 # PDF rendering corpus
 
-The collection contains **65 PDFs (3,186,695 bytes)**: 30 Mozilla pdf.js
+The collection contains **71 PDFs (3,198,409 bytes)**: 30 Mozilla pdf.js
 fixtures pinned to commit `94a48f3c844d4677b264b6e7c0a1e239c245189f`,
-one PDF Association PDF 2.0 example, and 34 generated fixtures.
+one PDF Association PDF 2.0 example, and 40 generated fixtures.
 
 Coverage includes embedded/subset/Type 3/CID fonts, Arabic and CJK text,
 JPEG/JPEG2000/JBIG2, packed images and masks, transparency/blending,
 shading/patterns, Form XObjects and AcroForms, offset page boxes/rotation,
 text state and clipping, malformed streams, and multipage/performance cases.
-The collection has **586 pages**, including a generated 500-page document for
+The collection has **592 pages**, including a generated 500-page document for
 scrolling, zoom cancellation and offscreen canvas eviction checks.
 
 Two complementary sets:
@@ -223,6 +223,36 @@ black cell is not a successful-function oracle. See the
 [PDF Reference's Type 4 operator table](https://files.connorslade.com/Books/PDF%201.4%20Refrence/B-Operators_in_Type_4_Functions.pdf).
 Retain the earlier reference caveats for JPX alpha, knockout, vertical substitute
 glyphs and ICC Range. Unprofiled CMYK color, font substitution and antialiasing
-can differ from Poppler. ICC page-group blending remains in RGB rather than the
-declared profile space; sampled cubic interpolation and interactive form support
-remain outside this proof. See the renderer notes for the remaining limits.
+can differ from Poppler. The subsequent ICC/cubic pass below extends this proof;
+interactive form support remains outside it.
+
+## ICC blending and cubic sampled functions
+
+Six additional fixtures isolate linear-RGB and Adobe-RGB page blending across
+vector, image, shading and pattern paints; isolated and inherited nonisolated
+Form groups; source-color inheritance; group opacity and alpha masks; and
+one-/two-input cubic sampled functions. Nonisolated Form groups inherit their
+parent's blending space rather than declaring a different one.
+
+`icc_profiles.py` includes an independent LittleCMS oracle for the final group
+components: linear red/half-blue maps near `(188,0,187)`, while Adobe green with
+quarter-red maps near `(0,192,0)`. Converting and clipping each source to sRGB
+before blending gives the wrong answer. Poppler's output for these fixtures
+uses the unconverted group components, so it is not their color oracle.
+
+For cubic interpolation, [ISO 32000-1 §7.10.2](https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf)
+specifies Order 3 and fallback when Size is below four, but does not specify
+unique endpoint conditions. This implementation uses uniform Catmull–Rom with
+first/last secant tangents. The four-knot fixture's decoded midpoint is 0.9;
+linear interpolation gives 0.8, as observed in the Poppler reference. Numeric
+regressions cover endpoints, mixed cubic/linear dimensions, reversed Encode,
+Decode/Range clipping and invalid orders.
+
+Verification: all **25 affected PDFs / 25 pages** completed natively and in the
+actual Chromium worker. The four managed-color fixtures' interior samples match
+the independent expectations within two channel values; both cubic midpoints
+match the expected peak. Native regressions cover the group boundary, knockout,
+mask/opacity, exact `/255` packed source-over and DeviceGray mask compatibility.
+Shared Image ICC checks pass (51 checks). Contact sheets include the original
+Adobe-profile transparency and nonisolated gray-mask documents. GL compiled but
+was not exercised live; it explicitly rejects managed-color groups.

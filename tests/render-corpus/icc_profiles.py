@@ -80,6 +80,27 @@ def swapped_rgb():
     ])
 
 
+def linear_rgb():
+    return profile('RGB ', 'XYZ ', [
+        ('wtpt', xyz(*D50)), ('rXYZ', xyz(0.4361, 0.2225, 0.0139)),
+        ('gXYZ', xyz(0.3851, 0.7169, 0.0971)),
+        ('bXYZ', xyz(0.1431, 0.0606, 0.7141)),
+        ('rTRC', curve_linear()), ('gTRC', curve_linear()),
+        ('bTRC', curve_linear()),
+    ])
+
+
+def adobe_rgb():
+    # Adobe RGB (1998), D50-adapted primaries and the exact 563/256 TRC.
+    gamma = b'curv' + b'\0' * 4 + u32(1) + u16(563)
+    return profile('RGB ', 'XYZ ', [
+        ('wtpt', xyz(*D50)), ('rXYZ', xyz(0.6097559, 0.3111242, 0.0194811)),
+        ('gXYZ', xyz(0.2052401, 0.6256560, 0.0608902)),
+        ('bXYZ', xyz(0.1492240, 0.0632197, 0.7448387)),
+        ('rTRC', gamma), ('gTRC', gamma), ('bTRC', gamma),
+    ])
+
+
 def lut_header(kind):
     # Identity 3x3 matrix is ignored for CMYK input (4 channels).
     tag = bytearray(kind + b'\0' * 4 + bytes((4, 3, 2, 0)))
@@ -176,11 +197,14 @@ def main(directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     profiles = {'gray-linear': gray(), 'rgb-swapped': swapped_rgb(),
-                'cmyk-mft1': cmyk_lut(8), 'cmyk-mft2': cmyk_lut(16)}
+                'cmyk-mft1': cmyk_lut(8), 'cmyk-mft2': cmyk_lut(16),
+                'rgb-linear': linear_rgb(), 'rgb-adobe': adobe_rgb()}
     samples = {'gray-linear': [[0], [128], [255], [51], [204]],
                'rgb-swapped': [[255, 0, 0], [0, 255, 0], [0, 0, 255]],
                'cmyk-mft1': [[0, 0, 0, 0], [0, 0, 0, 128], [0, 0, 0, 255]],
-               'cmyk-mft2': [[0, 0, 0, 0], [0, 0, 0, 128], [0, 0, 0, 255]]}
+               'cmyk-mft2': [[0, 0, 0, 0], [0, 0, 0, 128], [0, 0, 0, 255]],
+               'rgb-linear': [[128, 0, 127]],
+               'rgb-adobe': [[64, 191, 0]]}
     for name, content in profiles.items():
         (directory / (name + '.icc')).write_bytes(content)
     # Malformed examples: invalid header size/signature and truncated tag payload.
@@ -202,7 +226,9 @@ def main(directory):
                   'Set /ColorSpace << /C [/ICCBased gray-linear-profile] >>; /C cs 0.5019607843 sc; fill and stroke should match same oracle sample.',
                   'Type 2 axial shading in /C with FunctionType 2, C0 [0], C1 [1], N 1; midpoint should be around sRGB 188, not 128.',
                   'Embed RGB-swapped ICC with 1x1 /Device samples [255 0 0] and graphic /C cs 1 0 0 sc; both must match independent rgb-swapped[0].',
-                  'Embed each CMYK mft1/mft2 with 1x1 sample [0 0 0 0], graphic /C cs 0 0 0 0 sc and 2-stop axial CMYK shading; compare endpoints to oracle.'
+                  'Embed each CMYK mft1/mft2 with 1x1 sample [0 0 0 0], graphic /C cs 0 0 0 0 sc and 2-stop axial CMYK shading; compare endpoints to oracle.',
+                  'rgb-linear[0] is the group-space red/half-blue composite for all four quadrants of synth-icc-page-linear-blend.',
+                  'rgb-adobe[0] is the group-space green/quarter-red composite for all four quadrants of synth-icc-page-wide-gamut-blend; never convert and clip each source to sRGB before blending.'
               ]}
     (directory / 'oracle.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))

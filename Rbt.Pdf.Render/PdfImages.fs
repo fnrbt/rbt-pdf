@@ -7,11 +7,9 @@ open Rbt.Renderer
 let private number = function PdfInt n -> float n | PdfReal n -> n | _ -> 0.0
 let private integer d k def = match Pdf.dictGet d k def |> Option.map (Pdf.deref d) with Some (PdfInt n) -> int n | Some (PdfReal n) -> int n | _ -> 0
 let private clamp x = max 0.0 (min 1.0 x)
-let private channel x = byte (int (clamp x * 255.0 + 0.5))
 let private count = PdfColor.components
 
 let private colorSpace doc resources obj = PdfColor.resolve doc resources obj
-let private rgb = PdfColor.toRgb
 
 let private filters doc obj =
     match Pdf.dictGet doc "Filter" obj |> Option.map (Pdf.deref doc) with
@@ -66,7 +64,7 @@ let private pack r g b a =
     Pixel.pack (mul b) (mul g) (mul r) a
 
 /// Decode an image XObject or an equivalent inline image stream into premultiplied pixels.
-let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) depth : (int * int * uint32[]) option =
+let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte)) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) depth : (int * int * uint32[]) option =
     if depth > 8 then None else
     let w, h = integer doc "Width" obj, integer doc "Height" obj
     let stencil = match Pdf.dictGet doc "ImageMask" obj |> Option.map (Pdf.deref doc) with Some (PdfBool true) -> true | _ -> false
@@ -143,8 +141,9 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (doc: PdfDo
                             let struct(r,g,b) =
                                 if space.IsNone && containerCS = Some 18 && colorCount = 3 then
                                     let y, cb, cr = values.[0], values.[1] - 0.5, values.[2] - 0.5
-                                    struct(channel (y + 1.402 * cr), channel (y - 0.344136 * cb - 0.714136 * cr), channel (y + 1.772 * cb))
-                                else rgb cs values
+                                    let rgbValues = [| clamp (y + 1.402 * cr); clamp (y - 0.344136 * cb - 0.714136 * cr); clamp (y + 1.772 * cb) |]
+                                    toTarget cs rgbValues
+                                else toTarget cs values
                             pixels.[i] <-
                                 if smask = 2 && matte.IsNone then
                                     Pixel.pack (min b alpha) (min g alpha) (min r alpha) alpha
@@ -180,7 +179,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (doc: PdfDo
                             let sample = float v / 255.0
                             values.[c] <- ranges.[2*c] + sample * (ranges.[2*c+1] - ranges.[2*c])
                         if not masked then
-                            let struct(r,g,b) = rgb cs values
+                            let struct(r,g,b) = toTarget cs values
                             pixels.[i] <- pack r g b 255uy
                     Some (pixels, None)
                 | _ -> None
@@ -188,7 +187,20 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (doc: PdfDo
             | _ ->
                 decodeJpeg bytes |> Option.bind (fun (dw, dh, pixels) ->
                     if dw <> w || dh <> h || pixels.Length < w*h then None
-                    else Some (Array.copy pixels, None))
+                    else
+                        let cs = Option.get (PdfColor.device 3)
+                        let values = Array.zeroCreate<float> 3
+                        let converted = Array.zeroCreate<uint32> (w*h)
+                        for i in 0 .. w*h-1 do
+                            let p = pixels.[i]
+                            let a = Pixel.a p
+                            if a <> 0uy then
+                                values.[0] <- float (Pixel.r p) / float a
+                                values.[1] <- float (Pixel.g p) / float a
+                                values.[2] <- float (Pixel.b p) / float a
+                                let struct(r,g,b) = toTarget cs values
+                                converted.[i] <- pack r g b a
+                        Some (converted, None))
         else
             match space with
             | None -> None
@@ -219,7 +231,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (doc: PdfDo
                             if stencil then
                                 if values.[0] < 0.5 then pixels.[y*w+x] <- pack fill.R fill.G fill.B fill.A
                             else
-                                let struct(r,g,b) = rgb cs values
+                                let struct(r,g,b) = toTarget cs values
                                 pixels.[y*w+x] <- pack r g b 255uy
                 Some (pixels, Some samples)
             | _ -> None
@@ -231,13 +243,13 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (doc: PdfDo
         let mutable maskDecoded = true
         match maskObj with
         | Some mask ->
-            match decode decodeJpeg doc resources mask (Color.rgba 255uy 255uy 255uy 255uy) (depth+1) with
+            match decode decodeJpeg PdfColor.toRgb doc resources mask (Color.rgba 255uy 255uy 255uy 255uy) (depth+1) with
             | Some (mw,mh,mp) ->
                 let isStencil = match Pdf.dictGet doc "ImageMask" mask |> Option.map (Pdf.deref doc) with Some (PdfBool true) -> true | _ -> false
                 let matte =
                     match space, (Pdf.dictGet doc "Matte" mask |> Option.map (Pdf.deref doc)) with
                     | Some cs, Some (PdfArray values) when values.Length >= count cs ->
-                        let struct(r,g,b) = rgb cs (values |> List.map (Pdf.deref doc >> number) |> List.toArray)
+                        let struct(r,g,b) = toTarget cs (values |> List.map (Pdf.deref doc >> number) |> List.toArray)
                         Some (r,g,b)
                     | _ -> None
                 for y in 0 .. h-1 do

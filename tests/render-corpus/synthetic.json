@@ -455,6 +455,100 @@
       ],
       "description": "Positive 0.3-unit strokes and zero-width hairlines under a 0.35 scale transform.",
       "expected": "Two labelled panels of horizontal black lines. Subpixel lines on the left have much less coverage than the one-device-pixel hairlines on the right; positive widths must not be promoted to hairlines."
+    },
+    {
+      "id": "synth-icc-page-linear-blend",
+      "path": "generated/synth-icc-page-linear-blend.pdf",
+      "sha256": "e2cb1e4fe64dd4fac0cba5fc425daf5c5ef5369a2e36fce73a5de2d570871927",
+      "bytes": 2041,
+      "tags": [
+        "icc",
+        "transparency",
+        "page-group",
+        "image",
+        "shading",
+        "pattern"
+      ],
+      "description": "Linear RGB page blending shared by vector, image, shading and tiling-pattern paints.",
+      "expected": "All four quadrants are the same bright purple near RGB (188,0,188), not sRGB-space (128,0,128). Red and half-alpha blue are blended before display conversion."
+    },
+    {
+      "id": "synth-icc-page-wide-gamut-blend",
+      "path": "generated/synth-icc-page-wide-gamut-blend.pdf",
+      "sha256": "b77c046adc6feb377970052266424402e8cc7997b6e04d24946010940a0f47bd",
+      "bytes": 2052,
+      "tags": [
+        "icc",
+        "transparency",
+        "page-group",
+        "image",
+        "shading",
+        "pattern",
+        "gamut"
+      ],
+      "description": "Adobe RGB page blends green with quarter-alpha red without clipping source paints to sRGB first.",
+      "expected": "All four quadrants agree near RGB (0,193,0), with no red contamination. The independent oracle converts the final Adobe RGB components (0.25,0.75,0), not separately clipped source colors."
+    },
+    {
+      "id": "synth-icc-form-blend-boundary",
+      "path": "generated/synth-icc-form-blend-boundary.pdf",
+      "sha256": "b99d2aa3ffc19577cafff4d1a215070aedcd7d71fdb8574218ea43133ea3b7e7",
+      "bytes": 2262,
+      "tags": [
+        "icc",
+        "transparency",
+        "form",
+        "isolation",
+        "blend-mode",
+        "opacity"
+      ],
+      "description": "Linear RGB isolated and non-isolated Forms return their source contribution to an sRGB parent before boundary opacity and Multiply.",
+      "expected": "Top quadrants both show bright purple near (188,0,188). Bottom-left is near (94,128,94): half that display-space purple over green. Bottom-right is near (0,128,0): half-opacity Multiply over green. Untouched parent pixels must not make a profile roundtrip."
+    },
+    {
+      "id": "synth-function-cubic-1d",
+      "path": "generated/synth-function-cubic-1d.pdf",
+      "sha256": "03ab8ad81685871accd11f66a586755994f4ec132f72790b96c93f58b8eba144",
+      "bytes": 920,
+      "tags": [
+        "shading",
+        "function",
+        "sampled",
+        "cubic"
+      ],
+      "description": "Order 3 four-knot grayscale interpolation with Decode headroom for cubic overshoot.",
+      "expected": "A grayscale hill from black through the 0.8-valued inner knots, peaking near 0.9 (RGB 230) at the center. Linear interpolation incorrectly gives a flat 0.8 plateau. Uses uniform Catmull-Rom with secant endpoint tangents."
+    },
+    {
+      "id": "synth-function-cubic-2d",
+      "path": "generated/synth-function-cubic-2d.pdf",
+      "sha256": "3b974d78241f49a0132f8f45e2c6027ec64b1d34196aaf4b5c9639e675303cb3",
+      "bytes": 960,
+      "tags": [
+        "shading",
+        "function",
+        "sampled",
+        "cubic",
+        "multidimensional"
+      ],
+      "description": "Tensor-product sampled function with cubic four-knot x and linear two-knot y.",
+      "expected": "Inside an inset square, red rises from zero at both sides to about 230 in the middle, while green rises linearly from bottom to top. The center is near RGB (230,128,0). Samples advance along x first."
+    },
+    {
+      "id": "synth-icc-inherited-nested-mask",
+      "path": "generated/synth-icc-inherited-nested-mask.pdf",
+      "sha256": "8ea3c2a184b6d1bd6945a0377c34d60313971fb9f03faab42757469fa437537c",
+      "bytes": 3479,
+      "tags": [
+        "icc",
+        "transparency",
+        "form",
+        "inheritance",
+        "soft-mask",
+        "gamut"
+      ],
+      "description": "Wide-gamut inherited fill provenance, nested nonisolated linear group and boundary alpha mask plus opacity.",
+      "expected": "Top quadrants match near (0,192,0): inherited Adobe green must not be recovered from clipped sRGB. Bottom-left nested linear groups produce (188,0,188). Bottom-right applies half mask and half opacity exactly once over green, near (47,191,47)."
     }
   ]
 }

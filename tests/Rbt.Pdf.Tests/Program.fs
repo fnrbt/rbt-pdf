@@ -120,7 +120,8 @@ let rec drawingEvents matrix clipped commands =
         | Group (m, _, children) ->
             yield! drawingEvents (Matrix3x2.multiply m matrix) clipped children
         | Clip (_, _, children) -> yield! drawingEvents matrix true children
-        | TransparencyGroup (_, _, _, _, _, children) ->
+        | TransparencyGroup (_, _, _, _, _, children)
+        | ColorManagedGroup (_, _, _, _, _, _, children) ->
             yield! drawingEvents matrix clipped children
         | FillPath (segments, _, _) | StrokePath (segments, _) ->
             yield "path", clipped, [ for seg in segments do
@@ -227,6 +228,62 @@ let main _ =
         let masked = TransparencyGroup (false, false, 0.5, Difference, Some halfMask, [paint (200,180,10)])
         draw (TransparencyGroup (false, false, 1.0, Normal, None, [paint (10,20,200); masked]))
         |> assertRgb "nested opacity and mask each apply once" (55,55,198))
+
+    test "packed blending preserves opaque alpha and rounds by 255" (fun () ->
+        let destination = Pixel.pack 21uy 90uy 201uy 255uy
+        let mutable exact = true
+        for alpha in 0 .. 255 do
+            let r, g, b = alpha, alpha/2, alpha/3
+            let pixel = Pixel.blend (Pixel.pack (byte b) (byte g) (byte r) (byte alpha)) destination
+            let expected source backdrop = source + (backdrop * (255-alpha) + 127)/255
+            exact <- exact && Pixel.a pixel = 255uy
+                     && int (Pixel.r pixel) = expected r 201
+                     && int (Pixel.g pixel) = expected g 90
+                     && int (Pixel.b pixel) = expected b 21
+        check "all source alpha values match scalar source-over" exact)
+
+    test "managed groups convert contributions before parent compositing" (fun () ->
+        let square = [MoveTo (vec2 0.0 0.0); LineTo (vec2 16.0 0.0); LineTo (vec2 16.0 16.0); LineTo (vec2 0.0 16.0); Close]
+        let paint color = FillPath (square, Solid color, NonZero)
+        let conversion =
+            { ToGroup = fun r g b -> struct(r*r, g*g, b*b)
+              ToParent = fun r g b -> struct(sqrt r, sqrt g, sqrt b) }
+        let children = [paint (Color.rgb 255uy 0uy 0uy); paint (Color.rgba 0uy 0uy 255uy 128uy)]
+        let draw command =
+            let backend = Raster.create ()
+            backend.Init 16 16
+            backend.Submit [Clear (Color.rgb 0uy 255uy 0uy); command]
+            let pixels = backend.Finish () |> Framebuffer.tryGetArray |> Option.get
+            pixels.[8*16+8]
+        let assertRgb label (r,g,b) pixel =
+            check label (abs (int (Pixel.r pixel)-r) <= 2 && abs (int (Pixel.g pixel)-g) <= 2
+                         && abs (int (Pixel.b pixel)-b) <= 2 && Pixel.a pixel = 255uy)
+        for isolated in [false;true] do
+            for knockout in [false;true] do
+                let expected = if knockout then (0,127,128) else (180,0,181)
+                draw (ColorManagedGroup(conversion, isolated, knockout, 1.0, Normal, None, children))
+                |> assertRgb $"managed isolation={isolated}, knockout={knockout}" expected
+        draw (ColorManagedGroup(conversion, true, false, 0.5, Normal, None, children))
+        |> assertRgb "group opacity composites encoded parent components" (90,128,90)
+        draw (ColorManagedGroup(conversion, true, false, 0.5, Multiply, None, children))
+        |> assertRgb "boundary Multiply uses parent space" (0,128,0)
+        let mask = [paint (Color.rgba 255uy 255uy 255uy 128uy)]
+        draw (ColorManagedGroup(conversion, true, false, 0.5, Normal, Some mask, children))
+        |> assertRgb "managed mask and opacity apply once" (45,191,45))
+
+    test "DeviceGray soft masks retain alpha and luminosity semantics" (fun () ->
+        for subtype, paint in ["Alpha", "/Half gs 1 g"; "Luminosity", "0.5 g"] do
+            let content = paint + " 0 0 100 100 re f"
+            let mask =
+                $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /CS /DeviceGray /I true>> "
+                + $"/Resources <</ExtGState <</Half <</ca 0.5>>>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+            let resources = $"/ExtGState <</M <</SMask <</S /{subtype} /G 5 0 R>>>>>>"
+            let pixels = renderFixture "/MediaBox [0 0 100 100]" "" resources [5,mask]
+                             "1 0 0 rg /M gs 0 0 100 100 re f" 1.0 |> rasterize
+            let pixel = pixels.[50*100+50]
+            check $"{subtype} DeviceGray mask composites half red over opaque white"
+                (Pixel.a pixel = 255uy && Pixel.r pixel = 255uy
+                 && abs (int (Pixel.g pixel)-128) <= 2 && abs (int (Pixel.b pixel)-128) <= 2))
 
     test "PDF DCT samples use Decode rather than standalone Adobe polarity" (fun () ->
         // One 8x8 MCU with constant CMYK samples (0,128,128,0), unit
@@ -445,7 +502,8 @@ let main _ =
             [ for command in commands do
                 match command with
                 | Group (_, _, children) | Clip (_, _, children)
-                | TransparencyGroup (_, _, _, _, _, children) -> yield! glyphIds children
+                | TransparencyGroup (_, _, _, _, _, children)
+                | ColorManagedGroup (_, _, _, _, _, _, children) -> yield! glyphIds children
                 | DrawGlyphs (_, runs, _) ->
                     for run in runs do
                         for glyph in run.Glyphs do yield glyph.GlyphId
@@ -532,7 +590,49 @@ let main _ =
             check $"sampled {bits}-bit interpolation and clipping" (near 0.0 (f -1.0) && near 0.5 (f 0.5) && near 1.0 (f 2.0))
         let f = resolve "/FunctionType 0 /Domain [0 1] /Range [0.2 0.8] /Size [2] /BitsPerSample 8 /Encode [1 0] /Decode [0 1]" (String [|char 0; char 255|]) |> Option.get
         check "sampled reversed Encode and range clipping" (near 0.8 (f 0.0) && near 0.5 (f 0.5) && near 0.2 (f 1.0))
-        check "sampled unsupported interpolation order rejected" ((resolve "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8 /Order 3" (String [|char 0; char 255|])).IsNone)
+        let cubicDict = "/FunctionType 0 /Domain [0 3] /Range [0 1] /Size [4] /BitsPerSample 8 /Order 3"
+        let cubic bytes = resolve cubicDict (bytes |> List.map char |> Array.ofList |> String) |> Option.get
+        let crest = cubic [0;255;255;0]
+        let trough = cubic [255;0;0;255]
+        // At the middle of two unit-height knots, Hermite tangents are
+        // +1/2 and -1/2: the unbounded value is 9/8 (or -1/8 inverted).
+        check "cubic overshoot clipped after interpolation"
+            (near 1.0 (crest 1.5) && near 0.0 (trough 1.5))
+        let crestUnclipped =
+            resolve "/FunctionType 0 /Domain [0 3] /Range [0 2] /Size [4] /BitsPerSample 8 /Order 3 /Decode [0 1]"
+                (String [|char 0; char 255; char 255; char 0|]) |> Option.get
+        check "cubic interpolates before output clipping" (near 1.125 (crestUnclipped 1.5))
+        let edge = cubic [0;255;0;0]
+        // First secant tangent = 1 and next centered tangent = 0,
+        // hence the first half-segment is 1/2 + 1/8 = 5/8.
+        check "cubic endpoint tangents and exact knots"
+            (near 0.0 (edge -1.0) && near 0.625 (edge 0.5)
+             && near 1.0 (edge 1.0) && near 0.0 (edge 3.0)
+             && near 0.0 (edge 4.0))
+        let rightEdge = cubic [0;0;255;0]
+        check "cubic right endpoint secant and exact knot"
+            (near 0.625 (rightEdge 2.5) && near 0.0 (rightEdge 3.0))
+        let reversedCubic =
+            resolve (cubicDict + " /Encode [3 0]") (String [|char 0; char 255; char 0; char 0|]) |> Option.get
+        check "cubic reversed Encode and clipped input"
+            (near 0.625 (reversedCubic 2.5) && near 0.0 (reversedCubic -1.0)
+             && near 0.0 (reversedCubic 4.0))
+        let decodedCubic =
+            resolve "/FunctionType 0 /Domain [0 3] /Range [0.25 0.75] /Size [4] /BitsPerSample 8 /Order 3 /Decode [0.2 0.8]"
+                (String [|char 0; char 255; char 255; char 0|]) |> Option.get
+        check "cubic Decode followed by Range clipping"
+            (near 0.25 (decodedCubic 0.0) && near 0.75 (decodedCubic 1.5))
+        for size, bytes, expected in
+            [1, [255], 1.0; 2, [0;255], 0.5; 3, [0;255;0], 0.5] do
+            let short =
+                resolve $"/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [{size}] /BitsPerSample 8 /Order 3"
+                    (bytes |> List.map char |> Array.ofList |> String) |> Option.get
+            check $"cubic Size {size} uses constant or linear interpolation"
+                (near expected (short (if size = 3 then 0.25 else 0.5)))
+        check "sampled unsupported interpolation orders rejected"
+            ([0;2;4;-1] |> List.forall (fun order ->
+                (resolve $"/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8 /Order {order}"
+                    (String [|char 0; char 255|])).IsNone))
         let decoded = resolve "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8 /Decode [1 0]" (String [|char 0; char 255|]) |> Option.get
         check "sampled reversed Decode" (near 1.0 (decoded 0.0) && near 0.25 (decoded 0.75) && near 0.0 (decoded 1.0))
         check "odd Encode rejected" ((resolve "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8 /Encode [0 1 2]" (String [|char 0; char 255|])).IsNone)
@@ -542,6 +642,30 @@ let main _ =
             ((sampled [|0.0;1.0|] [|0.0;1.0|] [|2|] 8 1 [|0.0;1.0;2.0|] [|0.0;1.0|] [|0uy;255uy|]).IsNone)
         check "sampled evaluator rejects odd Decode without indexing past end"
             ((sampled [|0.0;1.0|] [|0.0;1.0|] [|2|] 8 1 [|0.0;1.0|] [|0.0;1.0;2.0|] [|0uy;255uy|]).IsNone)
+        let paired =
+            sampled [|0.0;3.0|] [|0.0;2.0;-1.0;1.0|] [|4|] 8 3
+                [|0.0;3.0|] [|0.0;1.0;0.0;1.0|]
+                [|0uy;255uy;255uy;0uy;255uy;0uy;0uy;255uy|] |> Option.get
+        let pairedResult = [|0.0;0.0|]
+        check "cubic interleaved output components decode independently"
+            (paired [|1.5|] pairedResult && near 1.125 pairedResult.[0] && near -0.125 pairedResult.[1])
+        let mixedSamples = [|0uy;255uy;255uy;0uy;255uy;0uy;0uy;255uy|]
+        let mixed = sampled [|0.0;3.0;0.0;1.0|] [|0.0;1.0|] [|4;2|] 8 3
+                        [|0.0;3.0;0.0;1.0|] [|0.0;1.0|] mixedSamples |> Option.get
+        let mixedResult = [|0.0|]
+        // At x=3/2 the rows are 9/8 and -1/8; linear y=1/4 yields 13/16.
+        check "cubic tensor with short dimension and first-dimension-fast samples"
+            (mixed [|1.5;0.25|] mixedResult && near 0.8125 mixedResult.[0])
+        let grid = Array.zeroCreate<byte> 16
+        for y in 2 .. 3 do
+            for x in 1 .. 2 do
+                grid.[y * 4 + x] <- 255uy
+        let tensor = sampled [|0.0;3.0;0.0;3.0|] [|0.0;2.0|] [|4;4|] 8 3
+                        [|0.0;3.0;0.0;3.0|] [|0.0;1.0|] grid |> Option.get
+        let tensorResult = [|0.0|]
+        // Row x=3/2 gives 9/8, and y=3/2 between 0 and 1 gives 1/2.
+        check "cubic tensor interpolates in both dimensions"
+            (tensor [|1.5;1.5|] tensorResult && near 0.5625 tensorResult.[0])
         check "truncated samples rejected" ((resolve "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8" (String [|char 0|])).IsNone))
 
     test "calculator PDF transfer functions" (fun () ->

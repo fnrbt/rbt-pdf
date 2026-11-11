@@ -3,7 +3,7 @@
 Date: 2026-09-11. Ground truth: `pdftoppm -r 96`. Ours: headless Chromium screenshots + canvas pixel reads.
 
 Current reproducible corpus: [tests/render-corpus/README.md](tests/render-corpus/README.md).
-It contains 31 pinned upstream fixtures plus 34 generated feature cases, fetch
+It contains 31 pinned upstream fixtures plus 40 generated feature cases, fetch
 and generation scripts, and a native-versus-Poppler rendering driver. Its initial
 verification section records visual mismatches and a Poppler JPX crash; successful
 process exits must not be treated as visual passes.
@@ -98,11 +98,10 @@ matching the document widths. The original is now pinned in the corpus.
 
 ### Assets, packaging and remaining limits
 
-- Rbt.Image **0.1.1**, Rbt.Text **0.1.7**, and
-  Rbt.Renderer/Core/Canvas **0.1.6** are published. Fresh-cache registry-only
-  native regressions and the Fable package build pass. The earlier 0.1.5
-  missing-native-package incident was fixed in Forge; 0.1.6 published through
-  the normal protected tag actions.
+- Rbt.Image **0.1.2**, Rbt.Text **0.1.7**, and
+  Rbt.Renderer/Core/Canvas **0.1.7** are published through the normal protected
+  Forge tag actions. The earlier missing-native-package incident was fixed in
+  Forge; no manual rollout is needed for these library releases.
 - Codec ports retain Apache-2.0 attribution and the bundled PDF.js license.
   Adobe CMaps retain their upstream redistribution notices.
 - [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk/blob/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf)
@@ -114,9 +113,11 @@ matching the document widths. The original is now pinned in the corpus.
   cells; native options and the browser app provide their respective backends.
 - Shading functions support types 0/2/3/4, including two-input function-based
   shading type 1 with Domain, Matrix and BBox. Sampled functions support all legal
-  sample bit depths, linear interpolation, Encode/Decode and range clipping;
-  cubic `/Order 3` remains unsupported. Calculator functions use bounded parsing,
-  typed operands and reusable execution storage. Limits include eight sampled
+  sample bit depths, linear and cubic interpolation, Encode/Decode and range
+  clipping. Cubic `/Order 3` uses tensor-product uniform Catmull–Rom with secant
+  endpoint tangents; dimensions smaller than four samples fall back to linear.
+  Calculator functions use bounded parsing, typed operands and reusable execution
+  storage. Limits include eight sampled
   dimensions, one million grid points, 64 outputs, and a 1,024-entry calculator
   stack with 100,000 execution steps. Patch meshes still use fixed 16×16
   tessellation; shading/pattern surfaces are capped at four million pixels.
@@ -128,14 +129,16 @@ matching the document widths. The original is now pinned in the corpus.
 - The 36 bundled CMaps remain a selected subset. Vertical CID `W2`/`DW2`,
   inherited CMaps and mixed-width codes now have focused regressions.
 - Transparency supports the standard blend modes, isolated/non-isolated and
-  knockout groups, and alpha/luminosity soft masks. Form-group blending requires
-  DeviceRGB; other declared group color spaces and `AIS true` are rejected.
-  Page groups retain the existing RGB compositing path: an ICC page profile does
-  not select a profile-space compositor. Full ICC-space blending remains a gap.
-  Knockout shape extraction remains approximate for geometry-expanding filters,
-  text masks and intrinsic image alpha. GL rejects custom pixel filters; raster
-  and Canvas handle PDF soft masks. These checks are regression evidence, not
-  PDF conformance certification.
+  knockout groups, and alpha/luminosity soft masks. Page and Form groups support
+  DeviceRGB and invertible RGB matrix/TRC ICC blending spaces on Raster/Canvas.
+  Source paints retain their original components until conversion into the active
+  group space; profile conversion belongs to Image and compositing to Renderer.
+  LUT/CMYK group transforms, LUT ICC sources in non-display groups, managed
+  luminosity masks and `AIS true` remain explicitly unsupported. Managed alpha
+  masks and DeviceGray soft masks are supported. GL rejects color-managed groups
+  and custom pixel filters. Knockout shape extraction remains approximate for
+  geometry-expanding filters, text masks and intrinsic image alpha. These checks
+  are regression evidence, not PDF conformance certification.
 
 ## Open gaps (cause not positively identified — do not fix blind)
 
@@ -218,6 +221,23 @@ not universal latency or adversarial-resource bounds.
   packaged worker. Original Arabic text, PDF 2.0 spacing, transparency and dense
   Forms have targeted visual/pixel evidence. Completion alone is not conformance
   or pixel-perfect parity with Poppler.
+
+## ICC-space and cubic follow-up
+
+- RGB matrix/TRC page and Form groups now blend in their declared profile space.
+  Source color provenance survives Form inheritance; images, shadings and patterns
+  convert directly through Image's D50 PCS API into the active working space.
+  Renderer converts the group's contribution before parent-space blending,
+  opacity and masks. Display-only groups avoid identity color conversions.
+- Cubic sampled functions now have bounded tensor-product evaluation without
+  per-evaluation allocation. Small dimensions retain linear interpolation.
+- A new mask regression exposed packed blending's `/256` approximation; exact
+  rounded `/255` now preserves opaque destination alpha.
+- The corpus has 71 documents / 592 pages. All 25 affected native and Chromium
+  pages completed. Independent LittleCMS expectations match managed-color
+  interior samples within two channel values; numeric and visual checks cover
+  cubic peaks, wide-gamut inheritance, nested groups, masks and boundary opacity.
+  Shared Image's 51 ICC checks and the native PDF regression executable pass.
 
 ## Incidental (throwaway scripts, not product bugs)
 - Native PPM writer dropped the R-channel mask (`v >>> 16` without `&&& 0xFFu`),

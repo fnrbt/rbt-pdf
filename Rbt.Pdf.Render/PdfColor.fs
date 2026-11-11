@@ -13,8 +13,10 @@ type Space =
     | CalRgb of struct(float * float * float) * float[] * float[]
     | Lab of struct(float * float * float) * float[]
     | Icc of Icc.Profile * float[]
-    | Indexed of int * uint32[]
+    | Indexed of int * Space * float[][]
 let isIndexed = function Indexed _ -> true | _ -> false
+let isIcc = function Icc _ -> true | _ -> false
+let isDeviceGray = function Gray -> true | _ -> false
 let device = function 1 -> Some Gray | 3 -> Some Rgb | 4 -> Some Cmyk | _ -> None
 
 let components = function Gray | CalGray _ -> 1 | Rgb | CalRgb _ | Lab _ -> 3 | Cmyk -> 4 | Icc (p,_) -> Icc.components p | Indexed _ -> 1
@@ -33,7 +35,7 @@ let private bounded (limits: float[]) (values: float[]) i =
     max limits.[2*i] (min limits.[2*i+1] values.[i])
 let private iccComponent (limits: float[]) (values: float[]) i = clamp (bounded limits values i)
 
-let toRgb space (values: float[]) : struct(byte * byte * byte) =
+let rec toRgb space (values: float[]) : struct(byte * byte * byte) =
     if isNull values || values.Length < components space then invalidArg "values" "PDF color component count mismatch"
     let struct(r,g,b) =
         match space with
@@ -67,17 +69,90 @@ let toRgb space (values: float[]) : struct(byte * byte * byte) =
                 (if Icc.components profile > 1 then iccComponent limits values 1 else 0.0)
                 (if Icc.components profile > 2 then iccComponent limits values 2 else 0.0)
                 (if Icc.components profile > 3 then iccComponent limits values 3 else 0.0)
-        | Indexed (hi, palette) ->
+        | Indexed (hi, baseSpace, palette) ->
             let index = max 0 (min hi (int (values.[0]+0.5)))
-            let pixel = palette.[index]
-            struct(float ((pixel >>> 16) &&& 255u) / 255.0,
-                   float ((pixel >>> 8) &&& 255u) / 255.0,
-                   float (pixel &&& 255u) / 255.0)
+            let struct(r,g,b) = toRgb baseSpace palette.[index]
+            struct(float r / 255.0, float g / 255.0, float b / 255.0)
     struct(channel r,channel g,channel b)
 
 let toColor space (values: float[]) alpha =
     let struct(r,g,b) = toRgb space values
     Color.rgba r g b (channel alpha)
+
+/// A three-component encoded blending space with an unclipped D50 PCS.
+type WorkingSpace =
+    { IsDisplay: bool
+      IsGray: bool
+      ToPcs: float -> float -> float -> struct(float * float * float)
+      FromPcs: float -> float -> float -> struct(float * float * float) }
+
+let displaySpace =
+    { IsDisplay = true
+      IsGray = false
+      ToPcs = Icc.rgbToXyzD50
+      FromPcs = Icc.xyzD50ToRgb }
+
+// DeviceGray is represented by three identical channels in renderer surfaces.
+let deviceGraySpace =
+    let toPcs gray _ _ = Icc.rgbToXyzD50 gray gray gray
+    let fromPcs x y z =
+        let struct(r,g,b) = Icc.xyzD50ToRgb x y z
+        let gray = 0.30*r + 0.59*g + 0.11*b
+        struct(gray,gray,gray)
+    { IsDisplay = false; IsGray = true; ToPcs = toPcs; FromPcs = fromPcs }
+
+let tryWorkingSpace = function
+    | Rgb -> Some displaySpace
+    | Icc (profile, _) ->
+        match Icc.tryToPcs profile, Icc.tryFromPcs profile with
+        | Some forward, Some inverse -> Some { IsDisplay = false; IsGray = false; ToPcs = forward; FromPcs = inverse }
+        | _ -> None
+    | _ -> None
+
+let rec private toPcs space (values: float[]) =
+    match space with
+    | Gray -> let g = clamp values.[0] in Icc.rgbToXyzD50 g g g
+    | Rgb -> Icc.rgbToXyzD50 values.[0] values.[1] values.[2]
+    | Cmyk ->
+        let k = 1.0 - clamp values.[3]
+        Icc.rgbToXyzD50 ((1.0-clamp values.[0])*k) ((1.0-clamp values.[1])*k) ((1.0-clamp values.[2])*k)
+    | CalGray (white,gamma) ->
+        let gray = Math.Pow(clamp values.[0], gamma)
+        let struct(wx,wy,wz) = white
+        Icc.adaptXYZToD50 white (gray*wx) (gray*wy) (gray*wz)
+    | CalRgb (white,gamma,matrix) ->
+        let a = Math.Pow(clamp values.[0], gamma.[0])
+        let b = Math.Pow(clamp values.[1], gamma.[1])
+        let c = Math.Pow(clamp values.[2], gamma.[2])
+        Icc.adaptXYZToD50 white
+            (a*matrix.[0]+b*matrix.[3]+c*matrix.[6])
+            (a*matrix.[1]+b*matrix.[4]+c*matrix.[7])
+            (a*matrix.[2]+b*matrix.[5]+c*matrix.[8])
+    | Lab (white,limits) ->
+        let struct(x,y,z) = Icc.labToXyz white (bounded limits values 0) (bounded limits values 1) (bounded limits values 2)
+        Icc.adaptXYZToD50 white x y z
+    | Icc (profile,limits) ->
+        match Icc.tryToPcs profile with
+        | Some forward when Icc.components profile = 3 ->
+            forward (iccComponent limits values 0) (iccComponent limits values 1) (iccComponent limits values 2)
+        | Some forward when Icc.components profile = 1 -> forward (iccComponent limits values 0) 0.0 0.0
+        | _ -> invalidOp "Unsupported source ICC PCS transform for transparency blending"
+    | Indexed (hi,baseSpace,palette) ->
+        let index = max 0 (min hi (int (values.[0]+0.5)))
+        toPcs baseSpace palette.[index]
+
+/// Convert before quantization, without routing an out-of-gamut source through sRGB.
+let toWorkingRgb (target: WorkingSpace) space (values: float[]) =
+    if isNull values || values.Length < components space then invalidArg "values" "PDF color component count mismatch"
+    if target.IsDisplay then toRgb space values
+    elif target.IsGray then
+        let struct(r,g,b) = toRgb space values
+        let gray = channel (0.30 * float r / 255.0 + 0.59 * float g / 255.0 + 0.11 * float b / 255.0)
+        struct(gray,gray,gray)
+    else
+        let struct(x,y,z) = toPcs space values
+        let struct(r,g,b) = target.FromPcs x y z
+        struct(channel r, channel g, channel b)
 
 /// Resolve PDF resource names, ICC stream Alternate and Indexed lookup tables.
 /// Unsupported ICC data uses its declared Alternate, or the PDF default Device
@@ -120,12 +195,10 @@ let resolve (doc: PdfDocument) (resources: PdfObj) (colorSpace: PdfObj) : Space 
                         else
                             let limits = bounds baseSpace
                             let palette = Array.init (int hi+1) (fun index ->
-                                let values = Array.init n (fun i ->
+                                Array.init n (fun i ->
                                     let t = float bytes.[index*n+i]/255.0
-                                    limits.[2*i] + t*(limits.[2*i+1]-limits.[2*i]))
-                                let struct(r,g,b) = toRgb baseSpace values
-                                (uint32 r <<< 16) ||| (uint32 g <<< 8) ||| uint32 b)
-                            Some (Indexed(int hi,palette)))
+                                    limits.[2*i] + t*(limits.[2*i+1]-limits.[2*i])))
+                            Some (Indexed(int hi,baseSpace,palette)))
                 | _ -> None
             | PdfName "ICCBased", profile :: _ ->
                 let n = Pdf.dictGet doc "N" profile |> Option.bind (Pdf.deref doc >> number)
