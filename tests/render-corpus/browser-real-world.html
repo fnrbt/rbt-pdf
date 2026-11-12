@@ -20,7 +20,7 @@
 const NativeWorker = window.Worker;
 const nativeClose = ImageBitmap.prototype.close;
 const stats = { created: 0, terminated: 0, active: 0, requested: 0, rendered: 0, closed: 0,
-                errors: [], workers: [], timeline: [], peakPending: 0, invisibleRequests: 0 };
+                errors: [], workers: [], timeline: [], peakPending: 0, invisibleRequests: 0, responses: new Map() };
 ImageBitmap.prototype.close = function () {
   const result = nativeClose.call(this);
   stats.closed++;
@@ -54,6 +54,8 @@ window.Worker = class extends NativeWorker {
                            width: data.width, height: data.height, at: now(), postedAt: request?.at };
         this.profile.responses.set(data.page, response);
         if (this.profile.responses.size > 32) this.profile.responses.delete(this.profile.responses.keys().next().value);
+        stats.responses.set(data.page, response);
+        if (stats.responses.size > 32) stats.responses.delete(stats.responses.keys().next().value);
         stats.rendered++;
       }
       if (data.kind === 'error') {
@@ -135,6 +137,7 @@ function dispose() {
   return now() - start;
 }
 async function open(bytes, ms) {
+  stats.responses.clear();
   const start = now();
   const previousWorkers = stats.workers.length;
   const task = openPdf(container, bytes, assets);
@@ -172,6 +175,7 @@ function imageEvidence(canvas) {
   thumbnail.width = 0; thumbnail.height = 0;
   return { samplePixels, thumbnailInkPixels: inkPixels, thumbnailAlphaSum: alphaSum };
 }
+function activeWorker() { return stats.workers.findLast(w => !w.profile.terminated); }
 async function visit(number, worker, ms, label) {
   const start = now();
   viewer.scrollToPage(number);
@@ -179,10 +183,10 @@ async function visit(number, worker, ms, label) {
   page.scrollIntoView({ behavior: 'instant', block: 'start' });
   const scale = viewer.zoom * dpr();
   const matched = await until(() => {
-    const failure = worker.profile.failures.get(number);
+    const failure = activeWorker()?.profile.failures.get(number);
     if (failure && Math.abs(failure.scale - scale) < 1e-8)
       throw new Error(`${label}: page ${number} worker render failed: ${failure.message}`);
-    const result = worker.profile.responses.get(number);
+    const result = stats.responses.get(number);
     const canvas = page.querySelector('canvas'), layer = page.querySelector('.text-layer');
     if (!shown(page) || !result || Math.abs(result.scale - scale) > 1e-8 || !canvas || !layer ||
         !canvas.width || !canvas.height || canvas.width !== result.width || canvas.height !== result.height) return null;
@@ -204,9 +208,13 @@ function counters() {
 }
 async function profileDocument(spec, timeoutMs) {
   const report = { id: spec.id, url: spec.url, requestedPages: spec.pages, stages: [], samples: [],
-    errors: [], countersBefore: counters(), dpr: dpr() };
+    errors: [], countersBefore: counters(), dpr: dpr(), interruptDelayMs: spec.interruptDelayMs ?? 0 };
   const start = now();
   let bytes, worker, failurePage = null;
+  const allowWork = async worker => {
+    if (report.interruptDelayMs) await new Promise(resolve => setTimeout(resolve, report.interruptDelayMs));
+    if (!worker.profile.pending.size) throw new Error('render finished before interruption probe');
+  };
   try {
     const fetchStart = now();
     bytes = await fetchDocument(new URL(spec.url, location.href), timeoutMs);
@@ -249,19 +257,45 @@ async function profileDocument(spec, timeoutMs) {
     viewer.setZoom(1.6);
     viewer.scrollToPage(succeeded[0]);
     pageFor(succeeded[0]).scrollIntoView({ behavior: 'instant', block: 'start' });
-    await until(() => worker.profile.pending.size > 0, 'render request before zoom cancellation', timeoutMs);
-    const pendingAtZoom = worker.profile.pending.size, deliveredBeforeZoom = stats.rendered;
+    worker = await until(() => {
+      const active = activeWorker();
+      return active?.profile.pending.size > 0 ? active : null;
+    }, 'render request before zoom cancellation', timeoutMs);
+    await allowWork(worker);
+    const pendingAtZoom = worker.profile.pending.size, deliveredBeforeZoom = stats.rendered, zoomAt = now();
     for (const z of [0.9, 1.1, 1.25]) viewer.setZoom(z);
+    if (!worker.profile.terminated) throw new Error('zoom did not terminate obsolete render worker');
     failurePage = succeeded[0];
-    report.zoomPending = { pendingAtZoom, ...(await visit(succeeded[0], worker, timeoutMs, 'zoom during pending render')),
+    report.zoomPending = { pendingAtZoom, oldWorkerTerminated: worker.profile.terminated,
+      terminationDelayMs: worker.profile.terminatedAt - zoomAt,
+      ...(await visit(succeeded[0], worker, timeoutMs, 'zoom during pending render')),
       deliveredDuringZoom: stats.rendered - deliveredBeforeZoom };
     report.samples.push({ label: 'after pending zoom', ...snapshot() });
-    // Make work pending before replacement; termination discards requests, not
-    // guaranteed to preempt synchronous worker execution already in progress.
+    if (last !== succeeded[0]) {
+      viewer.setZoom(1.45);
+      viewer.scrollToPage(succeeded[0]);
+      pageFor(succeeded[0]).scrollIntoView({ behavior: 'instant', block: 'start' });
+      worker = await until(() => {
+        const active = activeWorker();
+        return active && [...active.profile.pending.values()].some(r => r.page === succeeded[0]) ? active : null;
+      }, 'render request before scroll cancellation', timeoutMs);
+      await allowWork(worker);
+      const pendingAtScroll = worker.profile.pending.size, scrollAt = now();
+      viewer.scrollToPage(last);
+      pageFor(last).scrollIntoView({ behavior: 'instant', block: 'start' });
+      await until(() => worker.profile.terminated, 'offscreen render worker terminated', timeoutMs);
+      report.scrollPending = { pendingAtScroll, oldWorkerTerminated: true,
+        terminationDelayMs: worker.profile.terminatedAt - scrollAt,
+        ...(await visit(last, worker, timeoutMs, 'scroll during pending render')) };
+    }
+    // Replace while a real worker render is outstanding.
     viewer.setZoom(1.5);
     viewer.scrollToPage(succeeded[0]);
     pageFor(succeeded[0]).scrollIntoView({ behavior: 'instant', block: 'start' });
-    await until(() => worker.profile.pending.size > 0, 'render request before replacement', timeoutMs);
+    worker = await until(() => {
+      const active = activeWorker();
+      return active?.profile.pending.size > 0 ? active : null;
+    }, 'render request before replacement', timeoutMs);
     const pendingBeforeReplace = worker.profile.pending.size;
     const replaceStart = now();
     const replacement = await open(bytes, timeoutMs);
@@ -274,7 +308,10 @@ async function profileDocument(spec, timeoutMs) {
     viewer.setZoom(1.75);
     viewer.scrollToPage(succeeded[0]);
     pageFor(succeeded[0]).scrollIntoView({ behavior: 'instant', block: 'start' });
-    await until(() => worker.profile.pending.size > 0, 'render request before dispose', timeoutMs);
+    worker = await until(() => {
+      const active = activeWorker();
+      return active?.profile.pending.size > 0 ? active : null;
+    }, 'render request before dispose', timeoutMs);
     const pendingBeforeDispose = worker.profile.pending.size;
     report.disposal = { pendingBeforeDispose, elapsedMs: dispose(), oldWorkerTerminated: worker.profile.terminated };
     await frame();
@@ -291,6 +328,7 @@ async function profileDocument(spec, timeoutMs) {
     report.recentRequests = stats.timeline.slice(-32).map(({ id, page, scale, visible }) => ({ id,page,scale,visible }));
     // Only small plain observations survive a document; not worker instances.
     stats.workers.length = 0;
+    stats.responses.clear();
     stats.timeline.length = 0;
     stats.errors.length = 0;
   }

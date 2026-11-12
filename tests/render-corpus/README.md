@@ -709,9 +709,9 @@ All **500 distinct pages** passed. All **562 delivered bitmaps** were closed;
 Disposal left no page/layer nodes or canvas backing bytes.
 
 These are scoped canvas/DOM/lifecycle measurements, not a total browser-memory
-bound. Heap telemetry may be shared with other tabs. Stale zoom results are
-discarded; document replacement/disposal terminates workers. The check does not
-claim that zoom interrupts synchronous rendering already executing in a worker.
+bound. Heap telemetry may be shared with other tabs. In that release, stale zoom
+results were discarded and document replacement/disposal terminated workers;
+zoom did not interrupt synchronous rendering already executing in a worker.
 Evidence: `results/browser-stress/baseline-0.1.17-bitmap.json` and
 `results/browser-stress/source-verified.json`.
 
@@ -814,3 +814,122 @@ full-canvas pixel hashes and text lengths match. The reduction is 42.1%.
 This is worker backing storage, not total browser memory or byte-for-byte
 attribution to JPEG buffers. No timing inference is drawn from this experiment.
 Evidence: `results/real-world/jpeg-retained-memory-ab.json`.
+
+## Image profiling and render interruption (0.1.19)
+
+Build and serve browser checks without caching rebuilt JavaScript:
+
+```sh
+pnpm run build
+python3 tests/render-corpus/serve.py
+```
+
+Open `http://127.0.0.1:8774/tests/render-corpus/browser-stress.html` or
+`browser-real-world.html`. The server binds loopback and sends `Cache-Control:
+no-store`. If an earlier server cached the same origin, clear its cache or select
+a fresh port. During this investigation, the normal Python HTTP server let
+Chromium reuse pre-build worker modules; those post-build observations were
+discarded and verification repeated on a fresh, uncached origin.
+
+Worker CPU profiling of Chinese GEM page 3 identified JPEG component conversion,
+JPEG decoding and checked array access as dominant costs. PDF JPEG `/Decode`
+values are now computed once for each of the 256 possible byte samples per
+component, using the same floating-point arithmetic. This is PDF interpretation,
+so the change stays in `PdfImages.fs`; shared image/renderer packages are unchanged.
+
+| Cold worker profile, page 3 at scale 1 | Duration |
+| --- | ---: |
+| Before | 20.52 s |
+| After | 19.18 s |
+
+Each observation is one worker profile, including final pixel hashing/capture,
+not a statistical benchmark or a pdf.js speed comparison. The complete 596×842
+RGBA output is identical: SHA-256
+`c14bc1b115b00f9b80a1597bd8d8158824dd4bb80aaff0c6fb31c40e7f22c465`.
+Profiles and captures are in `results/performance-next/chinese-p3-*`.
+
+Zoom now terminates a worker with an obsolete posted render. Scrolling does the
+same once the complete observer batch places its active page outside the
+requested visible/prefetch region. The next render lazily reopens the document.
+If reopening has not yet posted a render, newer zooms invalidate the old request
+without restarting that worker. Attempt and observer generations reject stale
+completions. A private snapshot preserves the document if callers reuse their
+input buffer; disposal releases it. This retains one additional PDF-sized
+main-thread copy, and actual worker termination loses its decode/font caches.
+
+The Chinese GEM workload used pages 3, 5 and 8 and allowed pending work to run
+for 200 ms before interruption (`interruptDelayMs: 200` on its document spec):
+
+| Interruption | Old-worker termination delay | Requested page installed |
+| --- | ---: | ---: |
+| Zoom while rendering page 3 | 0.1 ms | 20.12 s |
+| Distant scroll from page 3 to page 8 | 1.3 ms | 1.82 s |
+
+Termination timings measure the main-thread `terminate()` call, not an OS-thread
+exit acknowledgment. Page 3 still requires expensive fresh decoding after zoom;
+interruption removes obsolete work, not the cost of rendering the replacement.
+The workload had no errors, seven created/terminated workers and eight
+delivered/closed bitmaps. Disposal left no workers, pending requests, page/layer
+nodes or canvas backing bytes.
+
+The updated 500-page harness also passes after overwriting the caller's input
+buffer. It exercises zoom during reopening, disposal during reopening, existing
+navigation/replacement cases and exact page-number/fill checks: 500 distinct
+pages, 14 created/terminated workers, 524 delivered/closed bitmaps, one peak
+pending render, no errors. Native regressions and the Fable build pass.
+Evidence: `results/performance-next/{verification,lifecycle,real-interruption}.json`.
+This pass does not recompare all corpus pages against Poppler.
+
+## Guarded browser JPEG decoding (0.1.19)
+
+The worker now prepares eligible JPEG XObjects with `createImageBitmap`, disabling
+browser orientation and color-space conversion. The bitmap is closed after its
+pixels enter the existing Canvas renderer; this is native decoding, not a
+zero-copy bitmap drawing path. `../rbt-image` supplies the reusable metadata-only
+`Jpeg.inspect`; PDF eligibility stays in `PdfImages.tryBrowserJpeg`, and no
+`rbt-renderer` changes are needed.
+
+Eligibility is intentionally conservative: a single DCT filter, matching JPEG/PDF
+dimensions, 8-bit DeviceRGB with ordinary YCbCr JPEG samples or DeviceGray, absent
+or identity `/Decode`, and no image masks, explicit decode parameters, color-space
+overrides, EXIF or embedded ICC metadata. Ordinary no-ColorSpace RGB previews
+remain eligible. Unknown application metadata and metadata after the first scan
+decline the fast path. Named/calibrated/ICCBased/CMYK sources remain managed.
+RGB/gray pixels inside non-display working spaces still pass through the PDF
+color conversion, including the independent K plane of a CMYK group.
+
+Browser rejection, missing APIs, wrong dimensions or invalid cached pixels use
+the managed decoder. Preparation deduplicates stream identities and traverses
+Form resources, including inherited resources, without following cycles.
+Images not reached by preparation still render through the managed fallback.
+
+Measured in Chromium 156, with a fresh worker for each render:
+
+| Fixture | Before | Browser fast path |
+| --- | ---: | ---: |
+| 1600×1200 RGB JPEG, rendered at 800×600 | 1.924 s | 0.817 s |
+| Same JPEG without a PDF ColorSpace | 1.166 s | 0.823 s |
+| Same RGB image inside a CMYK group | 3.770 s | 3.129 s |
+
+These are single observations of the rendering pipeline, not codec-only or
+statistical benchmarks. The synthetic JPEG's automatically generated ICC marker
+was removed before both measurements to exercise profile-free eligibility.
+All ten fixture comparisons are pixel-identical, including progressive gray,
+inverted Decode, soft masks, explicit ColorTransform, EXIF/ICC after SOF and late
+EXIF. Each successful browser decode closes its bitmap. Forced browser rejection
+and an unavailable `createImageBitmap` also produce the exact managed pixels.
+
+Chinese GEM page 3 (68 CMYK JPEG tiles) and the Bhasha cover remain managed and
+match their previous pixels. The cover comparison uses the same white-background
+capture as the prior parity harness; the raw transparent capture is also retained.
+This fast path does not remove those documents' CMYK decoding cost.
+
+Native PDF regressions, 2,701 shared codec checks and the Fable build pass.
+Evidence and inputs: `results/browser-jpeg/{before,after,fallbacks,real-pages,verification}.json`
+and adjacent PDFs/PNGs. This is targeted verification, not another full-corpus
+Poppler comparison.
+
+This release uses the published **Rbt.Image 0.1.7** metadata API. Image was
+published first through Forge; an isolated, no-HTTP-cache NuGet restore verified
+the registry artifact and its source commit
+`8f8b5e364916c407f31eb527e5d6d6425aebcac8`, without the locally packed candidate.

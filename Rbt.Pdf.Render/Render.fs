@@ -174,7 +174,7 @@ type RenderOptions =
       CjkFont: Lazy<Text.FontData option>
       /// Predefined PDF CMaps, keyed by their exact resource names.
       CMaps: Map<string, byte[]>
-      /// JPEG (DCTDecode) raw stream bytes -> (w, h, premultiplied BGRA uint32[]). None = skip image.
+      /// Eligible RGB/gray JPEG bytes -> (w, h, opaque BGRA pixels). None/invalid output uses managed PDF decoding.
       DecodeJpeg: byte[] -> (int * int * uint32[]) option
       /// Render a transparent pattern cell using the destination backend.
       Rasterize: int -> int -> Cmd list -> Framebuffer
@@ -744,7 +744,8 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                 | None -> ()
 
             let paintImage image =
-                match PdfImages.decode opts.DecodeJpeg toImageTarget (isFourChannel ()) doc currentResources
+                match PdfImages.decode opts.DecodeJpeg toImageTarget (isFourChannel ())
+                    (working |> Option.forall (fun space -> space.IsDisplay)) doc currentResources
                     image { (fillColor gs) with A = 255uy } gs.FillK 0 with
                 | Some (w, h, pixels, geometry, softImageMask, geometricMask, fourth) ->
                     let interpolate = Pdf.dictGet doc "Interpolate" image |> Option.map (Pdf.deref doc) = Some (PdfBool true)

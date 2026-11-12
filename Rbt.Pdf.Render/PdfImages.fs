@@ -3,6 +3,9 @@ module Rbt.Pdf.Render.PdfImages
 open System
 open Rbt.Pdf
 open Rbt.Renderer
+open Rbt.Image
+open Rbt.Image.Codecs
+open Rbt.Image.Formats
 
 let private number = function PdfInt n -> float n | PdfReal n -> n | _ -> 0.0
 let private integer d k def = match Pdf.dictGet d k def |> Option.map (Pdf.deref d) with Some (PdfInt n) -> int n | Some (PdfReal n) -> int n | _ -> 0
@@ -63,11 +66,67 @@ let private pack r g b a =
     let mul c = byte ((int c * int a + 127) / 255)
     Pixel.pack (mul b) (mul g) (mul r) a
 
+/// Browser pixels are safe only when the JPEG's color interpretation agrees
+/// with the PDF image dictionary. The no-ColorSpace RGB preview is intentional.
+let tryBrowserJpeg (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) : (byte[] * int * int) option =
+    let field key = Pdf.dictGet doc key obj
+    let present key = field key |> Option.isSome
+    let dimension key =
+        match field key |> Option.map (Pdf.deref doc) with
+        | Some (PdfInt value) when value > 0L && value <= int64 Int32.MaxValue -> Some (int value)
+        | _ -> None
+    let components, defaultName =
+        match field "ColorSpace" |> Option.map (Pdf.deref doc) with
+        | Some (PdfName "DeviceRGB") | None -> 3, "DefaultRGB"
+        | Some (PdfName "DeviceGray") -> 1, "DefaultGray"
+        | _ -> 0, ""
+    let identityDecode =
+        match field "Decode" |> Option.map (Pdf.deref doc) with
+        | None -> true
+        | Some (PdfArray values) when values.Length = components * 2 ->
+            values |> List.mapi (fun i v ->
+                match Pdf.deref doc v with
+                | PdfInt n -> float n = float (i % 2)
+                | PdfReal n -> n = float (i % 2)
+                | _ -> false) |> List.forall id
+        | _ -> false
+    let defaultUnchanged =
+        Pdf.dictGet doc "ColorSpace" resources
+        |> Option.bind (Pdf.dictGet doc defaultName)
+        |> Option.isNone
+    match Pdf.deref doc obj, dimension "Width", dimension "Height" with
+    | PdfStream (_, bytes), Some w, Some h
+        when components <> 0 && int64 w * int64 h <= 100000000L &&
+             (match field "Filter" |> Option.map (Pdf.deref doc) with
+              | Some (PdfName ("DCTDecode" | "DCT")) -> true
+              | Some (PdfArray [f]) ->
+                  match Pdf.deref doc f with PdfName ("DCTDecode" | "DCT") -> true | _ -> false
+              | _ -> false) &&
+             defaultUnchanged &&
+             (field "BitsPerComponent" |> Option.map (Pdf.deref doc) = Some (PdfInt 8L)) &&
+             identityDecode &&
+             not (List.exists present ["Mask"; "SMask"; "ImageMask"; "Matte"; "SMaskInData"]) &&
+             (match field "DecodeParms" |> Option.map (Pdf.deref doc) with
+              | None | Some PdfNull -> true
+              | Some (PdfArray [p]) -> Pdf.deref doc p = PdfNull
+              | _ -> false) ->
+        match Codec.run (fun () -> Jpeg.inspect bytes) with
+        | Ok header when header.Width = w && header.Height = h &&
+                         header.Components = components &&
+                         not header.HasExif && not header.HasIccProfile &&
+                         header.Orientation = 1 &&
+                         (if components = 3 then header.ColorTransform = 1 &&
+                                                  (header.AdobeTransform = -1 || header.AdobeTransform = 1)
+                          else header.ColorTransform = 0 && header.AdobeTransform = -1) ->
+            Some (bytes, w, h)
+        | _ -> None
+    | _ -> None
+
 /// The optional pixels retain geometric coverage before a soft image mask.
 /// A soft image mask contributes to shape only when the caller's AIS is true.
 /// The final optional plane stores premultiplied K as grayscale with matching
 /// alpha; PDF JPEG component samples reach it before any RGB conversion.
-let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte*byte)) (fourChannel: bool) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) (fillK: byte) depth : (int * int * uint32[] * uint32[] option * bool * bool * uint32[] option) option =
+let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte*byte)) (fourChannel: bool) (displayTarget: bool) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) (fillK: byte) depth : (int * int * uint32[] * uint32[] option * bool * bool * uint32[] option) option =
     if depth > 8 then None else
     let w, h = integer doc "Width" obj, integer doc "Height" obj
     let fourthPixels = if fourChannel then Some (lazy (Array.zeroCreate<uint32> (w*h))) else None
@@ -184,7 +243,35 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                 | Some (PdfInt n) -> Some (int n)
                 | Some (PdfReal n) -> Some (int n)
                 | _ -> None
-            match space with
+            let browserPixels =
+                match tryBrowserJpeg doc resources obj with
+                | Some (_, width, height) ->
+                    let gray = space |> Option.exists PdfColor.isDeviceGray
+                    let result = try decodeJpeg bytes with _ -> None
+                    match result with
+                    | Some (dw, dh, pixels) when dw = width && dh = height &&
+                                                 not (isNull pixels) && pixels.Length = w*h &&
+                                                 Array.forall (fun pixel ->
+                                                     Pixel.a pixel = 255uy &&
+                                                     (not gray || (Pixel.r pixel = Pixel.g pixel && Pixel.g pixel = Pixel.b pixel))) pixels ->
+                        if displayTarget && not fourChannel then Some pixels
+                        else
+                            let cs = space |> Option.defaultWith (fun () -> Option.get (PdfColor.device 3))
+                            let n = count cs
+                            let values = Array.zeroCreate<float> n
+                            let converted = Array.zeroCreate<uint32> (w*h)
+                            for i in 0 .. w*h-1 do
+                                let p = pixels.[i]
+                                values.[0] <- float (Pixel.r p) / 255.0
+                                if n = 3 then
+                                    values.[1] <- float (Pixel.g p) / 255.0
+                                    values.[2] <- float (Pixel.b p) / 255.0
+                                color converted i cs values 255uy
+                            Some converted
+                    | _ -> None
+                | None -> None
+            if browserPixels.IsSome then browserPixels else
+            (match space with
             | Some cs ->
                 let n = count cs
                 match ImageDecode.decodeComponents bytes transform with
@@ -193,21 +280,26 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                     let ranges = decodeArray doc obj n defaults
                     let pixels = Array.zeroCreate<uint32> (w*h)
                     let values = Array.zeroCreate<float> n
+                    // JPEG components are bytes, so each decoded component has
+                    // only 256 possible values. Preserve the exact Decode-array
+                    // arithmetic while moving it out of the per-pixel loop.
+                    let decodedSamples =
+                        Array.init (n * 256) (fun index ->
+                            let c, v = index / 256, index % 256
+                            let sample = float v / 255.0
+                            ranges.[2*c] + sample * (ranges.[2*c+1] - ranges.[2*c]))
                     for i in 0 .. w*h-1 do
                         let mutable masked = match key with Some k when k.Length = 2*n -> true | _ -> false
                         for c in 0 .. n-1 do
                             let v = int image.Data.[i*n+c]
                             match key with Some k when k.Length = 2*n && (v < k.[2*c] || v > k.[2*c+1]) -> masked <- false | _ -> ()
-                            // PDF's Decode array maps the DCT output samples, regardless of
-                            // Adobe JPEG polarity conventions used for standalone images.
-                            let sample = float v / 255.0
-                            values.[c] <- ranges.[2*c] + sample * (ranges.[2*c+1] - ranges.[2*c])
+                            values.[c] <- decodedSamples.[c*256+v]
                         if not masked then color pixels i cs values 255uy
                     Some pixels
                 | _ -> None
             | None when Pdf.dictGet doc "ColorSpace" obj |> Option.isSome -> None
             | _ ->
-                decodeJpeg bytes |> Option.bind (fun (dw, dh, pixels) ->
+                ImageDecode.decode bytes |> Option.bind (fun (dw, dh, pixels) ->
                     if dw <> w || dh <> h || pixels.Length < w*h then None
                     else
                         let cs = Option.get (PdfColor.device 3)
@@ -222,6 +314,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                                 values.[2] <- float (Pixel.b p) / float a
                                 color converted i cs values a
                         Some converted)
+            )
         else
             match space with
             | None -> None
@@ -270,7 +363,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
         | Some mask ->
             match decode decodeJpeg (fun cs values ->
                     let struct(r,g,b) = PdfColor.toRgb cs values
-                    struct(r,g,b,0uy)) false doc resources mask (Color.rgba 255uy 255uy 255uy 255uy) 0uy (depth+1) with
+                    struct(r,g,b,0uy)) false true doc resources mask (Color.rgba 255uy 255uy 255uy 255uy) 0uy (depth+1) with
             | Some (mw,mh,mp,_,_,_,_) ->
                 let isStencil = match Pdf.dictGet doc "ImageMask" mask |> Option.map (Pdf.deref doc) with Some (PdfBool true) -> true | _ -> false
                 let matte =

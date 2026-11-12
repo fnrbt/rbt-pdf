@@ -5,120 +5,84 @@ open Fable.Core.JsInterop
 open Rbt.Pdf
 open Rbt.Renderer.CanvasApi
 
-// ── JPEG decode cache ────────────────────────────────────
-// Keyed by raw byte[] identity (JS WeakMap — same array object from PdfStream each time).
-
+// Keyed by the original stream byte-array identity.
 let private jpegCache : obj = createWeakMap ()
 
-/// Synchronous JPEG cache lookup. Returns cached (w, h, premultiplied BGRA uint32[]) or None.
-/// Intended as the RenderOptions.DecodeJpeg function for web builds.
+/// Synchronous cache lookup, with the managed decoder as fallback.
 let decodeJpeg (data: byte[]) : (int * int * uint32[]) option =
     match weakMapTryGet<int * int * uint32[]> jpegCache data with
     | Some decoded -> Some decoded
     | None -> Rbt.Pdf.Render.ImageDecode.decode data
 
+[<Emit("createImageBitmap($0, {colorSpaceConversion: 'none', imageOrientation: 'none'})")>]
+let private createJpegBitmap (blob: Browser.Types.Blob) : JS.Promise<ImageBitmap> = jsNative
 
-/// Decode a JPEG blob via the browser, returning (w, h, premultiplied BGRA uint32[]).
-let private decodeJpegAsync (rawData: byte[]) : JS.Promise<unit> =
-    let blob = createBlob rawData "image/jpeg"
-    createImageBitmap blob
+let private decodeJpegAsync (rawData: byte[], width: int, height: int) : JS.Promise<unit> =
+    // Start in a promise callback so synchronous Blob/bitmap/canvas failures also fall back.
+    promiseReturn ()
+    |> promiseBind (fun () -> createJpegBitmap (createBlob rawData "image/jpeg"))
     |> promiseBind (fun bmp ->
-        let w = bmp.width
-        let h = bmp.height
-        let oc = createOffscreenCanvas w h
-        let ctx = getOffscreenContext2DReadFrequent oc
-        ctxDrawImageBitmap ctx bmp 0.0 0.0
-        bmp.close()
-        let pixels = Rbt.Renderer.CanvasImage.pixelsFromCanvas oc
-        weakMapSet<int * int * uint32[]> jpegCache rawData (w, h, pixels)
-        promiseReturn ()
-    )
-    |> promiseCatch (fun _err ->
-        // The synchronous managed decoder remains available when the browser rejects a JPEG.
-        promiseReturn ()
-    )
+        try
+            if bmp.width = width && bmp.height = height then
+                let canvas = createOffscreenCanvas width height
+                let ctx = getOffscreenContext2DReadFrequent canvas
+                ctxDrawImageBitmap ctx bmp 0.0 0.0
+                let pixels = Rbt.Renderer.CanvasImage.pixelsFromCanvas canvas
+                weakMapSet<int * int * uint32[]> jpegCache rawData (width, height, pixels)
+            promiseReturn ()
+        finally
+            bmp.close())
+    |> promiseCatch (fun _ -> promiseReturn ())
 
-// ── Prepare pre-pass ─────────────────────────────────────
-// Walk a page's XObject resources and pre-decode any DCTDecode images.
-
-let private getFilterName (doc: PdfDocument) (obj: PdfObj) : string =
-    match Pdf.dictGet doc "Filter" obj with
-    | Some (PdfName f) -> f
-    | Some (PdfArray (f :: _)) ->
-        match Pdf.deref doc f with
-        | PdfName n -> n
-        | _ -> ""
-    | _ -> ""
-
-let private isDCT (doc: PdfDocument) (obj: PdfObj) : bool =
-    let f = getFilterName doc obj
-    f = "DCTDecode" || f = "DCT"
-// PdfImages.decode uses the managed component decoder whenever ColorSpace is
-// declared. The browser's BGRA fallback is reached only when it is absent
-// (except image masks, whose stencil color space is supplied by the renderer).
-let private needsBrowserJpeg (doc: PdfDocument) (obj: PdfObj) =
-    Pdf.dictGet doc "ColorSpace" obj |> Option.isNone
-    && (match Pdf.dictGet doc "ImageMask" obj |> Option.map (Pdf.deref doc) with
-        | Some (PdfBool true) -> false
-        | _ -> true)
-
-let private collectDCTStreams (doc: PdfDocument) (resObj: PdfObj) : byte[] list =
-    let results = ResizeArray<byte[]>()
-    let visited = System.Collections.Generic.HashSet<int>()
-
+// Visit each form on the current path rather than globally: a form without resources
+// inherits its caller's resources, which may differ between invocations.
+let private collectDCTStreams (doc: PdfDocument) (resObj: PdfObj) : (byte[] * int * int) list =
+    let results = ResizeArray<byte[] * int * int>()
+    let seen : obj = createWeakMap ()
+    let active : obj = createWeakMap ()
     let rec walkResources (res: PdfObj) =
-        match Pdf.dictGet doc "XObject" res with
-        | Some xobjDictRef ->
-            match Pdf.deref doc xobjDictRef with
-            | PdfDict entries ->
-                for kv in entries do
-                    let xobj = Pdf.deref doc kv.Value
-                    // Track visited by object number to avoid infinite recursion
-                    let objNum =
-                        match kv.Value with
-                        | PdfIndirect (n, _) -> Some n
-                        | _ -> None
-                    let alreadyVisited =
-                        match objNum with
-                        | Some n -> not (visited.Add(n))
-                        | None -> false
-                    if not alreadyVisited then
-                        match Pdf.dictGet doc "Subtype" xobj with
-                        | Some (PdfName "Image") when isDCT doc xobj && needsBrowserJpeg doc xobj ->
-                            // Get the raw stream bytes (JPEG data)
-                            match Pdf.deref doc kv.Value with
-                            | PdfStream (_, raw) ->
-                                if not (weakMapHas jpegCache raw) then
-                                    results.Add(raw)
-                            | _ -> ()
-                        | Some (PdfName "Form") ->
-                            // Recurse into Form XObject resources
-                            match Pdf.dictGet doc "Resources" xobj with
-                            | Some formRes -> walkResources (Pdf.deref doc formRes)
+        match Pdf.dictGet doc "XObject" res |> Option.map (Pdf.deref doc) with
+        | Some (PdfDict entries) ->
+            for kv in entries do
+                let xobj = Pdf.deref doc kv.Value
+                match xobj with
+                | PdfStream (_, raw) ->
+                    match Pdf.dictGet doc "Subtype" xobj |> Option.map (Pdf.deref doc) with
+                    | Some (PdfName "Image") ->
+                        if not (weakMapHas seen raw) && not (weakMapHas jpegCache raw) then
+                            match Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc res xobj with
+                            | Some (bytes, w, h) ->
+                                weakMapSet<bool> seen bytes true
+                                results.Add(bytes, w, h)
                             | None -> ()
-                        | _ -> ()
-            | _ -> ()
-        | None -> ()
-
+                    | Some (PdfName "Form") ->
+                        if weakMapTryGet<bool> active raw <> Some true then
+                            weakMapSet<bool> active raw true
+                            try
+                                let formRes =
+                                    Pdf.dictGet doc "Resources" xobj
+                                    |> Option.map (Pdf.deref doc)
+                                    |> Option.defaultValue res
+                                walkResources formRes
+                            finally
+                                weakMapSet<bool> active raw false
+                    | _ -> ()
+                | _ -> ()
+        | _ -> ()
     walkResources (Pdf.deref doc resObj)
     results |> Seq.toList
 
-/// Async pre-pass: browser-decode only DCT images using PdfImages' no-ColorSpace fallback.
+/// Predecode eligible page and form JPEGs; rejected or failed decodes stay managed.
 let prepare (doc: PdfDocument) (pageNum: int) : JS.Promise<unit> =
     match Pdf.getPage doc pageNum with
     | None -> promiseReturn ()
     | Some pageRef ->
-        let resObj =
-            match Pdf.getPageInheritable doc pageRef "Resources" with
-            | Some r -> r
-            | None -> PdfNull
-        let rawStreams = collectDCTStreams doc resObj
-        if rawStreams.IsEmpty then
-            promiseReturn ()
+        let resources = Pdf.getPageInheritable doc pageRef "Resources" |> Option.defaultValue PdfNull
+        let streams = collectDCTStreams doc resources
+        if streams.IsEmpty then promiseReturn ()
         else
-            rawStreams
+            streams
             |> List.map decodeJpegAsync
             |> Array.ofList
             |> promiseAll
             |> promiseMap (fun _ -> ())
-

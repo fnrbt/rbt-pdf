@@ -35,7 +35,9 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
     // The worker executes page rendering synchronously; posting a queue of
     // prefetched pages only delays a newly visible page.
     let mutable activePage = 0
+    let mutable activeAttempt = 0
     let mutable observer : obj = null
+    let mutable observerVersion = 0
 
     let mutable pages =
         container.innerHTML <- ""
@@ -140,6 +142,8 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
                             let info = pages.[nextPage - 1]
                             if info.Gen <> generation then
                                 activePage <- nextPage
+                                activeAttempt <- activeAttempt + 1
+                                let attempt = activeAttempt
                                 let gen = generation
                                 let version = info.Version
                                 let dpr = devicePixelRatio ()
@@ -160,16 +164,28 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
                                 |> promiseCatch (fun err ->
                                     if not disposed then
                                         retry <- visiblePages.Contains(nextPage) && (gen <> generation || version <> info.Version)
-                                        emitJsExpr (nextPage, err) "console.error('PDF page', $0, 'render failed:', $1)"
+                                        if gen = generation && version = info.Version && visiblePages.Contains(nextPage) then
+                                            emitJsExpr (nextPage, err) "console.error('PDF page', $0, 'render failed:', $1)"
                                     promiseReturn ())
                                 |> promiseMap (fun () ->
-                                    activePage <- 0
-                                    if retry && not disposed && visiblePages.Contains(nextPage) && info.Gen <> generation then
-                                        pendingPages.Add(nextPage) |> ignore
-                                    scheduleRender ())
+                                    if activeAttempt = attempt then
+                                        activePage <- 0
+                                        if retry && not disposed && visiblePages.Contains(nextPage) && info.Gen <> generation then
+                                            pendingPages.Add(nextPage) |> ignore
+                                        scheduleRender ())
+                                |> promiseCatch (fun err ->
+                                    if not disposed then emitJsExpr err "console.error('PDF render scheduling failed:', $0)"
+                                    promiseReturn ())
                                 |> ignore
                             else scheduleRender ()
                         else scheduleRender ()) |> ignore
+
+    let cancelActive () =
+        if activePage <> 0 then
+            activeAttempt <- activeAttempt + 1
+            activePage <- 0
+            worker.CancelRender()
+            scheduleRender ()
 
     let observerCallback (entries: obj[]) =
         if not disposed then
@@ -190,12 +206,19 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
                         pendingPages.Remove(pageNum) |> ignore
                         evictPage idx
                 | _ -> ()
+            // Inspect the complete observer batch: a page can leave and re-enter
+            // before this callback finishes, in which case its render remains useful.
+            if activePage <> 0 && not (visiblePages.Contains activePage) then cancelActive ()
 
     let setupObserver () =
         if not (isNull observer) then
             emitJsExpr observer "$0.disconnect()"
         // Pre-render a viewport height before and after the visible region.
-        let obs = emitJsExpr observerCallback "new IntersectionObserver($0, { root: null, rootMargin: '100% 0px', threshold: 0 })"
+        observerVersion <- observerVersion + 1
+        let version = observerVersion
+        let callback (entries: obj[]) =
+            if version = observerVersion then observerCallback entries
+        let obs = emitJsExpr callback "new IntersectionObserver($0, { root: null, rootMargin: '100% 0px', threshold: 0 })"
         observer <- obs
         for info in pages do emitJsExpr (obs, info.Div) "$0.observe($1)"
 
@@ -207,6 +230,7 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
             generation <- generation + 1
             pendingPages.Clear()
             visiblePages.Clear()
+            cancelActive ()
             for i in 0 .. pageCount - 1 do
                 let info = pages.[i]
                 evictPage i

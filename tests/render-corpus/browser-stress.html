@@ -16,7 +16,7 @@
 // Observe the real worker protocol, without consuming or retaining transferred ImageBitmaps.
 const NativeWorker = window.Worker;
 const workers = { created: 0, terminated: 0, active: 0, opened: 0, requested: 0, rendered: 0,
-                  bitmapsClosed: 0, errors: [], peakPending: 0, instances: [], onRender: null };
+                  bitmapsClosed: 0, errors: [], peakPending: 0, instances: [], onRender: null, onOpen: null, responses: new Map() };
 const nativeBitmapClose = ImageBitmap.prototype.close;
 ImageBitmap.prototype.close = function () {
   const result = nativeBitmapClose.call(this);
@@ -27,15 +27,17 @@ window.Worker = class extends NativeWorker {
   constructor(url, options) {
     super(url, options);
     if (!String(url).includes('WorkerRuntime.js')) return;
-    this.stress = { pending: new Map(), responses: new Map(), terminated: false };
+    this.stress = { pending: new Map(), responses: new Map(), terminated: false, opened: false };
     workers.instances.push(this);
     workers.created++; workers.active++;
     this.addEventListener('message', ({ data }) => {
-      if (data.kind === 'opened') workers.opened++;
+      if (data.kind === 'opened') { workers.opened++; this.stress.opened = true; }
       if (data.kind === 'rendered') {
         const request = this.stress.pending.get(data.id);
         this.stress.responses.set(data.page, { scale: request?.scale, width: data.width, height: data.height });
         if (this.stress.responses.size > 32) this.stress.responses.delete(this.stress.responses.keys().next().value);
+        workers.responses.set(data.page, this.stress.responses.get(data.page));
+        if (workers.responses.size > 32) workers.responses.delete(workers.responses.keys().next().value);
         workers.rendered++;
       }
       if (data.kind === 'error') workers.errors.push(String(data.message));
@@ -46,6 +48,7 @@ window.Worker = class extends NativeWorker {
   }
   postMessage(message, transfer) {
     if (this.stress && message.kind === 'render') {
+      currentWorker = this;
       this.stress.pending.set(message.id, { page: message.page, scale: message.scale });
       workers.requested++;
       workers.peakPending = Math.max(workers.peakPending, this.stress.pending.size);
@@ -55,6 +58,11 @@ window.Worker = class extends NativeWorker {
       const notify = workers.onRender;
       workers.onRender = null;
       notify({ page: message.page, id: message.id, pending: this.stress.pending.size });
+    }
+    if (this.stress && message.kind === 'open' && workers.onOpen) {
+      const notify = workers.onOpen;
+      workers.onOpen = null;
+      notify(this);
     }
     return posted;
   }
@@ -90,6 +98,15 @@ function nextRender(action, timeoutMs) {
   });
   return result.finally(() => { clearTimeout(timer); workers.onRender = null; });
 }
+function nextOpen(action, timeoutMs) {
+  let timer;
+  const result = new Promise((resolve, reject) => {
+    workers.onOpen = resolve;
+    timer = setTimeout(() => { workers.onOpen = null; reject(new Error('worker reopen not posted')); }, timeoutMs);
+    action();
+  });
+  return result.finally(() => { clearTimeout(timer); workers.onOpen = null; });
+}
 
 function proxy() {
   const canvases = [...container.querySelectorAll('canvas')];
@@ -124,6 +141,7 @@ async function fetchFixture() {
   return new Uint8Array(await response.arrayBuffer());
 }
 function open(bytes) {
+  workers.responses.clear();
   currentWorker = null;
   const promise = openPdf(container, bytes, assetRoot.href);
   currentWorker = workers.instances.at(-1);
@@ -143,7 +161,7 @@ async function visit(number, timeoutMs) {
   const expectedText = `Page ${String(number).padStart(4, '0')}`;
   const expectedRgb = number % 2 ? [26, 77, 230] : [230, 51, 26];
   const result = await until(() => {
-    const response = currentWorker?.stress.responses.get(number);
+    const response = workers.responses.get(number);
     const canvas = page.querySelector('canvas');
     const layer = page.querySelector('.text-layer');
     if (!response || Math.abs(response.scale - scale) > 1e-9 || !canvas || !layer ||
@@ -176,7 +194,10 @@ async function run(options = {}) {
     let bytes;
     try {
       bytes = await fetchFixture();
-      const first = setViewer(await open(bytes));
+      // The caller owns this buffer and may reuse it once open completes.
+      const firstBytes = bytes.slice();
+      const first = setViewer(await open(firstBytes));
+      firstBytes.fill(0);
       if (first.pageCount !== 500) throw new Error(`expected 500 pages, got ${first.pageCount}`);
       report.scenarios.push({ name: 'opened', pages: first.pageCount });
       for (let number = 1; number <= 500; number++) {
@@ -207,13 +228,13 @@ async function run(options = {}) {
         first.setZoom(1.35);
       }, timeoutMs);
       const zoomPending = currentWorker.stress.pending.size;
+      const canceledWorker = currentWorker;
       for (const zoom of [0.8, 1.7, 1.1, 1.0]) first.setZoom(zoom);
+      if (!canceledWorker.stress.terminated) throw new Error('zoom did not terminate obsolete render worker');
       report.scenarios.push({ name: 'zoom during in-flight render', request: inFlightZoom,
                               pendingAtZoom: zoomPending, zoom: first.zoom, ...(await visit(400, timeoutMs)) });
       await capture('after in-flight zoom');
-      // Wait for an actual queued worker request, then replace before yielding
-      // another animation frame. Termination may discard work, not interrupt JS
-      // already executing synchronously inside the old worker.
+      // Wait for a real posted render, then replace before another animation frame.
       const inFlightReplacement = await nextRender(() => {
         first.scrollToPage(490);
         container.querySelector('[data-page="490"]').scrollIntoView({ behavior: 'instant', block: 'start' });
@@ -232,6 +253,18 @@ async function run(options = {}) {
       setViewer(await newOpening);
       report.scenarios.push({ name: 'replace while opening', oldResult, ...(await visit(500, timeoutMs)) });
       await capture('after replacements');
+      await nextRender(() => {
+        viewer.scrollToPage(200);
+        container.querySelector('[data-page="200"]').scrollIntoView({ behavior: 'instant', block: 'start' });
+        viewer.setZoom(1.3);
+      }, timeoutMs);
+      const reopening = await nextOpen(() => viewer.setZoom(1.4), timeoutMs);
+      if (reopening.stress.opened) throw new Error('reopen completed before cancellation scenario');
+      const workersBeforeBurst = workers.created;
+      for (const zoom of [0.8, 1.2, 1.0]) viewer.setZoom(zoom);
+      report.scenarios.push({ name: 'zoom while reopening', ...(await visit(200, timeoutMs)) });
+      if (workers.created !== workersBeforeBurst || reopening.stress.terminated)
+        throw new Error('unposted obsolete render restarted the opening worker');
       const inFlightDisposal = await nextRender(() => {
         viewer.scrollToPage(1);
         container.querySelector('[data-page="1"]').scrollIntoView({ behavior: 'instant', block: 'start' });
@@ -244,6 +277,14 @@ async function run(options = {}) {
                               pendingAtDisposal: disposalPending, ...proxy(),
                               pageNodes: container.querySelectorAll('.page').length });
       await capture('after disposal');
+      setViewer(await open(bytes));
+      await nextRender(() => viewer.setZoom(1.3), timeoutMs);
+      const disposedReopen = await nextOpen(() => viewer.setZoom(1.4), timeoutMs);
+      if (disposedReopen.stress.opened) throw new Error('reopen completed before disposal scenario');
+      dispose();
+      await frame();
+      report.scenarios.push({ name: 'dispose while reopening', workerTerminated: disposedReopen.stress.terminated, ...proxy() });
+      if (!disposedReopen.stress.terminated) throw new Error('opening worker survived disposal');
       if (workers.active !== 0 || container.querySelector('.page')) throw new Error('viewer/worker survived disposal');
       if (!oldResult.includes('superseded') && !oldResult.includes('disposed')) throw new Error(`unexpected superseded open: ${oldResult}`);
       if (workers.bitmapsClosed !== workers.rendered)

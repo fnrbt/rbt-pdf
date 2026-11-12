@@ -154,6 +154,21 @@ let renderPixels content =
     backend.Submit (Clear Color.white :: renderContent content)
     backend.Finish () |> Framebuffer.tryGetArray |> Option.get
 
+let rgbJpeg =
+    // 8x8 red JFIF/Y'CbCr JPEG with no embedded profile or orientation.
+    Convert.FromBase64String("/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjExLjEwMAD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABMAAEBAAAAAAAAAAAAAAAAAAAABgEBAQAAAAAAAAAAAAAAAAAABgcQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCAAIAAgDASIAAhEAAxEA/9oADAMBAAIRAxEAPwCLAE1/f//Z")
+let darkRgbJpeg =
+    // Constant dark RGB #336699, retaining a nonzero K when blended in CMYK.
+    Convert.FromBase64String("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUEBAMEBgUGBgYFBgYGBwkIBgcJBwYGCAsICQoKCgoKBggLDAsKDAkKCgr/2wBDAQICAgICAgUDAwUKBwYHCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgr/wAARCAAIAAgDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABwj/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCcwFEAd//Z")
+
+let grayJpeg =
+    // Single-component 8x8 JPEG: unit quantization, zero DC, AC EOB = gray 128.
+    Convert.FromBase64String("/9j/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAIAAgBAREA/8QAJgABAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAAPwA//9k=")
+
+let cmykJpeg =
+    // 8x8 constant CMYK (0,128,128,0) with Adobe APP14 transform zero.
+    Convert.FromBase64String("/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB/8AAFAgACAAIBAERAAIRAAMRAAQRAP/EACcAAAIAAAAAAAAAAAAAAAAAAAALEAEAAAAAAAAAAAAAAAAAAAAA/9oADgQBAAIAAwAEAAA/AF/4Bf8Av//Z")
+
 [<EntryPoint>]
 let main _ =
     test "baseline" (fun () -> assertHello "baseline" (build normal onePage 1))
@@ -914,7 +929,7 @@ let main _ =
     test "PDF DCT samples use Decode rather than standalone Adobe polarity" (fun () ->
         // One 8x8 MCU with constant CMYK samples (0,128,128,0), unit
         // quantization and DC-only blocks. APP14 declares transform zero.
-        let jpeg = Convert.FromBase64String("/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB/8AAFAgACAAIBAERAAIRAAMRAAQRAP/EACcAAAIAAAAAAAAAAAAAAAAAAAALEAEAAAAAAAAAAAAAAAAAAAAA/9oADgQBAAIAAwAEAAA/AF/4Bf8Av//Z")
+        let jpeg = cmykJpeg
         let unmarked = Array.append jpeg.[0..1] jpeg.[18..]
         for label, data, decode, black in
             [ "Adobe default", jpeg, "", false
@@ -931,6 +946,135 @@ let main _ =
                 (if black then Pixel.r pixel = 0uy && Pixel.g pixel = 0uy && Pixel.b pixel = 0uy
                  else Pixel.r pixel > 220uy && Pixel.g pixel > 80uy && Pixel.g pixel < 180uy
                       && Pixel.b pixel > 80uy && Pixel.b pixel < 180uy))
+
+    test "browser JPEG pixels apply only to eligible PDF RGB streams" (fun () ->
+        let doc = Pdf.openData (build normal onePage 1)
+        let image bytes extra =
+            PdfStream(Map.ofList
+                (["Width", PdfInt 8L; "Height", PdfInt 8L; "BitsPerComponent", PdfInt 8L
+                  "ColorSpace", PdfName "DeviceRGB"; "Filter", PdfName "DCTDecode"] @ extra), bytes)
+        let rgb = Rbt.Pdf.Render.ImageDecode.decodeComponents rgbJpeg None |> Option.get
+        let expected = Pixel.pack rgb.Data.[2] rgb.Data.[1] rgb.Data.[0] 255uy
+        let green = Pixel.pack 0uy 255uy 0uy 255uy
+        let cached = Array.create 64 green
+        let target space values =
+            let struct(r,g,b) = Rbt.Pdf.Render.PdfColor.toRgb space values
+            struct(r,g,b,0uy)
+        let render decoder display four convert obj =
+            Rbt.Pdf.Render.PdfImages.decode decoder convert four display doc PdfNull obj Color.black 0uy 0
+        let first decoder obj =
+            let _,_,pixels,_,_,_,_ = render decoder true false target obj |> Option.get
+            pixels.[0]
+        let eligible = image rgbJpeg []
+        check "ordinary RGB JPEG renders decoded RGB"
+            (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull eligible |> Option.isSome &&
+             first Rbt.Pdf.Render.ImageDecode.decode eligible = expected)
+        let identity =
+            image rgbJpeg ["Decode", PdfArray [for _ in 1..3 do yield PdfInt 0L; yield PdfInt 1L]]
+        check "identity Decode keeps the same decoded color"
+            (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull identity |> Option.isSome &&
+             first Rbt.Pdf.Render.ImageDecode.decode identity = expected)
+        let dark = image darkRgbJpeg []
+        let _,_,darkPixels = Rbt.Pdf.Render.ImageDecode.decode darkRgbJpeg |> Option.get
+        let source = darkPixels.[0]
+        let sourceSpace = Rbt.Pdf.Render.PdfColor.device 3 |> Option.get
+        let sourceValues =
+            [| float (Pixel.r source) / 255.0; float (Pixel.g source) / 255.0; float (Pixel.b source) / 255.0 |]
+        let struct(ec,em,ey,ek) =
+            Rbt.Pdf.Render.PdfColor.toWorkingCmyk Rbt.Pdf.Render.PdfColor.deviceCmykSpace sourceSpace sourceValues
+        let _,_,converted,_,_,_,fourth =
+            render Rbt.Pdf.Render.ImageDecode.decode false true
+                (Rbt.Pdf.Render.PdfColor.toWorkingCmyk Rbt.Pdf.Render.PdfColor.deviceCmykSpace) dark
+            |> Option.get
+        check "browser RGB enters CMYK working space with a distinct black plate"
+            (ec > 0uy && em > 0uy && ek > 0uy &&
+             converted.[0] = Pixel.pack ey em ec 255uy &&
+             (fourth |> Option.get).[0] = Pixel.pack ek ek ek 255uy)
+        let gray = image grayJpeg ["ColorSpace",PdfName "DeviceGray"]
+        let graySamples = Rbt.Pdf.Render.ImageDecode.decodeComponents grayJpeg None |> Option.get
+        let graySpace = Rbt.Pdf.Render.PdfColor.device 1 |> Option.get
+        let struct(gc,gm,gy,gk) =
+            Rbt.Pdf.Render.PdfColor.toWorkingCmyk Rbt.Pdf.Render.PdfColor.deviceCmykSpace
+                graySpace [|float graySamples.Data.[0] / 255.0|]
+        let _,_,grayPixels,_,_,_,grayK =
+            render Rbt.Pdf.Render.ImageDecode.decode false true
+                (Rbt.Pdf.Render.PdfColor.toWorkingCmyk Rbt.Pdf.Render.PdfColor.deviceCmykSpace) gray
+            |> Option.get
+        check "DeviceGray browser JPEG converts from one gray component to CMYK"
+            (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull gray |> Option.isSome &&
+             grayPixels.[0] = Pixel.pack gy gm gc 255uy &&
+             (grayK |> Option.get).[0] = Pixel.pack gk gk gk 255uy &&
+             gk > 0uy)
+        let _,_,wrongGray,_,_,_,wrongGrayK =
+            render (fun _ -> Some(8,8,cached)) false true
+                (Rbt.Pdf.Render.PdfColor.toWorkingCmyk Rbt.Pdf.Render.PdfColor.deviceCmykSpace) gray
+            |> Option.get
+        check "colored callback output for DeviceGray falls back to gray samples"
+            (wrongGray.[0] = grayPixels.[0] &&
+             (wrongGrayK |> Option.get).[0] = (grayK |> Option.get).[0])
+        for label, bad in
+            [ "missing cache", (fun _ -> None)
+              "wrong dimensions", (fun _ -> Some(7,8,cached))
+              "short pixel array", (fun _ -> Some(8,8,[|green|]))
+              "transparent JPEG pixel", (fun _ -> Some(8,8,Array.create 64 0u)) ] do
+            check $"{label} falls back to PDF component decoding"
+                (first bad eligible = expected)
+        let poison _ = Some(8,8,cached)
+        let noSpace =
+            match eligible with
+            | PdfStream (header, bytes) -> PdfStream (Map.remove "ColorSpace" header, bytes)
+            | _ -> failwith "Expected JPEG stream"
+        check "unmarked RGB JPEG retains its original no-ColorSpace preview"
+            (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull noSpace |> Option.isSome &&
+             first Rbt.Pdf.Render.ImageDecode.decode noSpace = expected)
+        let reversed =
+            image rgbJpeg ["Decode", PdfArray [for _ in 1..3 do yield PdfInt 1L; yield PdfInt 0L]]
+        let reversedPixel = first poison reversed
+        check "reversed Decode uses managed JPEG components, not cached RGB"
+            (reversedPixel = Pixel.pack (255uy-rgb.Data.[2]) (255uy-rgb.Data.[1]) (255uy-rgb.Data.[0]) 255uy)
+        let masked =
+            image rgbJpeg ["Mask", PdfArray [for _ in 1..3 do yield PdfInt 0L; yield PdfInt 255L]]
+        check "color-key Mask removes all matching JPEG pixels" (first poison masked = 0u)
+        let soft = PdfStream(Map.ofList
+            ["Width",PdfInt 1L; "Height",PdfInt 1L; "BitsPerComponent",PdfInt 8L
+             "ColorSpace",PdfName "DeviceGray"], [|128uy|])
+        let softened = first poison (image rgbJpeg ["SMask",soft])
+        check "soft mask modulates managed JPEG colors" (Pixel.a softened = 128uy && Pixel.r softened > 100uy && Pixel.g softened < 30uy)
+        let raw = Rbt.Pdf.Render.ImageDecode.decodeComponents rgbJpeg (Some 0) |> Option.get
+        let untransformed = first poison (image rgbJpeg
+            ["DecodeParms", PdfDict (Map.ofList ["ColorTransform",PdfInt 0L])])
+        check "explicit ColorTransform applies to managed JPEG samples"
+            (untransformed = Pixel.pack raw.Data.[2] raw.Data.[1] raw.Data.[0] 255uy)
+        let mismatched = image rgbJpeg ["Width",PdfInt 7L]
+        check "PDF/JPEG dimension mismatch cannot be offered to browser"
+            (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull mismatched = None &&
+             render poison true false target mismatched = None)
+        let marker code (payload: byte[]) =
+            Array.concat
+                [ rgbJpeg.[0..1]
+                  [|255uy;code;byte ((payload.Length+2) >>> 8);byte (payload.Length+2)|]
+                  payload
+                  rgbJpeg.[2..] ]
+        let exif = marker 0xE1uy (latin1 "Exif\000\000II*\000\008\000\000\000\000\000")
+        let icc = marker 0xE2uy (latin1 "ICC_PROFILE\000\001\001")
+        for label, bytes in ["EXIF",exif; "embedded ICC",icc] do
+            let obj = image bytes []
+            check $"{label} metadata declines browser and retains managed RGB"
+                (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull obj = None &&
+                 first poison obj = expected)
+        let adobe = marker 0xEEuy (Array.append (latin1 "Adobe") [|0uy;0uy;0uy;0uy;0uy;0uy;0uy|])
+        let adobeRaw = Rbt.Pdf.Render.ImageDecode.decodeComponents adobe None |> Option.get
+        check "Adobe direct-RGB metadata declines browser and uses stream's component transform"
+            (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull (image adobe []) = None &&
+             first poison (image adobe []) =
+                 Pixel.pack adobeRaw.Data.[2] adobeRaw.Data.[1] adobeRaw.Data.[0] 255uy)
+        let named = image rgbJpeg ["ColorSpace",PdfName "Alias"]
+        let resources = PdfDict (Map.ofList
+            ["ColorSpace",PdfDict (Map.ofList ["Alias",PdfName "DeviceRGB";"DefaultRGB",PdfName "DeviceRGB"])])
+        check "named color spaces and DefaultRGB overrides decline browser"
+            (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc resources named = None &&
+             Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc resources eligible = None))
+
 
     test "truncated Flate content retains its actual decoded prefix" (fun () ->
         // issue22044's truncated stream; Python zlib independently recovers
@@ -1140,7 +1284,7 @@ let main _ =
         let imagePixels =
             Rbt.Pdf.Render.PdfImages.decode decoder
                 (fun _ values -> struct(channel values.[0],channel values.[1],channel values.[2],channel values.[3]))
-                true doc PdfNull image Color.black 0uy 0 |> Option.get
+                true false doc PdfNull image Color.black 0uy 0 |> Option.get
         let (_,_,_,_,_,_,fourth) = imagePixels
         let fourthPixel = fourth |> Option.get |> Array.head
         check "PDF ICC CMYK image keeps distinct unconverted black plane" (Pixel.r fourthPixel = 128uy)
@@ -1175,6 +1319,42 @@ let main _ =
         use stream = Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
         use reader = new IO.StreamReader(stream)
         Convert.FromBase64String(reader.ReadToEnd())
+
+    test "ICC and CMYK JPEGs keep PDF component color conversion" (fun () ->
+        let doc = Pdf.openData (build normal onePage 1)
+        let fixture = Pdf.openData (loadLutFixture "icc-rgb-lut8-xyz-page.base64")
+        let page = Pdf.getPage fixture 1 |> Option.get
+        let resources = Pdf.dictGet fixture "Resources" page |> Option.get
+        let colorSpaces = Pdf.dictGet fixture "ColorSpace" resources |> Option.get
+        let profileBytes =
+            match Pdf.deref fixture (Pdf.dictGet fixture "Working" colorSpaces |> Option.get) with
+            | PdfArray [PdfName "ICCBased"; profile] -> Pdf.getStreamData fixture profile
+            | _ -> failwith "Missing RGB ICC profile"
+        let icc = PdfArray [PdfName "ICCBased"; PdfStream(Map.ofList ["N",PdfInt 3L],profileBytes)]
+        let image color bytes =
+            PdfStream(Map.ofList
+                ["Width",PdfInt 8L; "Height",PdfInt 8L; "BitsPerComponent",PdfInt 8L
+                 "ColorSpace",color; "Filter",PdfName "DCTDecode"],bytes)
+        let target cs values =
+            let struct(r,g,b) = Rbt.Pdf.Render.PdfColor.toRgb cs values
+            struct(r,g,b,0uy)
+        let poison _ = Some(8,8,Array.create 64 (Pixel.pack 0uy 255uy 0uy 255uy))
+        for label, color, bytes in
+            ["ICC",icc,rgbJpeg; "CMYK",PdfName "DeviceCMYK",cmykJpeg] do
+            let obj = image color bytes
+            let cs = Rbt.Pdf.Render.PdfColor.resolve doc PdfNull color |> Option.get
+            let components = Rbt.Pdf.Render.ImageDecode.decodeComponents bytes None |> Option.get
+            let values =
+                Array.init components.Components (fun c -> float components.Data.[c] / 255.0)
+            let struct(r,g,b) = Rbt.Pdf.Render.PdfColor.toRgb cs values
+            let expected = Pixel.pack b g r 255uy
+            let _,_,pixels,_,_,_,_ =
+                Rbt.Pdf.Render.PdfImages.decode poison target false true doc PdfNull obj Color.black 0uy 0
+                |> Option.get
+            check $"{label} excludes browser pixels and retains native PDF color interpretation"
+                (Rbt.Pdf.Render.PdfImages.tryBrowserJpeg doc PdfNull obj = None &&
+                 pixels.[0] = expected && pixels.[0] <> Pixel.pack 0uy 255uy 0uy 255uy))
+
 
     test "explicit RGB LUT8 XYZ and LUT16 Lab inverse admit PDF blending spaces" (fun () ->
         let fixture name colorName =
