@@ -3906,7 +3906,7 @@ module Font =
 
     /// Generate a ToUnicode CMap for text extraction
     let generateToUnicodeCMapText (usedGlyphs: (int * string) seq) : string =
-        let entries = usedGlyphs |> Seq.toArray
+        let entries = usedGlyphs |> Seq.filter (fun (_, text) -> not (System.String.IsNullOrEmpty text)) |> Seq.toArray
         let sb = StringBuilder()
         sb.AppendLine("/CIDInit /ProcSet findresource begin") |> ignore
         sb.AppendLine("12 dict begin") |> ignore
@@ -3939,7 +3939,7 @@ module Font =
     /// Generate a ToUnicode CMap for single-codepoint mappings.
     let generateToUnicodeCMap (usedGlyphs: (int * int) seq) : string =
         usedGlyphs
-        |> Seq.map (fun (gid, unicode) -> gid, string (char unicode))
+        |> Seq.map (fun (gid, unicode) -> gid, System.Char.ConvertFromUtf32 unicode)
         |> generateToUnicodeCMapText
 
     /// Create a font descriptor dictionary
@@ -3963,8 +3963,7 @@ module Font =
         ]
         Write.newIndirectObj doc (PdfDict dict)
 
-    /// Embed a TrueType font in the document
-    let embedTrueTypeWithToUnicode (doc: PdfDocument) (font: TrueTypeFont) (fontName: string) (customToUnicode: Map<int, string>) : PdfObj =
+    let private embedTrueTypeMapped (doc: PdfDocument) (font: TrueTypeFont) (fontName: string) (mapping: (int * int * string)[] option) (customToUnicode: Map<int, string>) : PdfObj =
         // Create the font file stream
         let fontFileDict = Map.ofList [
             ("Length1", PdfInt (int64 font.Data.Length))
@@ -3974,15 +3973,22 @@ module Font =
         // Create font descriptor
         let fontDescRef = createFontDescriptor doc font fontName fontFileRef
 
-        // Calculate widths array for ALL glyphs (needed for ligatures with high glyph IDs)
         let scale = 1000.0 / float font.UnitsPerEm
-        let widths = [|
-            for i in 0 .. font.NumGlyphs - 1 ->
-                PdfInt (int64 (float font.GlyphWidths.[i] * scale))
-        |]
+        let gids =
+            match mapping with
+            | Some entries -> entries |> Array.map (fun (_, gid, _) -> gid)
+            | None -> [| 0 .. font.NumGlyphs - 1 |]
+        let widths = gids |> Array.map (fun gid -> PdfInt (int64 (float font.GlyphWidths.[gid] * scale)))
+        let cidMap =
+            mapping |> Option.map (fun _ ->
+                let bytes = Array.zeroCreate<byte> (gids.Length * 2)
+                for cid in 0 .. gids.Length - 1 do
+                    bytes.[cid * 2] <- byte (gids.[cid] >>> 8)
+                    bytes.[cid * 2 + 1] <- byte gids.[cid]
+                Write.newIndirectObj doc (PdfStream (Map.empty, bytes)))
 
         // Create CIDFont dictionary
-        let cidFontDict = Map.ofList [
+        let cidFontDict = Map.ofList ([
             ("Type", PdfName "Font")
             ("Subtype", PdfName "CIDFontType2")
             ("BaseFont", PdfName fontName)
@@ -3994,19 +4000,21 @@ module Font =
             ("FontDescriptor", fontDescRef)
             ("DW", PdfInt 1000L)
             ("W", PdfArray [PdfInt 0L; PdfArray (Array.toList widths)])
-        ]
+        ] @ (cidMap |> Option.map (fun value -> "CIDToGIDMap", value) |> Option.toList))
         let cidFontRef = Write.newIndirectObj doc (PdfDict cidFontDict)
 
         // Generate ToUnicode CMap for text extraction
         // Invert the Cmap (Rbt.Unicode -> GlyphID) to get (GlyphID -> Rbt.Unicode)
         let glyphToUnicode =
-            font.Cmap
-            |> Map.toSeq
-            |> Seq.map (fun (unicode, glyphId) -> (glyphId, unicode))
-            |> Seq.map (fun (glyphId, unicode) -> glyphId, string (char unicode))
-            |> Map.ofSeq
-            |> fun cmap -> Map.fold (fun acc gid text -> Map.add gid text acc) cmap customToUnicode
-            |> Map.toSeq
+            match mapping with
+            | Some entries -> entries |> Seq.map (fun (cid, _, text) -> cid, text)
+            | None ->
+                font.Cmap
+                |> Map.toSeq
+                |> Seq.map (fun (unicode, glyphId) -> glyphId, System.Char.ConvertFromUtf32 unicode)
+                |> Map.ofSeq
+                |> fun cmap -> Map.fold (fun acc gid text -> Map.add gid text acc) cmap customToUnicode
+                |> Map.toSeq
         let toUnicodeCMap = generateToUnicodeCMapText glyphToUnicode
         let toUnicodeCMapBytes = asciiBytes toUnicodeCMap
         let toUnicodeRef = Write.newIndirectObj doc (PdfStream (Map.empty, toUnicodeCMapBytes))
@@ -4021,6 +4029,18 @@ module Font =
             ("ToUnicode", toUnicodeRef)
         ]
         Write.newIndirectObj doc (PdfDict fontDict)
+
+    /// Embed using explicit contiguous CID-to-glyph and CID-to-source mappings.
+    let embedTrueTypeWithCidMapping doc (font: TrueTypeFont) fontName (entries: (int * string)[]) =
+        if entries.Length > 65536 then invalidArg "entries" "A CID font supports at most 65536 character codes"
+        let mapping = entries |> Array.mapi (fun cid (gid, text) ->
+            if gid < 0 || gid >= font.NumGlyphs then invalidArg "entries" "Glyph ID is outside the font"
+            cid, gid, text)
+        embedTrueTypeMapped doc font fontName (Some mapping) Map.empty
+
+    /// Embed a TrueType font with legacy glyph-ID keyed Unicode overrides.
+    let embedTrueTypeWithToUnicode doc font fontName customToUnicode =
+        embedTrueTypeMapped doc font fontName None customToUnicode
 
     /// Embed a TrueType font in the document
     let embedTrueType (doc: PdfDocument) (font: TrueTypeFont) (fontName: string) : PdfObj =
@@ -4183,6 +4203,31 @@ module Doc =
             let f = { Name = resourceName; ObjRef = fontRef; Font = ttf }
             builder.EmbeddedFonts <- Map.add fontName f builder.EmbeddedFonts
             remap
+
+    /// Subset the font and assign CIDs to distinct original glyph/source pairs.
+    /// The returned map contains content character codes, not subset glyph IDs.
+    /// Each source string is the logical Unicode sequence represented by that occurrence.
+    /// Repeated glyph IDs may receive different CIDs; emit the returned CID, not the glyph ID.
+    /// Empty source sequences have no ToUnicode destination. Use an enclosing ActualText
+    /// replacement to preserve logical order for reordered or many-to-many shaped runs.
+    let loadFontBytesSubsetWithCidMapping
+        (builder: DocBuilder) (fontName: string) (data: byte[]) (occurrences: seq<int * string>)
+        : Map<int * string, int> =
+        let entries = occurrences |> Seq.distinct |> Seq.toArray
+        if entries.Length > 65535 then invalidArg "occurrences" "A CID font supports at most 65535 distinct glyph/source pairs"
+        let used = entries |> Seq.map fst |> Set.ofSeq
+        let subsetBytes, remap =
+            if Set.isEmpty used then data, Map.empty
+            else Rbt.OpenType.Subset.subsetCompact data used
+        let font = Font.parseTrueType subsetBytes
+        let name = if Set.isEmpty used then fontName else sprintf "%s+%s" (subsetPrefix used) fontName
+        let mapped =
+            Array.append [| 0, "" |]
+                (entries |> Array.map (fun (gid, text) -> Map.find gid remap, text))
+        let fontRef = Font.embedTrueTypeWithCidMapping builder.Doc font name mapped
+        let resourceName = $"F{Map.count builder.Fonts + Map.count builder.EmbeddedFonts}"
+        builder.EmbeddedFonts <- Map.add fontName { Name = resourceName; ObjRef = fontRef; Font = font } builder.EmbeddedFonts
+        entries |> Array.mapi (fun i pair -> pair, i + 1) |> Map.ofArray
 
     /// Get the resource name for an embedded font
     let getEmbeddedFont (builder: DocBuilder) (fontName: string) =

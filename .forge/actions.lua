@@ -22,6 +22,10 @@ end
 
 return {
     select = function(ctx)
+        -- This isolated writer release must not publish renderer/npm packages.
+        if ctx.ref_name == "refs/tags/v0.1.20" then
+            return { "publish" }
+        end
         if string.match(ctx.ref_name, "^refs/tags/v%d+%.%d+%.%d+") then
             return { "publish", "publish-render", "publish-npm" }
         end
