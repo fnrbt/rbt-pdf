@@ -366,3 +366,22 @@ not universal latency or adversarial-resource bounds.
   16.2%; other sampling metrics are mixed. Cross-backend thin-line differences remain.
 - Detailed evidence and remaining form limitations are in
   `tests/render-corpus/README.md`, “Missing widget appearances and image reduction”.
+
+## Canvas extent and fractional glyph fixes (0.1.17)
+
+- Remove binary64 rounding noise before allocating browser page canvases; genuine
+  fractional extents still round upward. Both formerly oversized corpus canvases
+  now match pdf.js at DPR 1.25.
+- Pin Renderer/Core/Canvas 0.1.15. Its shared CPU glyph fix preserves fractional
+  outline sizes instead of using rounded integer-ppem bitmap cache entries.
+  The direct-outline regressions pass at 12.25, 12.75 and 0.75 pixels with and
+  without explicit AA. Image remains 0.1.5; Text remains 0.1.7.
+- All 106 non-stress pages / 84 PDFs complete in the browser against pdf.js
+  6.5.438, with all canvas dimensions matching. The other 104 Fable captures
+  remain pixel-identical; the two corrected canvases retain their common pixels.
+- Independent ICC blending and subpixel stroke-coverage oracles support Fable's
+  disputed transparency and dense-Form output. No PDF color or Canvas stroke
+  changes were made merely to match pdf.js. Font/fallback differences and
+  Chromium's fractional clip-edge coverage remain documented limitations.
+- Reproducible comparison tooling and detailed evidence are described in
+  `tests/render-corpus/README.md`.

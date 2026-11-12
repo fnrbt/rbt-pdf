@@ -73,6 +73,14 @@ let private loadCjk () : JS.Promise<unit> =
         cjkPromise <- Some p
         p
 
+// Zoom / DPR * DPR and the page-size multiplication can put an integral
+// device extent a few binary64 rounding errors above its integer. Remove only
+// that arithmetic noise; genuinely fractional extents still need the last pixel.
+let private pixelExtent (extent: float) =
+    let nearest = System.Math.Round extent
+    let tolerance = abs extent * 8.881784197001252e-16 // 4 * binary64 machine epsilon
+    max 1 (int (if abs (extent - nearest) <= tolerance then nearest else ceil extent))
+
 let private render (id: int) (pageNum: int) (scale: float) : JS.Promise<unit> =
     match document, options with
     | Some doc, Some opts ->
@@ -99,7 +107,7 @@ let private render (id: int) (pageNum: int) (scale: float) : JS.Promise<unit> =
                 match rendered with
                 | None -> failwith (sprintf "PDF page %d is unavailable" pageNum)
                 | Some (commands, width, height, boxes) ->
-                    let w, h = int (ceil width), int (ceil height)
+                    let w, h = pixelExtent width, pixelExtent height
                     let canvas = createOffscreenCanvas w h
                     Rbt.Renderer.CanvasBackend.render (getOffscreenContext2D canvas) commands
                     let bitmap : ImageBitmap = emitJsExpr canvas "$0.transferToImageBitmap()"

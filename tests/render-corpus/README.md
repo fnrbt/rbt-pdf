@@ -489,3 +489,138 @@ Final evidence: `results/widget-reduction-full-report.json`,
 `widget-final-oracles.json`, `widget-final-browser-lifecycle.json`,
 `widget-final-focus-backends.png`, `widget-final-triage-{0,1,2}.png`, and
 `widget-tax-radio-detail.png`.
+
+## Published Fable versus pdf.js
+
+Compared **@rbt/pdf 0.1.16** with **pdfjs-dist 6.5.438**
+([pinned upstream release metadata](https://registry.npmjs.org/pdfjs-dist/6.5.438))
+in an actual Chromium browser. Both published tarballs were checked against their
+SHA-512 registry integrity values. This uses the Fable `openPdf` viewer and its
+real worker/page-view path, not the native renderer or a direct worker shortcut.
+pdf.js uses its packaged worker, CMaps, standard fonts and WASM, with display
+intent and canvas annotation appearances enabled.
+
+Both completed **106 pages from 84 PDFs**, excluding only the 500-page stress
+document. The target was 800 physical pixels on the longest side, using a shared
+PDF-space scale; the recorded browser DPR was 1.25. **104 pairs have equal
+dimensions** and five are pixel-identical. Two Fable outputs have one extra row
+or column: `upstream-colorkeymask` is 566×801 versus 566×800, and
+`synth-media-offset` is 801×534 versus 800×534. These are retained as geometry
+differences, not resized or silently excluded.
+
+Every page was visually reviewed. These categories describe differences, **not
+a pass rate or a count of bugs in either reader**:
+
+| Visual assessment | Pages |
+|---|---:|
+| Font or raster-quality differences | 52 |
+| Visually close | 24 |
+| Substantial content/color/shape disagreement | 27 |
+| One-pixel canvas-size discrepancy | 2 |
+| Unresolved malformed-function disagreement | 1 |
+
+Concrete findings:
+
+- Text and document layouts generally remain recognizable in both. Font weight,
+  glyph shape and small-text rasterization differ. The dense non-embedded CJK
+  example has text in both, but character-by-character equivalence is not established.
+  pdf.js reported unavailable HeiseiMin-W3, KozMinPr6N-Regular and STSong-Light
+  system fonts. Its missing `Fixture` font warnings also qualify the synthetic
+  vertical-CID comparison; those files are not proof of general vertical-font failure.
+- Thin-line/grid visibility remains different. The tax-form grid and dense
+  Form/pattern example are useful follow-up cases. The latter has much darker
+  patterned regions in pdf.js; Poppler resembles Fable, so it is not automatically
+  a Fable defect.
+- The biggest numerical differences are synthetic ICC blending/luminosity and
+  AIS/mask cases. Corpus expectations often favor Fable, but the comparison alone
+  does not certify either implementation. Keep independent numeric/specification
+  checks rather than changing output merely to match pdf.js.
+- The malformed calculator tile in `upstream-function-based-shading` is white in
+  Fable, a checkerboard in pdf.js and black in Poppler. Its real-valued `floor`
+  result is supplied to integer `mod`; this remains an invalid-input/reference
+  disagreement, not established missing valid content.
+- Both browser implementations render `upstream-bug-jpx` pixel-identically,
+  despite the known Poppler crash. The JPX embedded-alpha example is also close
+  to pdf.js, unlike the previously documented Poppler alpha disagreement.
+
+The source follow-up below resolves the two canvas discrepancies and isolates
+the real transparency and dense-Form disagreements without blindly matching
+pdf.js. Font/fallback and raster-quality differences remain. This deliberately
+feature-focused corpus does not measure general pdf.js conformance parity, interactive forms, accessibility,
+security or large-document performance. Recorded durations are diagnostic only:
+the Fable viewer may pre-render neighboring pages while pdf.js renders the
+requested page.
+
+Evidence lives under `results/browser-parity/`: `packages.json`, `cases.json`,
+`report.json`, `metrics.json`, `visual-review.json`, `browser-console.json`,
+`contact-001.png` through `contact-027.png`, and the original per-page PNGs.
+The visual-review attribution notes are hypotheses where independent correctness
+has not been established.
+
+### Source corrections and independent oracles
+
+The source viewer now removes binary64 arithmetic noise before rounding canvas
+extents upward. At DPR 1.25, `upstream-colorkeymask` is 566×800 rather than 566×801,
+and `synth-media-offset` is 800×534 rather than 801×534. Genuine fractional
+extents still round upward: a 300×200-point probe rendered with maximum side
+800.001 or 800.25 allocates 801×534; a maximum side of 0.75 allocates 1×1.
+This is an allocation correction, not a clip-antialiasing change: Chromium's
+plain Canvas clip-plus-layer drawing independently drops the probe's quarter-pixel
+right-edge coverage, unlike unclipped drawing.
+
+The full 106-page / 84-PDF browser comparison was rerun against pdf.js 6.5.438.
+Both engines completed every page and all 106 canvas dimensions now match.
+All 104 previously equal-size Fable captures are pixel-identical to the published
+baseline; the two resized captures preserve every pixel in their common extent.
+The pdf.js rerender itself changed pixels on 46 pages, so reference capture
+stability is not assumed. Evidence is separate under `results/browser-parity-fix/`:
+`report.json`, `metrics.json`, `baseline-pixel-comparison.json`,
+`verification-summary.json`, boundary probes and 27 contact sheets. This is a
+source build, not a newly published package.
+
+Independent inspection did not justify changing the disputed PDF semantics:
+
+- `upstream-transparency-group` declares an Adobe RGB (1998) ICC blending space.
+  At pixel (355,250), decoded shading functions, `/Difference` in that space and
+  LittleCMS conversion predict RGB (0,187,57); Fable gives (0,186,56).
+  Applying Difference after converting operands to sRGB instead predicts
+  (48,192,68), close to Poppler (48,191,68) and pdf.js (46,191,68).
+- `upstream-perf-structure-forms` contains 3,072 opaque stars, not a transparency
+  or pattern operation in the disputed region. Its transformed black stroke is
+  0.105 pt, approximately 0.106 browser pixel. A 64×64 geometric coverage oracle
+  at (150,100) finds 7.50% black-stroke coverage. Fable's (85,101,176) and Poppler's
+  (89,99,159) do not support thickening strokes to match pdf.js's (16,20,34).
+
+A separate shared CPU text defect was fixed in `../rbt-renderer`: fractional-size
+outline glyphs no longer use integer-ppem bitmap cache entries that resize their
+ink independently of layout. Direct-outline regressions pass at 12.25, 12.75
+and 0.75 pixels, with and without an explicit AA wrapper. This does not change
+Canvas output, and no Canvas font/stroke change was justified by this investigation.
+
+### Replaying browser comparisons
+
+Unpack `npm pack @rbt/pdf@0.1.16` under
+`results/browser-parity/vendor/rbt/`, and
+`npm pack pdfjs-dist@6.5.438 --registry=https://registry.npmjs.org` under
+`results/browser-parity/vendor/pdfjs/`, preserving each tarball's `package/`
+directory. Serve the repository root over HTTP and open
+`tests/render-corpus/browser-parity.html`. After `window.parity.ready`, call:
+
+```js
+await window.parity.render("/tests/render-corpus/downloads/pdf20-simple.pdf", 1, 800)
+```
+
+For a source build, run `pnpm run build` and open the harness with `?rbt=/`.
+The `rbt` parameter selects a package root containing `dist/` and `assets/`;
+without it, the pinned published package above remains the default. Save source
+results separately from the published baseline.
+
+The returned `fable` and `pdfjs` records contain status, original canvas size,
+PNG data URL, text and diagnostic duration. Both outputs are displayed and their
+documents disposed. Save decoded PNGs and their repository-relative paths in a
+report with `versions` and `pages: [{id, page, fable, pdfjs}]`; retain failed pages.
+`compare-browser.py [report.json]` generates metrics and all-page contact sheets
+(requires Pillow and NumPy; this run used 12.3.0 and 2.5.4).
+Opaque RGBA is compared as RGB without changing pixels; unequal geometries and
+nonopaque images are explicitly excluded from pixel metrics. Raw error and the
+quarter-size blurred metric rank inspection work; neither is a correctness threshold.
