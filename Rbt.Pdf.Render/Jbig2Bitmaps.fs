@@ -65,6 +65,28 @@ let private checkBitmap (bitmap: byte[][]) width height =
         for pixel in row do
             if pixel > 1uy then invalidArg "bitmap" "Invalid JBIG2 bitmap pixel"
 
+// Calculate legal source coordinates once, using wide arithmetic so even
+// arbitrary public-API offsets cannot overflow in the pixel loops.
+let private axisWindow sourceLength targetLength (delta: int64) =
+    let first = max 0L (-delta)
+    let last = min (int64 targetLength) (int64 sourceLength - delta)
+    if first >= last then 0, 0, 0
+    else int first, int last, int delta
+
+type private PixelWindow =
+    { X0: int; X1: int; Dx: int
+      Y0: int; Y1: int; Dy: int }
+
+let private pixelWindow sourceWidth sourceHeight width height dx dy =
+    let x0, x1, dx = axisWindow sourceWidth width dx
+    let y0, y1, dy = axisWindow sourceHeight height dy
+    { X0 = x0; X1 = x1; Dx = dx; Y0 = y0; Y1 = y1; Dy = dy }
+
+let private windowPixel (bitmap: byte[][]) (window: PixelWindow) x y =
+    if x >= window.X0 && x < window.X1 && y >= window.Y0 && y < window.Y1 then
+        int bitmap.[y + window.Dy].[x + window.Dx]
+    else 0
+
 /// Decode a generic region. Bitmap pixels are bytes: zero is white, one is black.
 let decodeBitmap (mmr: bool) (width: int) (height: int) (templateIndex: int)
                  (prediction: bool) (skip: byte[][] option) (at: (int * int)[]) (context: Context) : byte[][] =
@@ -100,6 +122,9 @@ let decodeBitmap (mmr: bool) (width: int) (height: int) (templateIndex: int)
             | 1 -> Array.concat [| fixedPixels.[0..8]; [| at.[0] |]; fixedPixels.[9..11] |]
             | 2 -> Array.concat [| fixedPixels.[0..6]; [| at.[0] |]; fixedPixels.[7..8] |]
             | _ -> Array.concat [| fixedPixels.[0..4]; [| at.[0] |]; fixedPixels.[5..8] |]
+        let windows =
+            template |> Array.map (fun (dx, dy) -> pixelWindow width height width height (int64 dx) (int64 dy))
+        let rows: byte[][] = Array.zeroCreate windows.Length
         let bitmap = Array.init height (fun _ -> Array.zeroCreate<byte> width)
         let decoder = context.Decoder
         let contexts = context.GetContexts("GB")
@@ -109,16 +134,19 @@ let decodeBitmap (mmr: bool) (width: int) (height: int) (templateIndex: int)
             if ltp <> 0 then
                 if y > 0 then Array.Copy(bitmap.[y-1], bitmap.[y], width)
             else
+                for i = 0 to windows.Length - 1 do
+                    let w = windows.[i]
+                    rows.[i] <- if y >= w.Y0 && y < w.Y1 then bitmap.[y + w.Dy] else null
                 for x in 0 .. width - 1 do
                     let skipped = match skip with Some s -> s.[y].[x] <> 0uy | None -> false
                     if not skipped then
                         let mutable label = 0
-                        for dx,dy in template do
-                            let px = int64 x + int64 dx
-                            let py = int64 y + int64 dy
+                        for i = 0 to windows.Length - 1 do
+                            let w = windows.[i]
+                            let row = rows.[i]
                             label <- label <<< 1
-                            if px >= 0L && px < int64 width && py >= 0L && py < int64 height then
-                                label <- label ||| int bitmap.[int py].[int px]
+                            if not (isNull row) && x >= w.X0 && x < w.X1 then
+                                label <- label ||| int row.[x + w.Dx]
                         bitmap.[y].[x] <- byte (decoder.ReadBit(contexts, label))
         bitmap
 
@@ -142,38 +170,37 @@ let decodeRefinement (width: int) (height: int) (templateIndex: int) (referenceB
         else
             [| (0,-1); (-1,0); (0,0); (1,0); (0,1); (1,1) |],
             [| (-1,-1); (0,-1); (1,-1); (-1,0) |]
+    let referenceWindows =
+        referenceTemplate |> Array.map (fun (dx, dy) ->
+            pixelWindow refWidth refHeight width height (int64 dx - int64 offsetX) (int64 dy - int64 offsetY))
+    let codingWindows =
+        codingTemplate |> Array.map (fun (dx, dy) -> pixelWindow width height width height (int64 dx) (int64 dy))
+    let predictionWindows =
+        [| for dy in -1 .. 1 do
+               for dx in -1 .. 1 do
+                   yield pixelWindow refWidth refHeight width height (int64 dx - int64 offsetX) (int64 dy - int64 offsetY) |]
     let bitmap = Array.init height (fun _ -> Array.zeroCreate<byte> width)
     let decoder = context.Decoder
     let contexts = context.GetContexts("GR")
-    let referencePixel x y =
-        if x < 0L || y < 0L || x >= int64 refWidth || y >= int64 refHeight then 0
-        else int referenceBitmap.[int y].[int x]
     let mutable ltp = 0
     for y in 0 .. height - 1 do
         if prediction then
             let ltpContext = if templateIndex = 0 then 0x100 else 0x40
             ltp <- ltp ^^^ decoder.ReadBit(contexts, ltpContext)
         for x in 0 .. width - 1 do
-            let rx = int64 x - int64 offsetX
-            let ry = int64 y - int64 offsetY
             let mutable implicitPixel = -1
             if ltp <> 0 then
-                let value = referencePixel (rx - 1L) (ry - 1L)
+                let value = windowPixel referenceBitmap predictionWindows.[0] x y
                 let mutable same = true
-                for dy in -1 .. 1 do
-                    for dx in -1 .. 1 do
-                        if referencePixel (rx + int64 dx) (ry + int64 dy) <> value then same <- false
+                for w in predictionWindows do
+                    if windowPixel referenceBitmap w x y <> value then same <- false
                 if same then implicitPixel <- value
             if implicitPixel >= 0 then bitmap.[y].[x] <- byte implicitPixel
             else
                 let mutable label = 0
-                for dx,dy in referenceTemplate do
-                    label <- (label <<< 1) ||| referencePixel (rx + int64 dx) (ry + int64 dy)
-                for dx,dy in codingTemplate do
-                    let px = int64 x + int64 dx
-                    let py = int64 y + int64 dy
-                    label <- label <<< 1
-                    if px >= 0L && px < int64 width && py >= 0L && py < int64 height then
-                        label <- label ||| int bitmap.[int py].[int px]
+                for w in referenceWindows do
+                    label <- (label <<< 1) ||| windowPixel referenceBitmap w x y
+                for w in codingWindows do
+                    label <- (label <<< 1) ||| windowPixel bitmap w x y
                 bitmap.[y].[x] <- byte (decoder.ReadBit(contexts, label))
     bitmap

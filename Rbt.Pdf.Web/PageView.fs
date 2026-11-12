@@ -32,10 +32,12 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
     let mutable renderPending = false
     let pendingPages = System.Collections.Generic.HashSet<int>()
     let visiblePages = System.Collections.Generic.HashSet<int>()
-    let inFlight = System.Collections.Generic.HashSet<int>()
+    // The worker executes page rendering synchronously; posting a queue of
+    // prefetched pages only delays a newly visible page.
+    let mutable activePage = 0
     let mutable observer : obj = null
 
-    let pages =
+    let mutable pages =
         container.innerHTML <- ""
         [| for i in 0 .. pageCount - 1 do
             let w, h = sizes.[i].[0], sizes.[i].[1]
@@ -54,14 +56,21 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
     let evictPage (idx: int) =
         let info = pages.[idx]
         info.Version <- info.Version + 1
+        // Keep only visible page layers; zeroing a canvas releases its backing
+        // store, but retaining its DOM node still grows with every page visited.
         match info.Canvas with
-        | Some c -> c.width <- 0; c.height <- 0
+        | Some c ->
+            c.width <- 0
+            c.height <- 0
+            emitJsExpr c "$0.remove()"
+            info.Canvas <- None
         | None -> ()
         match info.TextDiv with
-        | Some d -> d.innerHTML <- ""
+        | Some d ->
+            emitJsExpr d "$0.remove()"
+            info.TextDiv <- None
         | None -> ()
         info.Gen <- -1
-
     let installPage (info: PageInfo) (result: WorkerClient.RenderedPage) (scale: float) (dpr: float) =
         // Ownership of result.Bitmap ends here. Close even if DOM/text construction fails.
         try
@@ -101,46 +110,66 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
         finally result.Bitmap.close()
 
     let rec scheduleRender () =
-        if not disposed && not renderPending then
+        if not disposed && activePage = 0 && not renderPending && pendingPages.Count > 0 then
             renderPending <- true
             requestAnimationFrame (fun () ->
                 renderPending <- false
-                if not disposed then
-                    match pendingPages |> Seq.tryHead with
-                    | Some pageNum ->
-                        pendingPages.Remove(pageNum) |> ignore
-                        if visiblePages.Contains(pageNum) && inFlight.Add(pageNum) then
-                            let info = pages.[pageNum - 1]
-                            let gen = generation
-                            let version = info.Version
-                            let dpr = devicePixelRatio ()
-                            let scale = zoom * dpr
-                            let mutable retry = false
-                            worker.Render(pageNum, scale)
-                            |> promiseMap (fun rendered ->
-                                if not disposed && gen = generation && version = info.Version && visiblePages.Contains(pageNum) then
-                                    try
-                                        installPage info rendered scale dpr
-                                        info.Gen <- gen
-                                    with ex ->
-                                        evictPage (pageNum - 1)
-                                        emitJsExpr (pageNum, ex) "console.error('PDF page', $0, 'install failed:', $1)"
-                                else
-                                    retry <- not disposed && visiblePages.Contains(pageNum) && (gen <> generation || version <> info.Version)
-                                    rendered.Bitmap.close())
-                            |> promiseCatch (fun err ->
-                                if not disposed then
-                                    retry <- visiblePages.Contains(pageNum) && (gen <> generation || version <> info.Version)
-                                    emitJsExpr (pageNum, err) "console.error('PDF page', $0, 'render failed:', $1)"
-                                promiseReturn ())
-                            |> promiseMap (fun () ->
-                                inFlight.Remove(pageNum) |> ignore
-                                if retry && not disposed && visiblePages.Contains(pageNum) && info.Gen <> generation then
-                                    pendingPages.Add(pageNum) |> ignore
+                if not disposed && activePage = 0 && pendingPages.Count > 0 then
+                    // IntersectionObserver includes a viewport of prefetch margin.
+                    // Prefer the page occupying the actual viewport, then the
+                    // nearest prefetched page; recalculate after every response.
+                    let root : obj = emitJsExpr container "$0.getBoundingClientRect()"
+                    let viewportTop = max 0.0 (emitJsExpr root "$0.top")
+                    let viewportBottom : float = emitJsExpr root "Math.min(window.innerHeight, $0.bottom)"
+                    let mutable nextPage = 0
+                    let mutable bestPriority = System.Double.PositiveInfinity
+                    for pageNum in pendingPages do
+                        let rect : obj = emitJsExpr pages.[pageNum - 1].Div "$0.getBoundingClientRect()"
+                        let pageTop : float = emitJsExpr rect "$0.top"
+                        let pageBottom : float = emitJsExpr rect "$0.bottom"
+                        let overlap = min viewportBottom pageBottom - max viewportTop pageTop
+                        let priority =
+                            if overlap > 0.0 then -overlap
+                            else max (viewportTop - pageBottom) (pageTop - viewportBottom)
+                        if priority < bestPriority then
+                            bestPriority <- priority
+                            nextPage <- pageNum
+                    if nextPage <> 0 then
+                        pendingPages.Remove(nextPage) |> ignore
+                        if visiblePages.Contains(nextPage) then
+                            let info = pages.[nextPage - 1]
+                            if info.Gen <> generation then
+                                activePage <- nextPage
+                                let gen = generation
+                                let version = info.Version
+                                let dpr = devicePixelRatio ()
+                                let scale = zoom * dpr
+                                let mutable retry = false
+                                worker.Render(nextPage, scale)
+                                |> promiseMap (fun rendered ->
+                                    if not disposed && gen = generation && version = info.Version && visiblePages.Contains(nextPage) then
+                                        try
+                                            installPage info rendered scale dpr
+                                            info.Gen <- gen
+                                        with ex ->
+                                            evictPage (nextPage - 1)
+                                            emitJsExpr (nextPage, ex) "console.error('PDF page', $0, 'install failed:', $1)"
+                                    else
+                                        retry <- not disposed && visiblePages.Contains(nextPage) && (gen <> generation || version <> info.Version)
+                                        rendered.Bitmap.close())
+                                |> promiseCatch (fun err ->
+                                    if not disposed then
+                                        retry <- visiblePages.Contains(nextPage) && (gen <> generation || version <> info.Version)
+                                        emitJsExpr (nextPage, err) "console.error('PDF page', $0, 'render failed:', $1)"
+                                    promiseReturn ())
+                                |> promiseMap (fun () ->
+                                    activePage <- 0
+                                    if retry && not disposed && visiblePages.Contains(nextPage) && info.Gen <> generation then
+                                        pendingPages.Add(nextPage) |> ignore
                                     scheduleRender ())
-                            |> ignore
-                        if pendingPages.Count > 0 then scheduleRender ()
-                    | None -> ()) |> ignore
+                                |> ignore
+                            else scheduleRender ()
+                        else scheduleRender ()) |> ignore
 
     let observerCallback (entries: obj[]) =
         if not disposed then
@@ -204,4 +233,8 @@ type PageView(container: HTMLElement, sizes: float[][], worker: WorkerClient.Cli
             pendingPages.Clear()
             visiblePages.Clear()
             worker.Dispose()
+            for i in 0 .. pageCount - 1 do evictPage i
             container.innerHTML <- ""
+            // A disposed viewer may still be held by its caller; do not retain
+            // the detached placeholders and their former page-layer references.
+            pages <- [||]

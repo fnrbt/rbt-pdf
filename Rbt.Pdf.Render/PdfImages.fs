@@ -65,9 +65,20 @@ let private pack r g b a =
 
 /// The optional pixels retain geometric coverage before a soft image mask.
 /// A soft image mask contributes to shape only when the caller's AIS is true.
-let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte)) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) depth : (int * int * uint32[] * uint32[] option * bool * bool) option =
+/// The final optional plane stores premultiplied K as grayscale with matching
+/// alpha; PDF JPEG component samples reach it before any RGB conversion.
+let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte*byte)) (fourChannel: bool) (doc: PdfDocument) (resources: PdfObj) (obj: PdfObj) (fill: Color) (fillK: byte) depth : (int * int * uint32[] * uint32[] option * bool * bool * uint32[] option) option =
     if depth > 8 then None else
     let w, h = integer doc "Width" obj, integer doc "Height" obj
+    let fourthPixels = if fourChannel then Some (lazy (Array.zeroCreate<uint32> (w*h))) else None
+    let store (pixels: uint32[]) i r g b k a =
+        pixels.[i] <- pack r g b a
+        match fourthPixels with
+        | Some fourth -> fourth.Value.[i] <- pack k k k a
+        | None -> ()
+    let color (pixels: uint32[]) i cs values alpha =
+        let struct(r,g,b,k) = toTarget cs values
+        store pixels i r g b k alpha
     let stencil = match Pdf.dictGet doc "ImageMask" obj |> Option.map (Pdf.deref doc) with Some (PdfBool true) -> true | _ -> false
     let space = if stencil then PdfColor.device 1 else Pdf.dictGet doc "ColorSpace" obj |> Option.bind (colorSpace doc resources)
     let fs = filters doc obj
@@ -147,16 +158,20 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                                 for c in 0 .. colorCount-1 do
                                     values.[c] <- clamp ((values.[c] - (1.0 - a) * background.[c]) / a)
                             | None -> ()
-                            let struct(r,g,b) =
+                            let struct(r,g,b,k) =
                                 if space.IsNone && containerCS = Some 18 && colorCount = 3 then
                                     let y, cb, cr = values.[0], values.[1] - 0.5, values.[2] - 0.5
                                     let rgbValues = [| clamp (y + 1.402 * cr); clamp (y - 0.344136 * cb - 0.714136 * cr); clamp (y + 1.772 * cb) |]
                                     toTarget cs rgbValues
                                 else toTarget cs values
-                            pixels.[i] <-
-                                if smask = 2 && matte.IsNone then
-                                    Pixel.pack (min b alpha) (min g alpha) (min r alpha) alpha
-                                else pack r g b alpha
+                            if smask = 2 && matte.IsNone then
+                                pixels.[i] <- Pixel.pack (min b alpha) (min g alpha) (min r alpha) alpha
+                                match fourthPixels with
+                                | Some fourth ->
+                                    let value = min k alpha
+                                    fourth.Value.[i] <- Pixel.pack value value value alpha
+                                | None -> ()
+                            else store pixels i r g b k alpha
                     Some pixels
                 | _ -> invalidOp "Unsupported JPEG 2000 image color space or component count"
             | _ -> invalidOp "Unable to decode JPEG 2000 image"
@@ -187,9 +202,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                             // Adobe JPEG polarity conventions used for standalone images.
                             let sample = float v / 255.0
                             values.[c] <- ranges.[2*c] + sample * (ranges.[2*c+1] - ranges.[2*c])
-                        if not masked then
-                            let struct(r,g,b) = toTarget cs values
-                            pixels.[i] <- pack r g b 255uy
+                        if not masked then color pixels i cs values 255uy
                     Some pixels
                 | _ -> None
             | None when Pdf.dictGet doc "ColorSpace" obj |> Option.isSome -> None
@@ -207,8 +220,7 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                                 values.[0] <- float (Pixel.r p) / float a
                                 values.[1] <- float (Pixel.g p) / float a
                                 values.[2] <- float (Pixel.b p) / float a
-                                let struct(r,g,b) = toTarget cs values
-                                converted.[i] <- pack r g b a
+                                color converted i cs values a
                         Some converted)
         else
             match space with
@@ -238,10 +250,8 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                         | None -> ()
                         if not masked then
                             if stencil then
-                                if values.[0] < 0.5 then pixels.[y*w+x] <- pack fill.R fill.G fill.B fill.A
-                            else
-                                let struct(r,g,b) = toTarget cs values
-                                pixels.[y*w+x] <- pack r g b 255uy
+                                if values.[0] < 0.5 then store pixels (y*w+x) fill.R fill.G fill.B fillK fill.A
+                            else color pixels (y*w+x) cs values 255uy
                 Some pixels
             | _ -> None
     let explicitMask = imageMask |> Option.bind (function PdfStream _ as mask -> Some mask | _ -> None)
@@ -258,14 +268,15 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
         let mutable maskDecoded = true
         match maskObj with
         | Some mask ->
-            match decode decodeJpeg PdfColor.toRgb doc resources mask (Color.rgba 255uy 255uy 255uy 255uy) (depth+1) with
-            | Some (mw,mh,mp,_,_,_) ->
+            match decode decodeJpeg (fun cs values ->
+                    let struct(r,g,b) = PdfColor.toRgb cs values
+                    struct(r,g,b,0uy)) false doc resources mask (Color.rgba 255uy 255uy 255uy 255uy) 0uy (depth+1) with
+            | Some (mw,mh,mp,_,_,_,_) ->
                 let isStencil = match Pdf.dictGet doc "ImageMask" mask |> Option.map (Pdf.deref doc) with Some (PdfBool true) -> true | _ -> false
                 let matte =
                     match space, (Pdf.dictGet doc "Matte" mask |> Option.map (Pdf.deref doc)) with
                     | Some cs, Some (PdfArray values) when values.Length >= count cs ->
-                        let struct(r,g,b) = toTarget cs (values |> List.map (Pdf.deref doc >> number) |> List.toArray)
-                        Some (r,g,b)
+                        Some (toTarget cs (values |> List.map (Pdf.deref doc >> number) |> List.toArray))
                     | _ -> None
                 for y in 0 .. h-1 do
                     for x in 0 .. w-1 do
@@ -274,15 +285,26 @@ let rec decode (decodeJpeg: byte[] -> (int * int * uint32[]) option) (toTarget: 
                         let a = if isStencil then int (Pixel.a m) else int (Pixel.r m)
                         let p = colorPixels.[i]
                         let scale v = byte ((int v * a + 127)/255)
-                        let r,g,b =
+                        let unblend v mv =
+                            let alpha = (int (Pixel.a p) * a + 127) / 255
+                            byte (min alpha (max 0 (int v - ((int mv * (255-a) * int (Pixel.a p) + 32512) / 65025))))
+                        let r,g,b,k =
                             match matte with
-                            | Some (mr,mg,mb) ->
-                                let unblend v mv =
-                                    let alpha = (int (Pixel.a p) * a + 127) / 255
-                                    byte (min alpha (max 0 (int v - ((int mv * (255-a) * int (Pixel.a p) + 32512) / 65025))))
-                                unblend (Pixel.r p) mr, unblend (Pixel.g p) mg, unblend (Pixel.b p) mb
-                            | None -> scale (Pixel.r p), scale (Pixel.g p), scale (Pixel.b p)
-                        colorPixels.[i] <- Pixel.pack b g r (scale (Pixel.a p))
+                            | Some (struct(mr,mg,mb,mk)) ->
+                                let fourth = match fourthPixels with Some fourth -> Pixel.r fourth.Value.[i] | None -> 0uy
+                                unblend (Pixel.r p) mr, unblend (Pixel.g p) mg, unblend (Pixel.b p) mb,
+                                unblend fourth mk
+                            | None ->
+                                let fourth = match fourthPixels with Some fourth -> Pixel.r fourth.Value.[i] | None -> 0uy
+                                scale (Pixel.r p), scale (Pixel.g p), scale (Pixel.b p), scale fourth
+                        let alpha = scale (Pixel.a p)
+                        colorPixels.[i] <- Pixel.pack b g r alpha
+                        match fourthPixels with
+                        | Some fourth -> fourth.Value.[i] <- Pixel.pack k k k alpha
+                        | None -> ()
             | None -> maskDecoded <- false
         | None -> ()
-        if maskDecoded then Some (w,h,colorPixels,geometricPixels,explicitSoftMask.IsSome || embeddedSoftMask,maskOverridesState) else None
+        if maskDecoded then
+            Some (w,h,colorPixels,geometricPixels,explicitSoftMask.IsSome || embeddedSoftMask,maskOverridesState,
+                  fourthPixels |> Option.map (fun pixels -> pixels.Value))
+        else None

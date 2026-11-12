@@ -79,12 +79,14 @@ let toColor space (values: float[]) alpha =
     let struct(r,g,b) = toRgb space values
     Color.rgba r g b (channel alpha)
 
-/// A three-component encoded blending space with an unclipped D50 PCS.
+/// Encoded blending components with an unclipped D50 PCS. Four-channel ICC
+/// spaces keep their distinct black component through the group compositor.
 type WorkingSpace =
     { IsDisplay: bool
       IsGray: bool
       ToPcs: float -> float -> float -> struct(float * float * float)
       FromPcs: float -> float -> float -> struct(float * float * float)
+      FourChannel: (Icc.ForwardTransform * (float -> float -> float -> struct(float * float * float * float))) option
       /// The PDF profile stream identity, not ICC payload equality.
       ProfileSource: PdfObj option }
 
@@ -93,6 +95,7 @@ let displaySpace =
       IsGray = false
       ToPcs = Icc.rgbToXyzD50
       FromPcs = Icc.xyzD50ToRgb
+      FourChannel = None
       ProfileSource = None }
 
 // DeviceGray is represented by three identical channels in renderer surfaces.
@@ -102,15 +105,42 @@ let deviceGraySpace =
         let struct(r,g,b) = Icc.xyzD50ToRgb x y z
         let gray = 0.30*r + 0.59*g + 0.11*b
         struct(gray,gray,gray)
-    { IsDisplay = false; IsGray = true; ToPcs = toPcs; FromPcs = fromPcs; ProfileSource = None }
+    { IsDisplay = false; IsGray = true; ToPcs = toPcs; FromPcs = fromPcs
+      FourChannel = None; ProfileSource = None }
+// The PDF device model has no profile. Choose the exact algebraic inverse of
+// its existing RGB interpretation when converting foreign PCS colors into
+// DeviceCMYK; native DeviceCMYK paints bypass this non-unique decomposition.
+let deviceCmykSpace =
+    let forward c m y k =
+        let white = 1.0 - clamp k
+        Icc.rgbToXyzD50 ((1.0-clamp c)*white) ((1.0-clamp m)*white) ((1.0-clamp y)*white)
+    let inverse x y z =
+        let struct(r,g,b) = Icc.xyzD50ToRgb x y z
+        let white = max r (max g b)
+        if white <= 0.0 then struct(0.0,0.0,0.0,1.0)
+        else struct(clamp (1.0-r/white),clamp (1.0-g/white),clamp (1.0-b/white),clamp (1.0-white))
+    { IsDisplay = false; IsGray = false
+      ToPcs = (fun _ _ _ -> invalidOp "DeviceCMYK blending requires the black component")
+      FromPcs = (fun _ _ _ -> invalidOp "DeviceCMYK blending requires the black component")
+      FourChannel = Some (forward, inverse); ProfileSource = None }
+
 
 let tryWorkingSpace = function
     | Rgb -> Some displaySpace
-    | Icc (profile, _, source) ->
+    | Cmyk -> Some deviceCmykSpace
+    | Icc (profile, _, source) when Icc.components profile = 3 ->
         match Icc.tryToPcs profile, Icc.tryFromPcs profile with
-        | Some forward, Some inverse when Icc.components profile = 3 ->
+        | Some forward, Some inverse ->
             Some { IsDisplay = false; IsGray = false; ToPcs = (fun r g b -> forward r g b 0.0)
-                   FromPcs = inverse; ProfileSource = Some source }
+                   FromPcs = inverse; FourChannel = None; ProfileSource = Some source }
+        | _ -> None
+    | Icc (profile, _, source) when Icc.components profile = 4 ->
+        match Icc.tryToPcs profile, Icc.tryFromPcs4 profile with
+        | Some forward, Some inverse ->
+            Some { IsDisplay = false; IsGray = false
+                   ToPcs = (fun _ _ _ -> invalidOp "Four-channel ICC blending requires the black component")
+                   FromPcs = (fun _ _ _ -> invalidOp "Four-channel ICC blending requires the black component")
+                   FourChannel = Some (forward, inverse); ProfileSource = Some source }
         | _ -> None
     | _ -> None
 
@@ -121,7 +151,9 @@ let sameWorkingSpace (left: WorkingSpace) (right: WorkingSpace) =
     match left.ProfileSource, right.ProfileSource with
     | Some (PdfIndirect a), Some (PdfIndirect b) -> a = b
     | Some a, Some b -> Object.ReferenceEquals(a,b)
-    | None, None -> (left.IsDisplay && right.IsDisplay) || (left.IsGray && right.IsGray)
+    | None, None ->
+        (left.IsDisplay && right.IsDisplay) || (left.IsGray && right.IsGray) ||
+        (left.FourChannel.IsSome && right.FourChannel.IsSome)
     | _ -> false
 
 let private sameIccSource (target: WorkingSpace) source =
@@ -167,8 +199,32 @@ let rec private toPcs space (values: float[]) =
         toPcs baseSpace palette.[index]
 
 /// Convert before quantization, without routing an out-of-gamut source through sRGB.
+/// Preserve all four encoded components when the target is a CMYK blending
+/// profile; converting through sRGB would lose the independent black plate.
+let toWorkingCmyk (target: WorkingSpace) space (values: float[]) =
+    if isNull values || values.Length < components space then
+        invalidArg "values" "PDF color component count mismatch"
+    match target.FourChannel with
+    | None -> invalidArg "target" "PDF blending target is not four-channel"
+    | Some (_, inverse) ->
+        match space with
+        | Cmyk when target.ProfileSource.IsNone ->
+            struct(channel (clamp values.[0]),channel (clamp values.[1]),
+                   channel (clamp values.[2]),channel (clamp values.[3]))
+        | Icc (_,limits,source) when sameIccSource target source ->
+            struct(channel (iccComponent limits values 0),
+                   channel (iccComponent limits values 1),
+                   channel (iccComponent limits values 2),
+                   channel (iccComponent limits values 3))
+        | _ ->
+            let struct(x,y,z) = toPcs space values
+            let struct(c,m,y,k) = inverse x y z
+            struct(channel c,channel m,channel y,channel k)
+
+/// Convert a source to the existing three-channel blending surfaces.
 let toWorkingRgb (target: WorkingSpace) space (values: float[]) =
     if isNull values || values.Length < components space then invalidArg "values" "PDF color component count mismatch"
+    elif target.FourChannel.IsSome then invalidArg "target" "Four-channel blending requires toWorkingCmyk"
     elif target.IsDisplay then toRgb space values
     elif (match space with Icc (_,_,source) -> sameIccSource target source | _ -> false) then
         let limits = bounds space

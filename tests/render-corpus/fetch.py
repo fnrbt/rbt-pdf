@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
-MAX_BYTES = 10 * 1024 * 1024
+MAX_BYTES = 64 * 1024 * 1024
 
 
 def verify(path, entry):

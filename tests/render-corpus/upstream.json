@@ -580,6 +580,81 @@
         "path": "test/pdfs/160F-2019.pdf"
       },
       "license": "pdf.js repository LICENSE is Apache-2.0 (https://github.com/mozilla/pdf.js/blob/94a48f3c844d4677b264b6e7c0a1e239c245189f/LICENSE); individual test PDF and embedded font rights are not established by that repository license and may differ. Review before redistribution."
+    },
+    {
+      "id": "real-gnu-make",
+      "path": "downloads/real-gnu-make.pdf",
+      "url": "https://www.gnu.org/software/make/manual/make.pdf",
+      "sha256": "a4bc06026984382815e392159e60a4bc356cac6c5b81e5ae84fa4f58f621f4d3",
+      "bytes": 952174,
+      "tags": ["real-world", "document", "long", "born-digital", "embedded-fonts"],
+      "description": "GNU Make Manual edition 0.77: 229 pages of born-digital text and code with embedded subset Computer Modern Type 1 fonts. Representative pages: 10, 100, 220.",
+      "provenance": {
+        "project": "GNU Make / Free Software Foundation",
+        "revision": "Edition 0.77, 26 February 2023",
+        "path": "software/make/manual/make.pdf"
+      },
+      "license": "GNU Free Documentation License 1.3 or later, no invariant sections, with specified front- and back-cover texts; see the manual copyright notice."
+    },
+    {
+      "id": "real-jungle-1920",
+      "path": "downloads/real-jungle-1920.pdf",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/e/e7/Upton_Sinclair_-_The_Jungle_%281920_imprint%29.pdf",
+      "sha256": "490bd12daffd2a16dc496c58cab448adfd6ceb9867e81e8ace75b6b422ba4946",
+      "bytes": 14438348,
+      "tags": ["real-world", "document", "long", "scanned", "image-heavy", "jbig2", "ocr"],
+      "description": "The Jungle, 1920 imprint, scanned from Harvard's Baker Library by Google: 443 pages. Page 100 has a 2814x4318 600-dpi 1-bit JBIG2 scan plus JBIG2 mask; embedded GlyphLessFont supports OCR. Representative pages: 10, 100, 400.",
+      "provenance": {
+        "project": "Wikimedia Commons / Google Books / Harvard Baker Library",
+        "revision": "1920 imprint; Commons file uploaded 2 July 2015",
+        "path": "https://commons.wikimedia.org/wiki/File:Upton_Sinclair_-_The_Jungle_(1920_imprint).pdf"
+      },
+      "license": "Wikimedia Commons identifies the 1920 U.S. publication as public domain in the United States; copyright status may differ elsewhere. Review scan and redistribution rights in the relevant jurisdiction."
+    },
+    {
+      "id": "real-unesco-bhasha",
+      "path": "downloads/real-unesco-bhasha.pdf",
+      "url": "https://articles.unesco.org/sites/default/files/medias/fichiers/2026/03/Bhasha%20Matters%20State%20of%20the%20Education%20Report%20of%202025%20on%20Mother%20Tongue%20and%20Multilingual%20Education.pdf",
+      "sha256": "c6280144c3d5cc88f948eacab74139cc65876a7ce19a39794d041d97b9399edc",
+      "bytes": 18786851,
+      "tags": ["real-world", "document", "multilingual", "devanagari", "embedded-fonts", "image-heavy", "jpeg"],
+      "description": "UNESCO Bhasha Matters education report, 185 pages with embedded subset Type 1C Kohinoor Devanagari, CID TrueType and Latin fonts. Page 1 has JPEG images, page 35 has a 770x485 CMYK JPEG, pages 45, 78 and 87 use Kohinoor Devanagari.",
+      "provenance": {
+        "project": "UNESCO Regional Office for South Asia",
+        "revision": "2026 publication, ISBN 978-92-3-100845-0",
+        "path": "https://doi.org/10.54675/CMET1143"
+      },
+      "license": "CC BY-SA 3.0 IGO (https://creativecommons.org/licenses/by-sa/3.0/igo/), subject to UNESCO Open Access terms and separately credited third-party content."
+    },
+    {
+      "id": "real-unesco-chinese-gem",
+      "path": "downloads/real-unesco-chinese-gem.pdf",
+      "url": "https://gem-report-2017.unesco.org/wp-content/uploads/2016/09/UNESCO-translated-covers-and-intros-CHINESE.pdf",
+      "sha256": "fc86006ecf91a9b54cbab013aa05a18c7cd61e72ed0957e7f60eddefddf28e3e",
+      "bytes": 11435172,
+      "tags": ["real-world", "document", "chinese", "cjk", "cid", "embedded-fonts", "complex-layout", "cmyk", "jpeg"],
+      "description": "UNESCO 2016 Global Education Monitoring report Chinese covers and introductions, 10 pages. Embedded subset Microsoft JhengHei UI Chinese CID TrueType fonts; page 3 contains 68 CMYK JPEG images. Representative pages: 3, 5, 8.",
+      "provenance": {
+        "project": "UNESCO Global Education Monitoring Report",
+        "revision": "2016, ED/GEMR/MRT/2016/B/1",
+        "path": "wp-content/uploads/2016/09/UNESCO-translated-covers-and-intros-CHINESE.pdf"
+      },
+      "license": "The document states © UNESCO 2016, all rights reserved; no open redistribution license is established. Review rights before redistribution, including separately credited photographs."
+    },
+    {
+      "id": "real-unesco-gender-arabic",
+      "path": "downloads/real-un-arabic.pdf",
+      "url": "https://digitallibrary.un.org/nanna/record/4028109/files/1389381_AR.pdf?registerDownload=1&version=1&withMetadata=0&withWatermark=0",
+      "sha256": "0f7a8f5666e6d2a65bb1098cfdfa5f8bd8ea5d9d5719daa9a2a43f5ef94ccf26",
+      "bytes": 7346367,
+      "tags": ["real-world", "document", "arabic", "rtl", "cid", "embedded-fonts", "complex-layout"],
+      "description": "UNESCO 2019 Global Education Monitoring gender report in Arabic, 70 pages, with charts and embedded subset Muna, Yakout and Myriad Arabic CID fonts. Representative pages: 10, 30, 60.",
+      "provenance": {
+        "project": "UNESCO Global Education Monitoring Report, hosted by UN Digital Library",
+        "revision": "2019, ISBN 978-92-3-600083-1",
+        "path": "https://doi.org/10.54676/BGQM3885"
+      },
+      "license": "CC BY-SA 3.0 IGO applies only to the text, per page 4; other content requires permission unless explicitly identified as UNESCO property. Cover photograph credited to Biju Boro/UNICEF."
     }
   ]
 }

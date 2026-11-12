@@ -22,12 +22,22 @@ let private createPage width height association (r: Reader) =
     r.UInt32() |> ignore
     let flags = r.Byte()
     let striping = r.UInt16()
-    if pageWidth <> width || (pageHeight <> UInt32.MaxValue && pageHeight <> uint32 height) then
-        invalidOp "JBIG2 page dimensions do not match PDF image"
+    if pageWidth <= 0 || (pageHeight <> UInt32.MaxValue && pageHeight = 0u) then
+        invalidOp "Invalid JBIG2 page dimensions"
     if pageHeight = UInt32.MaxValue && (striping &&& 0x8000) = 0 then invalidOp "Invalid unknown JBIG2 page height"
+    // The PDF image dimensions can differ from the embedded page dimensions.
+    // Compose only their intersection, using the PDF row stride for output.
+    let pageWidth = min pageWidth width
+    let pageHeight = if pageHeight = UInt32.MaxValue then height else int (min pageHeight (uint32 height))
     let stride = (width + 7) / 8
-    let initial = if flags &&& 4 <> 0 then 0xffuy else 0uy
-    { Pixels = Array.create (stride * height) initial; Width = width; Height = height; Stride = stride
+    let pixels = Array.zeroCreate<byte> (stride * height)
+    if flags &&& 4 <> 0 then
+        for y = 0 to pageHeight - 1 do
+            let row = y * stride
+            for x = 0 to pageWidth / 8 - 1 do pixels.[row + x] <- 0xffuy
+            if pageWidth % 8 <> 0 then
+                pixels.[row + pageWidth / 8] <- byte (0xff <<< (8 - pageWidth % 8))
+    { Pixels = pixels; Width = pageWidth; Height = pageHeight; Stride = stride
       Operator = (flags >>> 3) &&& 3; Override = (flags &&& 64) <> 0; Association = association }
 
 // Page bitmap uses the JBIG2 convention 1=black until final output conversion.
@@ -35,26 +45,27 @@ let private compose (page: Page) (region: Region) (bitmap: byte[][]) =
     if bitmap.Length <> region.Height then invalidOp "Invalid JBIG2 bitmap height"
     let op = if page.Override then region.Operator else page.Operator
     if op > 4 then invalidOp "Invalid JBIG2 combination operator"
+    let clippedWidth = if region.X >= page.Width then 0 else min region.Width (page.Width - region.X)
+    let clippedHeight = if region.Y >= page.Height then 0 else min region.Height (page.Height - region.Y)
     for y = 0 to region.Height - 1 do
         let row = bitmap.[y]
         if row.Length <> region.Width then invalidOp "Invalid JBIG2 bitmap width"
-        let py = int64 region.Y + int64 y
-        if py < int64 page.Height then
-            for x = 0 to region.Width - 1 do
-                let px = int64 region.X + int64 x
-                if px < int64 page.Width then
-                    let index = int py * page.Stride + (int px >>> 3)
-                    let mask = 0x80 >>> (int px &&& 7)
-                    let old = (int page.Pixels.[index] &&& mask) <> 0
-                    let bit = row.[x] <> 0uy
-                    let value =
-                        match op with
-                        | 0 -> old || bit
-                        | 1 -> old && bit
-                        | 2 -> old <> bit
-                        | 3 -> old = bit
-                        | _ -> bit
-                    page.Pixels.[index] <- byte (if value then int page.Pixels.[index] ||| mask else int page.Pixels.[index] &&& (~~~mask))
+        if y < clippedHeight then
+            let rowStart = (region.Y + y) * page.Stride
+            for x = 0 to clippedWidth - 1 do
+                let px = region.X + x
+                let index = rowStart + (px >>> 3)
+                let mask = 0x80 >>> (px &&& 7)
+                let old = (int page.Pixels.[index] &&& mask) <> 0
+                let bit = row.[x] <> 0uy
+                let value =
+                    match op with
+                    | 0 -> old || bit
+                    | 1 -> old && bit
+                    | 2 -> old <> bit
+                    | 3 -> old = bit
+                    | _ -> bit
+                page.Pixels.[index] <- byte (if value then int page.Pixels.[index] ||| mask else int page.Pixels.[index] &&& (~~~mask))
 
 let private referencedSymbols (symbols: Dictionary<uint32, byte[][][]>) (references: uint32[]) =
     let result = ResizeArray<byte[][]>()

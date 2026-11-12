@@ -53,18 +53,14 @@ let private getFilterName (doc: PdfDocument) (obj: PdfObj) : string =
 let private isDCT (doc: PdfDocument) (obj: PdfObj) : bool =
     let f = getFilterName doc obj
     f = "DCTDecode" || f = "DCT"
-
-let private lastFilterIsDCT (doc: PdfDocument) (obj: PdfObj) : bool =
-    match Pdf.dictGet doc "Filter" obj with
-    | Some (PdfName f) -> f = "DCTDecode" || f = "DCT"
-    | Some (PdfArray filters) ->
-        match filters |> List.tryLast with
-        | Some f ->
-            match Pdf.deref doc f with
-            | PdfName n -> n = "DCTDecode" || n = "DCT"
-            | _ -> false
-        | None -> false
-    | _ -> false
+// PdfImages.decode uses the managed component decoder whenever ColorSpace is
+// declared. The browser's BGRA fallback is reached only when it is absent
+// (except image masks, whose stencil color space is supplied by the renderer).
+let private needsBrowserJpeg (doc: PdfDocument) (obj: PdfObj) =
+    Pdf.dictGet doc "ColorSpace" obj |> Option.isNone
+    && (match Pdf.dictGet doc "ImageMask" obj |> Option.map (Pdf.deref doc) with
+        | Some (PdfBool true) -> false
+        | _ -> true)
 
 let private collectDCTStreams (doc: PdfDocument) (resObj: PdfObj) : byte[] list =
     let results = ResizeArray<byte[]>()
@@ -88,7 +84,7 @@ let private collectDCTStreams (doc: PdfDocument) (resObj: PdfObj) : byte[] list 
                         | None -> false
                     if not alreadyVisited then
                         match Pdf.dictGet doc "Subtype" xobj with
-                        | Some (PdfName "Image") when isDCT doc xobj ->
+                        | Some (PdfName "Image") when isDCT doc xobj && needsBrowserJpeg doc xobj ->
                             // Get the raw stream bytes (JPEG data)
                             match Pdf.deref doc kv.Value with
                             | PdfStream (_, raw) ->
@@ -107,12 +103,11 @@ let private collectDCTStreams (doc: PdfDocument) (resObj: PdfObj) : byte[] list 
     walkResources (Pdf.deref doc resObj)
     results |> Seq.toList
 
-/// Async pre-pass: decode every DCTDecode XObject reachable from the page into the JPEG cache.
+/// Async pre-pass: browser-decode only DCT images using PdfImages' no-ColorSpace fallback.
 let prepare (doc: PdfDocument) (pageNum: int) : JS.Promise<unit> =
     match Pdf.getPage doc pageNum with
     | None -> promiseReturn ()
     | Some pageRef ->
-        let pageObj = Pdf.deref doc pageRef
         let resObj =
             match Pdf.getPageInheritable doc pageRef "Resources" with
             | Some r -> r

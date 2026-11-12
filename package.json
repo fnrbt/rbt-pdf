@@ -1,6 +1,6 @@
 {
   "name": "@rbt/pdf",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Fable-compiled PDF viewer for browser applications",
   "type": "module",
   "sideEffects": false,

@@ -624,3 +624,193 @@ report with `versions` and `pages: [{id, page, fable, pdfjs}]`; retain failed pa
 Opaque RGBA is compared as RGB without changing pixels; unequal geometries and
 nonopaque images are explicitly excluded from pixel metrics. Raw error and the
 quarter-size blurred metric rank inspection work; neither is a correctness threshold.
+
+## Browser reliability, controlled fonts and 500-page lifecycle
+
+The post-0.1.17 source fixes were checked with a Fable build, the native regression
+runner, two complete 106-page browser comparison passes, and a separate 500-page
+viewer session. This covers all 606 corpus pages in the browser, but only the
+106 non-stress pages were compared with pdf.js in this run.
+
+### Reference repeatability
+
+The managed Chromium environment produced different text pixels across repeated
+pdf.js document loads. Identical `fillText` arguments and identical font bytes
+also reproduced variation without either PDF renderer. Waiting for
+`document.fonts.ready`, reloading the document, and requesting a readback-oriented
+Canvas did not eliminate it. This is evidence against attributing those
+differences to PDF parsing or a font-loading race; the exact managed-browser
+configuration responsible was not established.
+
+Use a dedicated, fresh Chromium process for comparison captures. The measured
+environment was Chrome **156.0.8078.79**, Linux, DPR **1.25**, software rasterization,
+pdf.js **6.5.438**, and unchanged display intent/font handling. For example, after
+serving the repository and building the source viewer:
+
+```sh
+profile=$(mktemp -d)
+google-chrome --headless=new --disable-gpu --force-color-profile=srgb \
+  --force-device-scale-factor=1.25 --user-data-dir="$profile" \
+  --remote-debugging-address=127.0.0.1 --remote-debugging-port=9238
+```
+
+Connect browser automation to that process and open
+`browser-parity.html?rbt=/`. Record the actual browser version, DPR and package
+versions, rather than assuming requested emulation settings took effect.
+The default reference Canvas profile is `display`; `&referenceCanvas=readback`
+is available for diagnostics and is recorded with the actual context attributes.
+The harness now awaits pdf.js document destruction before starting the next case.
+
+Across two full passes, all **106 Fable** captures were pixel-identical between
+runs. **105 pdf.js** captures were identical; `upstream-perf-structure-forms`
+differed at **25 pixels**, with maximum channel delta **3**, in the dense graphic
+region. This remaining reference variation is retained, not filtered or counted
+as a Fable defect. Evidence: `results/browser-reliability/findings.json`,
+`clean-pass1.json`, `clean-pass2.json`, `repeat-summary.json` and original PNGs.
+
+### Controlled fonts and CMap correction
+
+The embedded controls use the same PDF/font bytes in both engines:
+`Embedded_font.pdf` contains subset NotoSansTC-DemiLight, while the selected
+TrueType line in `mixedfonts.pdf` uses embedded DejaVuSans. In isolated-browser
+captures at maximum side 1200, the DejaVuSans line has identical thresholded ink
+bounds `[66,314–378,327]`; the CJK glyph `除` has bounds `[232,154–267,192]`
+in Fable and `[232,154–267,191]` in pdf.js. Raster masks still differ; these
+measurements do not establish an advance or missing-glyph defect. Crop coordinates,
+thresholds and captures are in `results/controlled-fonts/isolated/report.json`.
+The nonembedded KozMin/STSong specimen remains a separate fallback-font comparison.
+
+That specimen exposed a real Fable CMap bug: the integer parser interpreted an
+unprefixed leading `0b` as binary even when hexadecimal was requested. Prefixing
+CMap hex values explicitly with `0x` preserves CID keys such as `0b5b`, so GBK
+`c4f8` now maps to `镍`, not the spurious Latin text `Äø`.
+`font-regression.html?rbt=/` checks actual Adobe CMap resolution for five source
+codes and the viewer's complete expected GBK row. Inspect `window.fontRegression`
+for completion and results. Its source run passes at DPR 1.25.
+Only the dense nonembedded CJK page changed among the 106 Fable captures versus
+the preceding source baseline; the other 105 remain pixel-identical.
+
+### Long-document lifecycle
+
+Open `browser-stress.html` after building, then call `await window.stress.run()`.
+An optional `?rbt=<package-root>` selects a package containing `dist/` and `assets/`.
+The harness checks every page's number and alternating fill color in one
+500-page viewer session, then exercises reverse jumps, jump/zoom bursts, zoom with
+pending work, replacement during opening/rendering, and disposal during rendering.
+It observes real worker messages and bitmap closes without retaining bitmaps.
+
+The baseline passed rendering but retained 500 empty canvas/text-layer pairs after
+navigation. Page eviction now removes those layers and clears their references;
+disposal also releases the page-placeholder array held by an externally retained
+viewer. At each 50-page settled checkpoint, the fixed run retained **7 canvas and
+7 text-layer nodes**, matching the live pages, with **3,360,000 canvas backing bytes**.
+All **500 distinct pages** passed. All **562 delivered bitmaps** were closed;
+**4 workers** were created and terminated, with no worker errors or survivors.
+Disposal left no page/layer nodes or canvas backing bytes.
+
+These are scoped canvas/DOM/lifecycle measurements, not a total browser-memory
+bound. Heap telemetry may be shared with other tabs. Stale zoom results are
+discarded; document replacement/disposal terminates workers. The check does not
+claim that zoom interrupts synchronous rendering already executing in a worker.
+Evidence: `results/browser-stress/baseline-0.1.17-bitmap.json` and
+`results/browser-stress/source-verified.json`.
+
+## Real-world document coverage
+
+The `real-world` entries in `upstream.json` pin five additional documents by byte
+size and SHA-256. Run `python3 tests/render-corpus/fetch.py` to fetch or verify
+them. The per-file download limit is 64 MiB; pinned sizes and hashes remain
+mandatory. Downloaded documents are not included in the repository or packages.
+
+| Document | Pages | Coverage | Representative pages |
+| --- | ---: | --- | --- |
+| GNU Make manual | 229 | Long born-digital text/code, embedded Type 1 fonts | 10, 100, 220 |
+| The Jungle, 1920 imprint | 443 | Scanned book, JBIG2 images/masks, OCR text | 10, 100, 400 |
+| UNESCO Bhasha Matters | 185 | Devanagari, mixed embedded fonts, photographs and CMYK JPEG | 1, 35, 45, 78, 87 |
+| UNESCO Chinese GEM introduction | 10 | Embedded Chinese CID fonts, complex layout, CMYK photographs | 3, 5, 8 |
+| UNESCO Arabic gender report | 70 | Embedded Arabic CID fonts, RTL text, charts | 10, 30, 60 |
+
+Provenance and rights are recorded per manifest entry. Public availability is not
+a redistribution license: the Chinese report states all rights reserved; the
+Arabic report's CC license covers its text, not all photographs or other content.
+The GNU manual uses the GFDL, Bhasha Matters uses CC BY-SA 3.0 IGO with third-party
+exceptions, and the scanned book's public-domain status is jurisdiction-dependent.
+These documents add real workload diversity; representative-page measurements do
+not constitute a full-document pixel comparison or general PDF conformance proof.
+
+### Real-document measurements and fixes (0.1.18)
+
+`browser-real-world.html?rbt=/` exercises the source viewer; pass
+`?rbt=/path/to/extracted/package/` to exercise an npm package. Wait for
+`window.realWorld.ready`, then call `await window.realWorld.run()`. The report
+separates open-ready time, worker response, installed visible canvas/text,
+revisit, rapid navigation/zoom, replacement and disposal. Errors are retained.
+`window.realWorld.run({documents: [...], timeoutMs: 90000})` selects workloads;
+the default includes the five real documents and tracemonkey as a control.
+
+Final source observations in managed Chromium 156, DPR 1.25:
+
+| Document | Selected cold-page times (seconds) | Rendering errors |
+| --- | --- | ---: |
+| tracemonkey control | 0.28, 0.08, 0.16 | 0 |
+| GNU Make | 0.24, 0.13, 0.24 | 0 |
+| The Jungle | 6.24, 14.84, 17.09 | 0 |
+| Bhasha Matters | 13.97, 2.13, 2.73, 4.89, 2.05 | 0 |
+| Chinese GEM | 23.91, 2.24, 2.25 | 0 |
+| Arabic gender report | 0.25, 0.38, 0.21 | 0 |
+
+These are individual observed workloads, not statistical benchmarks or equal-work
+speed comparisons with pdf.js. All six workloads finish with zero live workers,
+pending renders, page/layer nodes and canvas backing bytes; delivered bitmaps are
+closed. Source baseline and final reports are in `results/real-world/`.
+Window heap figures are not a viewer-only total-memory bound.
+
+The scan exposed a PDF/JBIG2 width mismatch (1034 versus 1035 pixels). The decoder
+now composes the valid intersection without changing output stride. Two scan
+images and their shared mask match Poppler across **24,461,236 decoded pixels**.
+CPU profiling then identified generic JBIG2 bitmap decoding as the dominant scan
+cost. Moving overflow-safe coordinate calculations outside pixel loops reduced
+the observed page-400 cold visit from 32.77 to 17.09 seconds. The native regression
+suite covers mismatched dimensions and extreme adaptive/refinement offsets.
+
+The cover exposed valid four-channel ICC CMYK transparency with Multiply.
+Image 0.1.6 supplies explicit CMYK B2A LUT inverses; Renderer 0.1.16 preserves four
+components through group compositing on native and Canvas paths. PDF-specific
+color spaces, codecs and paint interpretation remain here. DeviceCMYK groups,
+patterns, shadings and luminosity masks also preserve K. Eight component scenes
+(including nonseparable modes, knockout, clipping and nested boundaries) match
+all native/Canvas pixels. GL integration compiles but was not runtime-exercised.
+
+At 451×600, the actual cover's mean absolute RGB-channel difference is 2.55/255
+against pdf.js and 3.90/255 against Poppler; maximum differences are 156 and 197.
+No resampling or tolerance filtering hides those differences. Visual references
+and measurements are `results/real-world/bhasha-cover-*.png`,
+`bhasha-cover-reference.json` and `bhasha-cover-metrics.json`.
+
+The final dedicated-Chromium 106-page run has no failures and every Fable image
+is pixel-identical to the preceding corrected-source baseline. It is recorded
+in `results/cmyk-release/corpus/report.json`; this is not a full-page comparison
+of all pages in the five new long documents.
+
+The final 500-page lifecycle run records 530 delivered/closed bitmaps, four
+created/terminated workers and one peak pending render
+(`results/real-world/source-final-stress.json`). The viewer selects actual
+viewport overlap before prefetch and no longer queues parallel synchronous work.
+JPEG preview preparation also excludes declared-color-space images whose PDF
+decoder consumes native components instead. Expensive image/scan decoding remains
+a performance limitation; stale-zoom handling does not preempt work already
+executing synchronously in the worker.
+
+Controlled Chinese GEM page-3 retention, after the visible canvas/text is
+installed, all worker renders drain, and worker GC runs:
+
+| Viewer | Worker V8 backing-storage bytes |
+| --- | ---: |
+| Released 0.1.17 | 90,019,434 |
+| 0.1.18 source | 52,152,377 |
+
+Both arms use the same viewport, DPR, document, zoom and page sequence; their
+full-canvas pixel hashes and text lengths match. The reduction is 42.1%.
+This is worker backing storage, not total browser memory or byte-for-byte
+attribution to JPEG buffers. No timing inference is drawn from this experiment.
+Evidence: `results/real-world/jpeg-retained-memory-ab.json`.

@@ -199,11 +199,16 @@ type private BitReader(data: byte[]) =
         if n <= 24 then float (reader.Read n)
         else float (reader.Read 16) * 65536.0 + float (reader.Read (n-16))
 
-let private packedColor toTarget space alpha (v: float[]) =
-    let struct(r,g,b) = toTarget space v
+let private storeColor toTarget space alpha (main: uint32[]) (fourth: uint32[] option) index values =
+    let struct(r,g,b,k) = toTarget space values
     let a = byte (clamp 0.0 255.0 (alpha * 255.0 + 0.5))
     let premul c = byte ((int c * int a + 127) / 255)
-    Pixel.pack (premul b) (premul g) (premul r) a
+    main.[index] <- Pixel.pack (premul b) (premul g) (premul r) a
+    match fourth with
+    | Some pixels ->
+        let ink = premul k
+        pixels.[index] <- Pixel.pack ink ink ink a
+    | None -> ()
 
 // Rasterization is in page space, so the result also handles sheared shading
 // matrices. The transparent image is bounded to the visible page and BBox.
@@ -231,21 +236,25 @@ let private rasterBounds (ctm: Matrix3x2) pageBounds bbox scale =
     let h = max 1 (int (ceil ((y1-y0)*s)))
     Some (inv, x0, y0, x1, y1, w, h)
 
-let private rasterCommand x0 y0 x1 y1 w h pixels =
+let private rasterCommand x0 y0 x1 y1 w h pixels fourth =
     let m = { M11 = x1-x0; M12 = 0.0; M21 = 0.0; M22 = y1-y0; DX = x0; DY = y0 }
-    Group (m, 1.0, [BitmapPaint.command pixels w h true])
+    let main = Group (m, 1.0, [BitmapPaint.command pixels w h true])
+    match fourth with
+    | Some k -> Components4(main, Group (m, 1.0, [BitmapPaint.command k w h true]))
+    | None -> main
 
 let private inBBox bbox x y =
     match bbox with
     | None -> true
     | Some (b: float[]) -> x >= b.[0] && x <= b.[2] && y >= b.[1] && y <= b.[3]
 
-let private functionShading toTarget ctm alpha pageBounds scale bbox space (domain: float[]) (matrix: Matrix3x2) (func: Function) =
+let private functionShading toTarget fourChannel ctm alpha pageBounds scale bbox space (domain: float[]) (matrix: Matrix3x2) (func: Function) =
     match rasterBounds ctm pageBounds bbox scale with
     | None -> Some (Group (Matrix3x2.identity, 1.0, []))
     | Some (inv, x0, y0, x1, y1, w, h) ->
         let inverseMatrix = Matrix3x2.inverse matrix
         let pixels = Array.zeroCreate<uint32> (w*h)
+        let fourth = if fourChannel then Some (Array.zeroCreate<uint32> (w*h)) else None
         let input = Array.zeroCreate<float> 2
         for py in 0 .. h-1 do
             let y = y1 - (float py + 0.5) * (y1-y0) / float h
@@ -258,15 +267,16 @@ let private functionShading toTarget ctm alpha pageBounds scale bbox space (doma
                     if u >= domain.[0] && u <= domain.[1] && v >= domain.[2] && v <= domain.[3] then
                         input.[0] <- u
                         input.[1] <- v
-                        pixels.[py*w+px] <- packedColor toTarget space alpha (func.EvalN input)
-        Some (rasterCommand x0 y0 x1 y1 w h pixels)
+                        storeColor toTarget space alpha pixels fourth (py*w+px) (func.EvalN input)
+        Some (rasterCommand x0 y0 x1 y1 w h pixels fourth)
 
-let private radial toTarget ctm alpha pageBounds scale bbox space (coords: float[]) (domain: float[]) (extend0, extend1) (func: Function) =
+let private radial toTarget fourChannel ctm alpha pageBounds scale bbox space (coords: float[]) (domain: float[]) (extend0, extend1) (func: Function) =
     let components = PdfColor.components space
     match rasterBounds ctm pageBounds bbox scale with
     | None -> Some (Group (Matrix3x2.identity, 1.0, []))
     | Some (inv, x0, y0, x1, y1, w, h) ->
         let pixels = Array.zeroCreate<uint32> (w*h)
+        let fourth = if fourChannel then Some (Array.zeroCreate<uint32> (w*h)) else None
         let cx, cy, r = coords.[0], coords.[1], coords.[2]
         let dx, dy, dr = coords.[3]-cx, coords.[4]-cy, coords.[5]-r
         let a = dx*dx + dy*dy - dr*dr
@@ -296,10 +306,11 @@ let private radial toTarget ctm alpha pageBounds scale bbox space (coords: float
                     if best <> Double.NegativeInfinity then
                         let t = clamp 0.0 1.0 best
                         let values = func.Eval (domain.[0] + t*(domain.[1]-domain.[0]))
-                        if values.Length = components then pixels.[py*w+px] <- packedColor toTarget space alpha values
-        Some (rasterCommand x0 y0 x1 y1 w h pixels)
+                        if values.Length = components then
+                            storeColor toTarget space alpha pixels fourth (py*w+px) values
+        Some (rasterCommand x0 y0 x1 y1 w h pixels fourth)
 
-let private mesh toTarget doc sh ctm alpha pageBounds scale bbox space (func: Function option) kind =
+let private mesh toTarget fourChannel doc sh ctm alpha pageBounds scale bbox space (func: Function option) kind =
     let components = PdfColor.components space
     let integer key = numberField doc key sh |> Option.bind (fun x -> if x = floor x then Some (int x) else None)
     let data = try Some (Pdf.getStreamData doc sh) with _ -> None
@@ -312,6 +323,7 @@ let private mesh toTarget doc sh ctm alpha pageBounds scale bbox space (func: Fu
         match flagBits, row, rasterBounds ctm pageBounds bbox scale with
         | Some bf, Some row, Some (inv, x0, y0, x1, y1, w, h) when (kind = 5 && row >= 2) || (kind <> 5 && List.contains bf [2;4;8]) ->
             let pixels = Array.zeroCreate<uint32> (w*h)
+            let fourth = if fourChannel then Some (Array.zeroCreate<uint32> (w*h)) else None
             let reader = BitReader(data)
             let sample bits lo hi = lo + reader.Read(bits) * (hi-lo) / (Math.Pow(2.0, float bits)-1.0)
             let point () = sample bc decode.[0] decode.[1], sample bc decode.[2] decode.[3]
@@ -343,7 +355,8 @@ let private mesh toTarget doc sh ctm alpha pageBounds scale bbox space (func: Fu
                                 if inBBox bbox (float p.X) (float p.Y) then
                                     let values = Array.init nc (fun i -> a*v0.C.[i]+b*v1.C.[i]+c*v2.C.[i])
                                     let values = match func with Some f -> f.Eval values.[0] | None -> values
-                                    if values.Length = components then pixels.[py*w+px] <- packedColor toTarget space alpha values
+                                    if values.Length = components then
+                                        storeColor toTarget space alpha pixels fourth (py*w+px) values
             let mutable ok = true
             if kind = 4 || kind = 5 then
                 let vertices = ResizeArray<MeshVertex>()
@@ -433,13 +446,13 @@ let private mesh toTarget doc sh ctm alpha pageBounds scale bbox space (func: Fu
                             for i in 0 .. n-1 do
                                 triangle grid.[j].[i] grid.[j].[i+1] grid.[j+1].[i]
                                 triangle grid.[j].[i+1] grid.[j+1].[i+1] grid.[j+1].[i]
-            if ok && triangleCount > 0 then Some (rasterCommand x0 y0 x1 y1 w h pixels) else None
+            if ok && triangleCount > 0 then Some (rasterCommand x0 y0 x1 y1 w h pixels fourth) else None
         | _, _, None -> Some (Group (Matrix3x2.identity, 1.0, []))
         | _ -> None
     | _ -> None
 
 /// Render a shading object in PDF page coordinates.
-let private renderObject (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte)) (doc: PdfDocument) (resources: PdfObj) (shading: PdfObj) (ctm: Matrix3x2) (alpha: float) (pageBounds: float * float * float * float) (scale: float) : Cmd option =
+let private renderObject (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte*byte)) fourChannel (doc: PdfDocument) (resources: PdfObj) (shading: PdfObj) (ctm: Matrix3x2) (alpha: float) (pageBounds: float * float * float * float) (scale: float) : Cmd option =
     let shading = Some shading
     match shading with
     | None -> None
@@ -466,19 +479,19 @@ let private renderObject (toTarget: PdfColor.Space -> float[] -> struct(byte*byt
             match matrix with
             | Some m when m.Length = 6 && abs (m.[0]*m.[3]-m.[1]*m.[2]) >= 1e-12 ->
                 let m = { M11=m.[0]; M12=m.[1]; M21=m.[2]; M22=m.[3]; DX=m.[4]; DY=m.[5] }
-                functionShading toTarget ctm alpha pageBounds scale bbox space domain m func
+                functionShading toTarget fourChannel ctm alpha pageBounds scale bbox space domain m func
             | _ -> None
         | Some 3.0, Some space, Some coords, Some domain, Some bbox, Some ext, Some func
             when coords.Length = 6 && coords.[2] >= 0.0 && coords.[5] >= 0.0 &&
                  domain.Length = 2 && domain.[0] < domain.[1] &&
                  (bbox |> Option.forall (fun b -> b.Length = 4 && b.[0] <= b.[2] && b.[1] <= b.[3])) &&
                  func.Inputs = 1 && func.Outputs = PdfColor.components space ->
-            radial toTarget ctm alpha pageBounds scale bbox space coords domain ext func
+            radial toTarget fourChannel ctm alpha pageBounds scale bbox space coords domain ext func
         | Some kind, Some space, _, _, Some bbox, _, func
             when kind >= 4.0 && kind <= 7.0 && kind = floor kind &&
                  (bbox |> Option.forall (fun b -> b.Length = 4 && b.[0] <= b.[2] && b.[1] <= b.[3])) &&
                  (field doc "Function" sh |> Option.isNone || (func |> Option.exists (fun f -> f.Inputs = 1 && f.Outputs = PdfColor.components space))) ->
-            mesh toTarget doc sh ctm alpha pageBounds scale bbox space func (int kind)
+            mesh toTarget fourChannel doc sh ctm alpha pageBounds scale bbox space func (int kind)
         | Some 2.0, Some space, Some coords, Some domain, Some bbox, Some (extend0, extend1), Some func
             when coords.Length = 4 && domain.Length = 2 && domain.[0] < domain.[1] && func.Inputs = 1 && func.Outputs = PdfColor.components space && (bbox |> Option.forall (fun b -> b.Length = 4 && b.[0] <= b.[2] && b.[1] <= b.[3])) ->
             let x0, y0, x1, y1 = coords.[0], coords.[1], coords.[2], coords.[3]
@@ -501,18 +514,25 @@ let private renderObject (toTarget: PdfColor.Space -> float[] -> struct(byte*byt
             if not extend1 then poly <- clip (-dx) (-dy) (dx*x1+dy*y1) poly
             if poly.Length < 3 then Some (Group (Matrix3x2.identity, 1.0, [])) else
             let color (values: float[]) =
-                let struct(r,g,b) = toTarget space values
-                Color.rgba r g b (byte (clamp 0.0 255.0 (alpha * 255.0 + 0.5)))
+                let struct(r,g,b,k) = toTarget space values
+                let a = byte (clamp 0.0 255.0 (alpha * 255.0 + 0.5))
+                struct(Color.rgba r g b a, Color.rgba k k k a)
             let span = domain.[1] - domain.[0]
             let boundaries =
                 func.Breaks |> List.filter (fun x -> x > domain.[0] && x < domain.[1]) |> List.distinct |> List.sort
             let edges = domain.[0] :: boundaries @ [domain.[1]] |> List.toArray
             let stops = ResizeArray<GradientStop>()
-            let add x c =
-                stops.Add { Offset = clamp 0.0 1.0 ((x-domain.[0])/span); StopColor = c }
-            let deviation (a: Color) (m: Color) (b: Color) =
+            let fourthStops = if fourChannel then Some (ResizeArray<GradientStop>()) else None
+            let add x (struct(c,k)) =
+                let offset = clamp 0.0 1.0 ((x-domain.[0])/span)
+                stops.Add { Offset = offset; StopColor = c }
+                match fourthStops with
+                | Some fourth -> fourth.Add { Offset = offset; StopColor = k }
+                | None -> ()
+            let deviation (struct(a, ak)) (struct(m, mk)) (struct(b, bk)) =
                 let diff (x: byte) (y: byte) (z: byte) = abs (float y - (float x + float z) * 0.5)
-                max (diff a.R m.R b.R) (max (diff a.G m.G b.G) (diff a.B m.B b.B))
+                let primary = max (diff a.R m.R b.R) (max (diff a.G m.G b.G) (diff a.B m.B b.B))
+                if fourChannel then max primary (diff ak.R mk.R bk.R) else primary
             let rec segment depth a ca b cb =
                 let mid = (a+b)*0.5
                 let cm = color (func.Eval mid)
@@ -544,16 +564,20 @@ let private renderObject (toTarget: PdfColor.Space -> float[] -> struct(byte*byt
             let p1 = vec2 (float p0.X + gx*factor) (float p0.Y + gy*factor)
             let points = poly |> List.map (fun (x,y) -> Matrix3x2.transformVec2 ctm (vec2 x y))
             let path = MoveTo (List.head points) :: ((List.tail points |> List.map LineTo) @ [Close])
-            Some (FillPath (path, LinearGradient (p0, p1, List.ofSeq stops, Pad), NonZero))
+            let main = FillPath (path, LinearGradient (p0, p1, List.ofSeq stops, Pad), NonZero)
+            match fourthStops with
+            | Some fourth ->
+                Some (Components4(main, FillPath(path, LinearGradient(p0,p1,List.ofSeq fourth,Pad),NonZero)))
+            | None -> Some main
         | _ -> None
 
 /// Render a shading, rejecting any function execution error.
-let tryRenderObject (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte)) (doc: PdfDocument) (resources: PdfObj) (shading: PdfObj) (ctm: Matrix3x2) (alpha: float) (pageBounds: float * float * float * float) (scale: float) : Cmd option =
-    try renderObject toTarget doc resources shading ctm alpha pageBounds scale
+let tryRenderObject (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte*byte)) fourChannel (doc: PdfDocument) (resources: PdfObj) (shading: PdfObj) (ctm: Matrix3x2) (alpha: float) (pageBounds: float * float * float * float) (scale: float) : Cmd option =
+    try renderObject toTarget fourChannel doc resources shading ctm alpha pageBounds scale
     with FunctionEvaluationError -> None
 
 /// Resolve a named shading from the current resource dictionary.
-let tryRender (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte)) (doc: PdfDocument) (resources: PdfObj) (name: string) (ctm: Matrix3x2) (alpha: float) (pageBounds: float * float * float * float) (scale: float) : Cmd option =
+let tryRender (toTarget: PdfColor.Space -> float[] -> struct(byte*byte*byte*byte)) fourChannel (doc: PdfDocument) (resources: PdfObj) (name: string) (ctm: Matrix3x2) (alpha: float) (pageBounds: float * float * float * float) (scale: float) : Cmd option =
     field doc "Shading" resources
     |> Option.bind (field doc name)
-    |> Option.bind (fun sh -> tryRenderObject toTarget doc resources sh ctm alpha pageBounds scale)
+    |> Option.bind (fun sh -> tryRenderObject toTarget fourChannel doc resources sh ctm alpha pageBounds scale)

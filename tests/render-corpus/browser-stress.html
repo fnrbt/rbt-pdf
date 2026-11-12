@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PDF viewer lifecycle stress</title>
+<style>
+  body { margin: 0; font: 14px sans-serif; background: #ddd; }
+  header { position: sticky; top: 0; z-index: 1; padding: 8px; background: white; }
+  #viewer { width: 100%; }
+</style>
+</head>
+<body>
+<header>500-page PDF viewer stress: <span id="status">Loading…</span></header>
+<div id="viewer"></div>
+<script type="module">
+// Observe the real worker protocol, without consuming or retaining transferred ImageBitmaps.
+const NativeWorker = window.Worker;
+const workers = { created: 0, terminated: 0, active: 0, opened: 0, requested: 0, rendered: 0,
+                  bitmapsClosed: 0, errors: [], peakPending: 0, instances: [], onRender: null };
+const nativeBitmapClose = ImageBitmap.prototype.close;
+ImageBitmap.prototype.close = function () {
+  const result = nativeBitmapClose.call(this);
+  workers.bitmapsClosed++;
+  return result;
+};
+window.Worker = class extends NativeWorker {
+  constructor(url, options) {
+    super(url, options);
+    if (!String(url).includes('WorkerRuntime.js')) return;
+    this.stress = { pending: new Map(), responses: new Map(), terminated: false };
+    workers.instances.push(this);
+    workers.created++; workers.active++;
+    this.addEventListener('message', ({ data }) => {
+      if (data.kind === 'opened') workers.opened++;
+      if (data.kind === 'rendered') {
+        const request = this.stress.pending.get(data.id);
+        this.stress.responses.set(data.page, { scale: request?.scale, width: data.width, height: data.height });
+        if (this.stress.responses.size > 32) this.stress.responses.delete(this.stress.responses.keys().next().value);
+        workers.rendered++;
+      }
+      if (data.kind === 'error') workers.errors.push(String(data.message));
+      this.stress.pending.delete(data.id);
+    });
+    this.addEventListener('error', e => workers.errors.push(String(e.message)));
+    this.addEventListener('messageerror', e => workers.errors.push(String(e.message || e.type)));
+  }
+  postMessage(message, transfer) {
+    if (this.stress && message.kind === 'render') {
+      this.stress.pending.set(message.id, { page: message.page, scale: message.scale });
+      workers.requested++;
+      workers.peakPending = Math.max(workers.peakPending, this.stress.pending.size);
+    }
+    const posted = super.postMessage(message, transfer);
+    if (this.stress && message.kind === 'render' && workers.onRender) {
+      const notify = workers.onRender;
+      workers.onRender = null;
+      notify({ page: message.page, id: message.id, pending: this.stress.pending.size });
+    }
+    return posted;
+  }
+  terminate() {
+    if (this.stress && !this.stress.terminated) {
+      this.stress.terminated = true;
+      this.stress.pending.clear();
+      this.stress.responses.clear();
+      workers.terminated++; workers.active--;
+    }
+    return super.terminate();
+  }
+};
+
+const status = document.querySelector('#status');
+const container = document.querySelector('#viewer');
+const rbtRoot = new URL(new URLSearchParams(location.search).get('rbt') || '../../', location.href);
+const assetRoot = new URL('assets/', rbtRoot);
+const fixture = new URL('./generated/synth-many-pages.pdf', location.href);
+const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+const errorString = error => String(error?.stack || error?.message || error);
+const actualDpr = () => window.devicePixelRatio || 1;
+let openPdf;
+let viewer = null;
+let currentWorker = null;
+let runPromise = null;
+function nextRender(action, timeoutMs) {
+  let timer;
+  const result = new Promise((resolve, reject) => {
+    workers.onRender = resolve;
+    timer = setTimeout(() => { workers.onRender = null; reject(new Error('render request not posted')); }, timeoutMs);
+    action();
+  });
+  return result.finally(() => { clearTimeout(timer); workers.onRender = null; });
+}
+
+function proxy() {
+  const canvases = [...container.querySelectorAll('canvas')];
+  const textLayers = [...container.querySelectorAll('.text-layer')];
+  const pending = workers.instances.reduce((count, worker) => count + worker.stress.pending.size, 0);
+  return {
+    installedCanvases: canvases.filter(c => c.width && c.height).length,
+    installedBytes: canvases.reduce((sum, c) => sum + c.width * c.height * 4, 0),
+    canvasNodes: canvases.length,
+    textLayerNodes: textLayers.length,
+    textNodes: textLayers.reduce((sum, layer) => sum + layer.querySelectorAll('*').length, 0),
+    pending, workerActive: workers.active,
+  };
+}
+async function until(predicate, label, timeoutMs) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    const value = predicate();
+    if (value) return value;
+    await frame();
+  }
+  throw new Error(`${label} timed out after ${timeoutMs}ms: ${JSON.stringify(proxy())}`);
+}
+async function settle(timeoutMs) {
+  await until(() => proxy().pending === 0, 'worker render settlement', timeoutMs);
+  await frame(); await frame();
+  return proxy();
+}
+async function fetchFixture() {
+  const response = await fetch(fixture);
+  if (!response.ok) throw new Error(`fixture HTTP ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+function open(bytes) {
+  currentWorker = null;
+  const promise = openPdf(container, bytes, assetRoot.href);
+  currentWorker = workers.instances.at(-1);
+  return promise;
+}
+function setViewer(value) { viewer = value; currentWorker = workers.instances.at(-1); return value; }
+function dispose() { if (viewer) { viewer.dispose(); viewer = null; } }
+async function visit(number, timeoutMs) {
+  const started = performance.now();
+  viewer.scrollToPage(number);
+  // scrollToPage intentionally uses smooth scrolling; land on the requested page
+  // immediately too, so each visit tests rendering rather than the animation duration.
+  const page = container.querySelector(`[data-page="${number}"]`);
+  if (!page) throw new Error(`page ${number} missing`);
+  page.scrollIntoView({ behavior: 'instant', block: 'start' });
+  const scale = viewer.zoom * actualDpr();
+  const expectedText = `Page ${String(number).padStart(4, '0')}`;
+  const expectedRgb = number % 2 ? [26, 77, 230] : [230, 51, 26];
+  const result = await until(() => {
+    const response = currentWorker?.stress.responses.get(number);
+    const canvas = page.querySelector('canvas');
+    const layer = page.querySelector('.text-layer');
+    if (!response || Math.abs(response.scale - scale) > 1e-9 || !canvas || !layer ||
+        canvas.width !== response.width || canvas.height !== response.height || !canvas.width || !canvas.height) return null;
+    const text = layer.textContent || '';
+    if (!text.includes(expectedText)) return null;
+    const pixel = [...canvas.getContext('2d').getImageData(Math.floor(canvas.width / 2), Math.floor(canvas.height / 2), 1, 1).data];
+    if (pixel.slice(0, 3).some((channel, i) => Math.abs(channel - expectedRgb[i]) > 3) || pixel[3] !== 255)
+      throw new Error(`page ${number}: expected ${expectedText} ${expectedRgb}, observed ${JSON.stringify({ text, pixel })}`);
+    return { page: number, text, pixel, width: canvas.width, height: canvas.height,
+             seconds: (performance.now() - started) / 1000, ...proxy() };
+  }, `page ${number} installed with correct text and color`, timeoutMs);
+  return result;
+}
+
+async function run(options = {}) {
+  if (runPromise) throw new Error('A stress run is already active');
+  const work = (async () => {
+    const timeoutMs = options.timeoutMs ?? 60000;
+    const started = performance.now();
+    const report = { fixture: fixture.pathname, dpr: actualDpr(), pages: [], samples: [], scenarios: [],
+                     errors: [], workers: null, completion: null, seconds: null, heap: null };
+    window.stress.latest = report;
+    const capture = async label => {
+      const sample = { label, ...(await settle(timeoutMs)) };
+      report.samples.push(sample);
+      if (sample.canvasNodes !== sample.installedCanvases || sample.textLayerNodes !== sample.installedCanvases)
+        throw new Error(`evicted page layers retained at ${label}: ${JSON.stringify(sample)}`);
+    };
+    let bytes;
+    try {
+      bytes = await fetchFixture();
+      const first = setViewer(await open(bytes));
+      if (first.pageCount !== 500) throw new Error(`expected 500 pages, got ${first.pageCount}`);
+      report.scenarios.push({ name: 'opened', pages: first.pageCount });
+      for (let number = 1; number <= 500; number++) {
+        status.textContent = `Checking page ${number}/500`;
+        report.pages.push(await visit(number, timeoutMs));
+        if (number % 50 === 0) await capture(`after ${number} visits`);
+      }
+      report.completion = { checked: report.pages.length, unique: new Set(report.pages.map(p => p.page)).size };
+      for (const number of [500, 1, 300, 2, 499, 3, 250, 1]) {
+        // Rapid transitions and reverse-direction scrolls, each requiring installed output.
+        report.scenarios.push({ name: 'jump', ...(await visit(number, timeoutMs)) });
+      }
+      for (const number of [499, 2, 400, 1, 250, 500, 3]) {
+        first.scrollToPage(number);
+        container.querySelector(`[data-page="${number}"]`).scrollIntoView({ behavior: 'instant', block: 'start' });
+      }
+      report.scenarios.push({ name: 'jump burst settled', ...(await visit(3, timeoutMs)) });
+      await capture('after jumps');
+      for (const zoom of [1.4, 0.7, 1.8, 0.9, 1.0]) {
+        first.setZoom(zoom);
+        first.scrollToPage(zoom > 1 ? 498 : 3);
+      }
+      report.scenarios.push({ name: 'rapid zoom settled', zoom: first.zoom, ...(await visit(3, timeoutMs)) });
+      await capture('after zoom');
+      const inFlightZoom = await nextRender(() => {
+        first.scrollToPage(400);
+        container.querySelector('[data-page="400"]').scrollIntoView({ behavior: 'instant', block: 'start' });
+        first.setZoom(1.35);
+      }, timeoutMs);
+      const zoomPending = currentWorker.stress.pending.size;
+      for (const zoom of [0.8, 1.7, 1.1, 1.0]) first.setZoom(zoom);
+      report.scenarios.push({ name: 'zoom during in-flight render', request: inFlightZoom,
+                              pendingAtZoom: zoomPending, zoom: first.zoom, ...(await visit(400, timeoutMs)) });
+      await capture('after in-flight zoom');
+      // Wait for an actual queued worker request, then replace before yielding
+      // another animation frame. Termination may discard work, not interrupt JS
+      // already executing synchronously inside the old worker.
+      const inFlightReplacement = await nextRender(() => {
+        first.scrollToPage(490);
+        container.querySelector('[data-page="490"]').scrollIntoView({ behavior: 'instant', block: 'start' });
+        first.setZoom(1.25);
+      }, timeoutMs);
+      const replacementPending = currentWorker.stress.pending.size;
+      const replacement = setViewer(await open(bytes));
+      report.scenarios.push({ name: 'replace while rendering', request: inFlightReplacement,
+                              pendingAtReplacement: replacementPending, workerActive: workers.active,
+                              oldWorkerTerminated: workers.instances.at(-2).stress.terminated,
+                              ...(await visit(250, timeoutMs)) });
+      // Two overlapping opens: the first must reject as superseded and terminate its worker.
+      const oldOpening = open(bytes);
+      const newOpening = open(bytes);
+      const oldResult = await oldOpening.then(value => { value.dispose(); return 'unexpectedly resolved'; }, error => errorString(error));
+      setViewer(await newOpening);
+      report.scenarios.push({ name: 'replace while opening', oldResult, ...(await visit(500, timeoutMs)) });
+      await capture('after replacements');
+      const inFlightDisposal = await nextRender(() => {
+        viewer.scrollToPage(1);
+        container.querySelector('[data-page="1"]').scrollIntoView({ behavior: 'instant', block: 'start' });
+        viewer.setZoom(1.4);
+      }, timeoutMs);
+      const disposalPending = currentWorker.stress.pending.size;
+      dispose();
+      await frame();
+      report.scenarios.push({ name: 'dispose while rendering', request: inFlightDisposal,
+                              pendingAtDisposal: disposalPending, ...proxy(),
+                              pageNodes: container.querySelectorAll('.page').length });
+      await capture('after disposal');
+      if (workers.active !== 0 || container.querySelector('.page')) throw new Error('viewer/worker survived disposal');
+      if (!oldResult.includes('superseded') && !oldResult.includes('disposed')) throw new Error(`unexpected superseded open: ${oldResult}`);
+      if (workers.bitmapsClosed !== workers.rendered)
+        throw new Error(`${workers.rendered} rendered bitmaps delivered, ${workers.bitmapsClosed} closed on UI thread`);
+      if (workers.errors.length) throw new Error(`worker errors: ${workers.errors.join('; ')}`);
+      report.workers = { created: workers.created, terminated: workers.terminated, active: workers.active,
+                         opened: workers.opened, requested: workers.requested, rendered: workers.rendered,
+                         bitmapsClosed: workers.bitmapsClosed, peakPending: workers.peakPending, errors: workers.errors };
+      report.seconds = (performance.now() - started) / 1000;
+      if (performance.memory?.usedJSHeapSize) report.heap = { usedJSHeapSize: performance.memory.usedJSHeapSize,
+                                                             jsHeapSizeLimit: performance.memory.jsHeapSizeLimit };
+      status.textContent = `Finished ${report.completion.checked} pages in ${report.seconds.toFixed(1)}s`;
+      return report;
+    } catch (error) {
+      report.errors.push(errorString(error));
+      report.workers = { created: workers.created, terminated: workers.terminated, active: workers.active,
+                         opened: workers.opened, requested: workers.requested, rendered: workers.rendered,
+                         bitmapsClosed: workers.bitmapsClosed, peakPending: workers.peakPending, errors: workers.errors };
+      report.seconds = (performance.now() - started) / 1000;
+      status.textContent = `Failed: ${errorString(error)}`;
+      return report;
+    } finally { dispose(); }
+  })();
+  runPromise = work;
+  try { return await work; } finally { runPromise = null; }
+}
+window.stress = { ready: false, error: null, run, proxy, workers };
+try {
+  ({ openPdf } = await import(new URL('dist/App.js', rbtRoot).href));
+  window.stress.ready = true;
+  status.textContent = 'Ready';
+} catch (error) {
+  window.stress.error = errorString(error);
+  status.textContent = window.stress.error;
+}
+</script>
+</body>
+</html>

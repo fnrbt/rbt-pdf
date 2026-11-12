@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Real-world PDF viewer profiling</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px sans-serif; background: #ddd; }
+  header { height: 40px; padding: 10px; background: white; }
+  #viewer { height: calc(100vh - 40px); overflow: auto; padding: 8px; }
+  .page { background: white; }
+  .text-layer, .text-layer > span { color: transparent; }
+</style>
+</head>
+<body>
+<header>Real-world PDF profiler: <span id="status">Loading…</span></header>
+<div id="viewer"></div>
+<script type="module">
+// Instrument the real worker and bitmap lifecycle; never retain transferred bitmaps.
+const NativeWorker = window.Worker;
+const nativeClose = ImageBitmap.prototype.close;
+const stats = { created: 0, terminated: 0, active: 0, requested: 0, rendered: 0, closed: 0,
+                errors: [], workers: [], timeline: [], peakPending: 0, invisibleRequests: 0 };
+ImageBitmap.prototype.close = function () {
+  const result = nativeClose.call(this);
+  stats.closed++;
+  return result;
+};
+const container = document.querySelector('#viewer');
+const status = document.querySelector('#status');
+const root = new URL(new URLSearchParams(location.search).get('rbt') || '../../', location.href);
+const assets = new URL('assets/', root).href;
+const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+const now = () => performance.now();
+const errText = e => String(e?.stack || e?.message || e);
+const dpr = () => window.devicePixelRatio || 1;
+const shown = page => {
+  if (!page) return false;
+  const rect = page.getBoundingClientRect(), viewport = container.getBoundingClientRect();
+  return rect.bottom > viewport.top && rect.top < viewport.bottom && rect.right > viewport.left && rect.left < viewport.right;
+};
+window.Worker = class extends NativeWorker {
+  constructor(url, options) {
+    super(url, options);
+    if (!String(url).includes('WorkerRuntime.js')) return;
+    this.profile = { pending: new Map(), responses: new Map(), failures: new Map(), terminated: false, sizes: null };
+    stats.workers.push(this);
+    stats.created++; stats.active++;
+    this.addEventListener('message', ({ data }) => {
+      if (data.kind === 'opened') this.profile.sizes = data.sizes;
+      if (data.kind === 'rendered') {
+        const request = this.profile.pending.get(data.id);
+        const response = { page: data.page, id: data.id, scale: request?.scale,
+                           width: data.width, height: data.height, at: now(), postedAt: request?.at };
+        this.profile.responses.set(data.page, response);
+        if (this.profile.responses.size > 32) this.profile.responses.delete(this.profile.responses.keys().next().value);
+        stats.rendered++;
+      }
+      if (data.kind === 'error') {
+        if (stats.errors.length < 30) stats.errors.push(String(data.message));
+        const request = this.profile.pending.get(data.id);
+        if (request) this.profile.failures.set(request.page, { scale: request.scale, message: String(data.message) });
+      }
+      this.profile.pending.delete(data.id);
+    });
+    this.addEventListener('error', e => { if (stats.errors.length < 30) stats.errors.push(String(e.message)); });
+    this.addEventListener('messageerror', e => { if (stats.errors.length < 30) stats.errors.push(String(e.message || e.type)); });
+  }
+  postMessage(message, transfer) {
+    if (this.profile && message.kind === 'render') {
+      const page = container.querySelector(`[data-page="${message.page}"]`);
+      const request = { id: message.id, page: message.page, scale: message.scale, at: now(), visible: shown(page) };
+      this.profile.pending.set(message.id, request);
+      stats.requested++;
+      if (!request.visible) stats.invisibleRequests++;
+      stats.peakPending = Math.max(stats.peakPending, this.profile.pending.size);
+      stats.timeline.push(request);
+      if (stats.timeline.length > 64) stats.timeline.shift();
+    }
+    return super.postMessage(message, transfer);
+  }
+  terminate() {
+    if (this.profile && !this.profile.terminated) {
+      this.profile.terminated = true;
+      this.profile.terminatedAt = now();
+      this.profile.pending.clear(); this.profile.responses.clear(); this.profile.sizes = null;
+      stats.terminated++; stats.active--;
+    }
+    return super.terminate();
+  }
+};
+function snapshot() {
+  const canvases = [...container.querySelectorAll('canvas')];
+  const textLayers = [...container.querySelectorAll('.text-layer')];
+  return {
+    canvasNodes: canvases.length,
+    canvasBytes: canvases.reduce((n, c) => n + 4 * c.width * c.height, 0),
+    textLayers: textLayers.length,
+    textNodes: textLayers.reduce((n, layer) => n + layer.querySelectorAll('*').length, 0),
+    placeholders: container.querySelectorAll('.page').length,
+    pending: stats.workers.reduce((n, w) => n + w.profile.pending.size, 0),
+    activeWorkers: stats.active,
+    closedBitmaps: stats.closed,
+    deliveredBitmaps: stats.rendered,
+    heapUsed: performance.memory?.usedJSHeapSize ?? null // Shared process heap, not viewer-owned.
+  };
+}
+async function until(predicate, label, ms) {
+  const start = now();
+  while (now() - start < ms) {
+    const result = predicate();
+    if (result) return result;
+    await frame();
+  }
+  throw new Error(`${label} timed out after ${ms}ms (${JSON.stringify(snapshot())})`);
+}
+async function timed(promise, label, ms, cleanup = () => {}) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => { cleanup(); reject(new Error(`${label} timed out after ${ms}ms`)); }, ms);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+async function fetchDocument(url, ms) {
+  const controller = new AbortController();
+  const response = await timed(fetch(url, { signal: controller.signal }), `fetch ${url}`, ms, () => controller.abort());
+  if (!response.ok) throw new Error(`fetch ${url}: HTTP ${response.status}`);
+  return new Uint8Array(await timed(response.arrayBuffer(), `download ${url}`, ms, () => controller.abort()));
+}
+let openPdf, viewer = null;
+function dispose() {
+  const start = now();
+  if (viewer) { viewer.dispose(); viewer = null; }
+  return now() - start;
+}
+async function open(bytes, ms) {
+  const start = now();
+  const previousWorkers = stats.workers.length;
+  const task = openPdf(container, bytes, assets);
+  // openPdf constructs its worker in a microtask, not synchronously.
+  let expired = false;
+  task.then(v => { if (expired) v.dispose(); }, () => {});
+  const value = await timed(task, 'openPdf', ms, () => {
+    expired = true;
+    for (const worker of stats.workers.slice(previousWorkers)) worker.terminate();
+  });
+  const worker = stats.workers.at(-1);
+  viewer = value;
+  return { worker, openMs: now() - start, pageCount: value.pageCount };
+}
+function pageFor(n) {
+  const page = container.querySelector(`[data-page="${n}"]`);
+  if (!page) throw new Error(`page ${n} missing (${viewer?.pageCount} pages)`);
+  return page;
+}
+function imageEvidence(canvas) {
+  const ctx = canvas.getContext('2d');
+  const positions = [[0.1,0.1],[0.5,0.1],[0.9,0.5],[0.5,0.5],[0.1,0.9],[0.9,0.9]];
+  const samplePixels = positions.map(([x,y]) => [...ctx.getImageData(Math.min(canvas.width-1,Math.floor(x*canvas.width)),
+    Math.min(canvas.height-1,Math.floor(y*canvas.height)),1,1).data]);
+  const thumbnail = document.createElement('canvas');
+  thumbnail.width = 32; thumbnail.height = 32;
+  const reduced = thumbnail.getContext('2d');
+  reduced.drawImage(canvas, 0, 0, 32, 32);
+  const pixels = reduced.getImageData(0, 0, 32, 32).data;
+  let inkPixels = 0, alphaSum = 0;
+  for (let i = 3; i < pixels.length; i += 4) {
+    if (pixels[i]) inkPixels++;
+    alphaSum += pixels[i];
+  }
+  thumbnail.width = 0; thumbnail.height = 0;
+  return { samplePixels, thumbnailInkPixels: inkPixels, thumbnailAlphaSum: alphaSum };
+}
+async function visit(number, worker, ms, label) {
+  const start = now();
+  viewer.scrollToPage(number);
+  const page = pageFor(number);
+  page.scrollIntoView({ behavior: 'instant', block: 'start' });
+  const scale = viewer.zoom * dpr();
+  const matched = await until(() => {
+    const failure = worker.profile.failures.get(number);
+    if (failure && Math.abs(failure.scale - scale) < 1e-8)
+      throw new Error(`${label}: page ${number} worker render failed: ${failure.message}`);
+    const result = worker.profile.responses.get(number);
+    const canvas = page.querySelector('canvas'), layer = page.querySelector('.text-layer');
+    if (!shown(page) || !result || Math.abs(result.scale - scale) > 1e-8 || !canvas || !layer ||
+        !canvas.width || !canvas.height || canvas.width !== result.width || canvas.height !== result.height) return null;
+    return { result, canvas, layer };
+  }, `${label}: page ${number} canvas and text installed at scale ${scale}`, ms);
+  const { result, canvas, layer } = matched;
+  const rect = page.getBoundingClientRect();
+  return { label, page: number, zoom: viewer.zoom, scale, elapsedMs: now()-start,
+    requestPostedMs: result.postedAt == null ? null : result.postedAt-start,
+    responseMs: result.at-start, installedAfterResponseMs: now()-result.at,
+    geometry: { cssWidth: rect.width, cssHeight: rect.height, width: canvas.width, height: canvas.height },
+    textLength: layer.textContent.length, textPreview: layer.textContent.slice(0,120),
+    image: imageEvidence(canvas), visible: shown(page), memory: snapshot() };
+}
+function counters() {
+  return { created: stats.created, terminated: stats.terminated, active: stats.active,
+    requested: stats.requested, rendered: stats.rendered, closed: stats.closed,
+    invisibleRequests: stats.invisibleRequests, peakPending: stats.peakPending, errors: stats.errors.slice() };
+}
+async function profileDocument(spec, timeoutMs) {
+  const report = { id: spec.id, url: spec.url, requestedPages: spec.pages, stages: [], samples: [],
+    errors: [], countersBefore: counters(), dpr: dpr() };
+  const start = now();
+  let bytes, worker, failurePage = null;
+  try {
+    const fetchStart = now();
+    bytes = await fetchDocument(new URL(spec.url, location.href), timeoutMs);
+    report.fetchMs = now()-fetchStart; report.bytes = bytes.byteLength;
+    const opened = await open(bytes, timeoutMs);
+    worker = opened.worker;
+    report.open = { elapsedMs: opened.openMs, pageCount: opened.pageCount,
+      sizes: spec.pages.map(n => ({ page: n, points: worker.profile.sizes?.[n-1] ?? null })) };
+    report.samples.push({ label: 'after open', ...snapshot() });
+    const pages = spec.pages.length ? spec.pages : [1];
+    const succeeded = [];
+    for (const n of pages) {
+      failurePage = n;
+      const visitedAt = now();
+      try {
+        report.stages.push(await visit(n, worker, timeoutMs, 'cold visit'));
+        succeeded.push(n);
+      } catch (error) {
+        report.errors.push({ page: n, stage: 'cold visit', elapsedMs: now()-visitedAt, message: errText(error) });
+      }
+      report.samples.push({ label: `after page ${n}`, ...snapshot() });
+    }
+    if (!succeeded.length) throw new Error('No selected page rendered; lifecycle scenarios require a successful page');
+    failurePage = succeeded[0];
+    report.stages.push(await visit(failurePage, worker, timeoutMs, 'revisit'));
+    const last = succeeded.at(-1);
+    for (const n of [succeeded[0], last, succeeded[Math.floor(succeeded.length/2)], succeeded[0]]) {
+      viewer.scrollToPage(n);
+      pageFor(n).scrollIntoView({ behavior: 'instant', block: 'start' });
+    }
+    report.stages.push(await visit(succeeded[0], worker, timeoutMs, 'rapid jump settled'));
+    for (const z of [1.35, 0.8, 1.2]) {
+      viewer.setZoom(z);
+      viewer.scrollToPage(last);
+      pageFor(last).scrollIntoView({ behavior: 'instant', block: 'start' });
+    }
+    failurePage = last;
+    report.stages.push(await visit(last, worker, timeoutMs, 'rapid zoom settled'));
+    report.samples.push({ label: 'after jumps/zoom', ...snapshot() });
+    viewer.setZoom(1.6);
+    viewer.scrollToPage(succeeded[0]);
+    pageFor(succeeded[0]).scrollIntoView({ behavior: 'instant', block: 'start' });
+    await until(() => worker.profile.pending.size > 0, 'render request before zoom cancellation', timeoutMs);
+    const pendingAtZoom = worker.profile.pending.size, deliveredBeforeZoom = stats.rendered;
+    for (const z of [0.9, 1.1, 1.25]) viewer.setZoom(z);
+    failurePage = succeeded[0];
+    report.zoomPending = { pendingAtZoom, ...(await visit(succeeded[0], worker, timeoutMs, 'zoom during pending render')),
+      deliveredDuringZoom: stats.rendered - deliveredBeforeZoom };
+    report.samples.push({ label: 'after pending zoom', ...snapshot() });
+    // Make work pending before replacement; termination discards requests, not
+    // guaranteed to preempt synchronous worker execution already in progress.
+    viewer.setZoom(1.5);
+    viewer.scrollToPage(succeeded[0]);
+    pageFor(succeeded[0]).scrollIntoView({ behavior: 'instant', block: 'start' });
+    await until(() => worker.profile.pending.size > 0, 'render request before replacement', timeoutMs);
+    const pendingBeforeReplace = worker.profile.pending.size;
+    const replaceStart = now();
+    const replacement = await open(bytes, timeoutMs);
+    report.replacement = { pendingBeforeReplace, oldWorkerTerminated: worker.profile.terminated,
+      oldTerminationDelayMs: worker.profile.terminatedAt - replaceStart,
+      openMs: replacement.openMs, activeWorkers: stats.active };
+    worker = replacement.worker;
+    failurePage = last;
+    report.stages.push(await visit(last, worker, timeoutMs, 'replacement visible'));
+    viewer.setZoom(1.75);
+    viewer.scrollToPage(succeeded[0]);
+    pageFor(succeeded[0]).scrollIntoView({ behavior: 'instant', block: 'start' });
+    await until(() => worker.profile.pending.size > 0, 'render request before dispose', timeoutMs);
+    const pendingBeforeDispose = worker.profile.pending.size;
+    report.disposal = { pendingBeforeDispose, elapsedMs: dispose(), oldWorkerTerminated: worker.profile.terminated };
+    await frame();
+    report.samples.push({ label: 'after disposal', ...snapshot() });
+    if (stats.active !== 0 || snapshot().placeholders !== 0) throw new Error('worker or placeholders survived disposal');
+  } catch (error) {
+    report.errors.push({ page: failurePage, message: errText(error) });
+  } finally {
+    report.cleanupMs = dispose();
+    if (stats.active) for (const w of stats.workers) if (!w.profile.terminated) w.terminate();
+    report.final = snapshot();
+    report.elapsedMs = now()-start;
+    report.countersAfter = counters();
+    report.recentRequests = stats.timeline.slice(-32).map(({ id, page, scale, visible }) => ({ id,page,scale,visible }));
+    // Only small plain observations survive a document; not worker instances.
+    stats.workers.length = 0;
+    stats.timeline.length = 0;
+    stats.errors.length = 0;
+  }
+  return report;
+}
+const defaultDocuments = [
+  { id: 'tracemonkey-control', url: 'downloads/tracemonkey.pdf', pages: [7, 14, 1] },
+  { id: 'real-gnu-make', url: 'downloads/real-gnu-make.pdf', pages: [10, 100, 220] },
+  { id: 'real-jungle-1920', url: 'downloads/real-jungle-1920.pdf', pages: [10, 100, 400] },
+  { id: 'real-unesco-bhasha', url: 'downloads/real-unesco-bhasha.pdf', pages: [1, 35, 45, 78, 87] },
+  { id: 'real-unesco-chinese-gem', url: 'downloads/real-unesco-chinese-gem.pdf', pages: [3, 5, 8] },
+  { id: 'real-un-arabic', url: 'downloads/real-un-arabic.pdf', pages: [10, 30, 60] }
+];
+let running = false;
+async function run(options = {}) {
+  if (running) throw new Error('Profiler already running');
+  if (!openPdf) throw new Error(window.realWorld.error || 'Viewer module has not loaded');
+  running = true;
+  const documents = options.documents ?? defaultDocuments;
+  const output = { rbtRoot: root.href, browser: navigator.userAgent, dpr: dpr(),
+    timeoutMs: options.timeoutMs ?? 90000, documents: [], startedAt: new Date().toISOString() };
+  window.realWorld.latest = output;
+  try {
+    for (const spec of documents) {
+      status.textContent = `Profiling ${spec.id}…`;
+      output.documents.push(await profileDocument(spec, output.timeoutMs));
+    }
+    status.textContent = `Completed ${output.documents.length} documents`;
+    return output;
+  } finally { running = false; }
+}
+window.realWorld = { ready: false, error: null, run, snapshot, documents: defaultDocuments, latest: null };
+try {
+  ({ openPdf } = await import(new URL('dist/App.js', root).href));
+  window.realWorld.ready = true;
+  status.textContent = 'Ready';
+} catch (error) {
+  window.realWorld.error = errText(error);
+  status.textContent = window.realWorld.error;
+}
+</script>
+</body>
+</html>

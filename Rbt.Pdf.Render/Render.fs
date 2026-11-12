@@ -14,6 +14,8 @@ type GraphicsState = {
     CTM: Matrix3x2
     FillColor: Color
     StrokeColor: Color
+    FillK: byte
+    StrokeK: byte
     FillSource: (PdfColor.Space * float[]) option
     StrokeSource: (PdfColor.Space * float[]) option
     LineWidth: float
@@ -45,6 +47,8 @@ let private defaultState = {
     CTM = Matrix3x2.identity
     FillColor = Color.black
     StrokeColor = Color.black
+    FillK = 0uy
+    StrokeK = 0uy
     FillSource = PdfColor.device 1 |> Option.map (fun space -> space, [|0.0|])
     StrokeSource = PdfColor.device 1 |> Option.map (fun space -> space, [|0.0|])
     LineWidth = 1.0
@@ -173,7 +177,9 @@ type RenderOptions =
       /// JPEG (DCTDecode) raw stream bytes -> (w, h, premultiplied BGRA uint32[]). None = skip image.
       DecodeJpeg: byte[] -> (int * int * uint32[]) option
       /// Render a transparent pattern cell using the destination backend.
-      Rasterize: int -> int -> Cmd list -> Framebuffer }
+      Rasterize: int -> int -> Cmd list -> Framebuffer
+      /// Render a subtractive four-component cell, preserving CMY and K planes.
+      Rasterize4: int -> int -> Cmd list -> Framebuffer * Framebuffer }
 
 #if !FABLE_COMPILER
 module RenderOptions =
@@ -217,7 +223,9 @@ module RenderOptions =
                   let backend = Raster.create ()
                   backend.Init width height
                   backend.Submit (Clear (Color.rgba 0uy 0uy 0uy 0uy) :: commands)
-                  backend.Finish () }
+                  backend.Finish ()
+              Rasterize4 = fun width height commands ->
+                  Raster.rasterizeComponents width height Matrix3x2.identity 0 true commands }
 
     /// Options for .NET: the fallback font from fallbackFontCandidates, JPEG decoding by ImageDecode.decode.
     let native () = nativeOpts.Value
@@ -249,6 +257,30 @@ let private groupConversion (parent: PdfColor.WorkingSpace) (child: PdfColor.Wor
         let struct(x,y,z) = source.ToPcs r g b
         destination.FromPcs x y z
     { ToGroup = convert parent child; ToParent = convert child parent }
+let private groupConversion4 (parent: PdfColor.WorkingSpace) (child: PdfColor.WorkingSpace) : ColorSpaceConversion4 =
+    let components (space: PdfColor.WorkingSpace) = if space.FourChannel.IsSome then 4 else 3
+    let convert (source: PdfColor.WorkingSpace) (destination: PdfColor.WorkingSpace) r g b k =
+        let struct(x,y,z) =
+            match source.FourChannel with
+            | Some (forward, _) -> forward r g b k
+            | None -> source.ToPcs r g b
+        match destination.FourChannel with
+        | Some (_, inverse) -> inverse x y z
+        | None ->
+            let struct(r,g,b) = destination.FromPcs x y z
+            struct(r,g,b,0.0)
+    { ParentComponents = components parent; GroupComponents = components child
+      ToGroup = convert parent child; ToParent = convert child parent
+      Complement = child.FourChannel.IsSome }
+
+let private managedGroup (parent: PdfColor.WorkingSpace) (child: PdfColor.WorkingSpace option)
+                         isolated knockout opacity mode mask children =
+    match child with
+    | Some target when not (PdfColor.sameWorkingSpace parent target) ->
+        if parent.FourChannel.IsSome || target.FourChannel.IsSome then
+            ColorManagedGroup4(groupConversion4 parent target, isolated, knockout, opacity, mode, mask, children)
+        else ColorManagedGroup(groupConversion parent target, isolated, knockout, opacity, mode, mask, children)
+    | _ -> TransparencyGroup(isolated, knockout, opacity, mode, mask, children)
 
 let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resources: PdfObj) (contentData: byte[]) (initialState: GraphicsState) (initialWorking: PdfColor.WorkingSpace option) (viewport: PageGeometry.Viewport) (scale: float) (depth: int) : Cmd list * CharBox[] =
             if depth > 32 then invalidOp "PDF content recursion limit exceeded"
@@ -262,17 +294,24 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
             let stateStack = ResizeArray<GraphicsState>()
             let mutable gs = initialState
             let mutable working = initialWorking
+            let isFourChannel () = working |> Option.exists (fun space -> space.FourChannel.IsSome)
             let toTarget space values =
                 match working with
                 | Some target -> PdfColor.toWorkingRgb target space values
                 | None -> PdfColor.toRgb space values
+            let toImageTarget space values =
+                match working with
+                | Some target when target.FourChannel.IsSome -> PdfColor.toWorkingCmyk target space values
+                | _ -> let struct(r,g,b) = toTarget space values in struct(r,g,b,0uy)
             let sourceColor (space, values) alpha =
-                let struct(r,g,b) = toTarget space values
-                Color.rgba r g b (byte (clamp 0.0 255.0 (alpha * 255.0)))
+                let struct(r,g,b,k) = toImageTarget space values
+                Color.rgba r g b (byte (clamp 0.0 255.0 (alpha * 255.0))), k
             let refreshColors state =
-                { state with
-                    FillColor = state.FillSource |> Option.map (fun source -> sourceColor source state.FillAlpha) |> Option.defaultValue state.FillColor
-                    StrokeColor = state.StrokeSource |> Option.map (fun source -> sourceColor source state.StrokeAlpha) |> Option.defaultValue state.StrokeColor }
+                let fill, fillK = state.FillSource |> Option.map (fun source -> sourceColor source state.FillAlpha)
+                                  |> Option.defaultValue (state.FillColor,state.FillK)
+                let stroke, strokeK = state.StrokeSource |> Option.map (fun source -> sourceColor source state.StrokeAlpha)
+                                      |> Option.defaultValue (state.StrokeColor,state.StrokeK)
+                { state with FillColor = fill; FillK = fillK; StrokeColor = stroke; StrokeK = strokeK }
             gs <- refreshColors gs
             let path = PathBuilder(fun () -> gs.CTM)
             let cmds = ResizeArray<Cmd>()
@@ -363,7 +402,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     | CubicTo (a, b, c) -> CubicTo(p a, p b, p c)
                     | other -> other)
 
-            let patternCommands name color source alpha bounds =
+            let patternCommands name color k source alpha bounds =
                 let number value =
                     match Pdf.deref doc value with PdfInt n -> float n | PdfReal n -> n | _ -> 0.0
                 let get key obj = Pdf.dictGet doc key obj |> Option.map (Pdf.deref doc)
@@ -382,7 +421,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     | Some (PdfInt 2L) ->
                         match get "Shading" pattern with
                         | Some shading ->
-                            Shading.tryRenderObject toTarget doc currentResources shading patternToPage 1.0 bounds scale
+                            Shading.tryRenderObject toImageTarget (isFourChannel ()) doc currentResources shading patternToPage 1.0 bounds scale
                             |> Option.map (fun command -> [Group(Matrix3x2.identity, alpha, [command])], lazy [Cmd.shapeOf command])
                             |> Option.defaultValue ([], lazy [])
                         | None -> [], lazy []
@@ -401,6 +440,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                 let tileState =
                                     { gs with CTM = Matrix3x2.identity; FillPattern = None; StrokePattern = None
                                               FillColor = { color with A = 255uy }; StrokeColor = { color with A = 255uy }
+                                              FillK = k; StrokeK = k
                                               FillSource = source; StrokeSource = source; FillAlpha = 1.0; StrokeAlpha = 1.0
                                               BlendMode = "Normal"; SoftMask = None; AlphaIsShape = defaultAlphaIsShape }
                                 let tileViewport =
@@ -422,7 +462,16 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                     [ for iy in firstY .. lastY do
                                         for ix in firstX .. lastX do
                                             yield Group(Matrix3x2.translate (float ix * stepX) (float iy * stepY), 1.0, cell) ]
-                                let image = opts.Rasterize width height [Group(toPixels, 1.0, cells)]
+                                let images =
+                                    let commands = [Group(toPixels, 1.0, cells)]
+                                    if isFourChannel () then
+                                        let main, k = opts.Rasterize4 width height commands
+                                        Some (main, k)
+                                    else None
+                                let image =
+                                    match images with
+                                    | Some (main, _) -> main
+                                    | None -> opts.Rasterize width height [Group(toPixels, 1.0, cells)]
                                 let fromPixels =
                                     { M11 = 1.0 / sx; M12 = 0.0; M21 = 0.0; M22 = -1.0 / sy
                                       DX = 0.5 / sx; DY = stepY - 0.5 / sy }
@@ -431,10 +480,17 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                 let shape = lazy (
                                     let shapeImage = opts.Rasterize width height [Cmd.shapeOf (Group(toPixels, 1.0, cells))]
                                     [FillPath(area, TilingPaint(shapeImage, placement, Repeat, Repeat), NonZero)])
-                                [Group(Matrix3x2.identity, alpha, [FillPath(area, TilingPaint(image, placement, Repeat, Repeat), NonZero)])], shape
+                                let main = Group(Matrix3x2.identity, alpha, [FillPath(area, TilingPaint(image, placement, Repeat, Repeat), NonZero)])
+                                let command =
+                                    match images with
+                                    | Some (_, k) ->
+                                        Components4(main, Group(Matrix3x2.identity, alpha, [FillPath(area, TilingPaint(k, placement, Repeat, Repeat), NonZero)]))
+                                    | None -> main
+                                [command], shape
                         | _ -> [], lazy []
                     | _ -> [], lazy []
 
+            let fourthColor value (original: Color) = Color.rgba value value value original.A
             let paintPath (segments: PathSeg list) fill stroke rule =
                 let bounds () =
                     let points =
@@ -454,9 +510,16 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                 if fill then
                     match gs.FillPattern with
                     | Some name ->
-                        let color, shape = patternCommands name gs.FillColor gs.FillSource gs.FillAlpha (bounds ())
+                        let color, shape = patternCommands name gs.FillColor gs.FillK gs.FillSource gs.FillAlpha (bounds ())
                         addPaint gs.FillAlpha (Some (lazy [Clip(segments, rule, shape.Value)])) true (Clip(segments, rule, color))
-                    | None -> addPaint gs.FillAlpha None true (FillPath(segments, Solid (fillColor gs), rule))
+                    | None ->
+                        let color = fillColor gs
+                        let main = FillPath(segments, Solid color, rule)
+                        let command =
+                            if isFourChannel () then
+                                Components4(main, FillPath(segments, Solid (fourthColor gs.FillK color), rule))
+                            else main
+                        addPaint gs.FillAlpha None true command
                 if stroke && abs (gs.CTM.M11 * gs.CTM.M22 - gs.CTM.M12 * gs.CTM.M21) > 1e-12 then
                     let style = makeStroke gs
                     let strokeCommand paint =
@@ -464,10 +527,18 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         else Group(gs.CTM, 1.0, [StrokePath(transformPath (Matrix3x2.inverse gs.CTM) segments, { style with Paint = paint })])
                     match gs.StrokePattern with
                     | Some name ->
-                        let color, shape = patternCommands name gs.StrokeColor gs.StrokeSource gs.StrokeAlpha (bounds ())
+                        let color, shape = patternCommands name gs.StrokeColor gs.StrokeK gs.StrokeSource gs.StrokeAlpha (bounds ())
                         let geometry = strokeCommand (Solid Color.white)
                         addPaint gs.StrokeAlpha (Some (lazy [Mask([geometry], shape.Value)])) true (Mask([geometry], color))
-                    | None -> addPaint gs.StrokeAlpha None true (strokeCommand style.Paint)
+                    | None ->
+                        let main = strokeCommand style.Paint
+                        let command =
+                            if isFourChannel () then
+                                let alpha = byte (clamp 0.0 255.0 (gs.StrokeAlpha * 255.0))
+                                let k = Color.rgba gs.StrokeK gs.StrokeK gs.StrokeK alpha
+                                Components4(main, strokeCommand (Solid k))
+                            else main
+                        addPaint gs.StrokeAlpha None true command
 
             let getFontInfo () =
                 let key = Pdf.dictGet doc "Font" currentResources |> Option.bind (Pdf.dictGet doc gs.FontName)
@@ -604,7 +675,15 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                            Glyphs = Array.init (finish - first) (fun i -> snd glyphs.[first + i])
                                            Direction = Rbt.Shaper.Shaper.LeftToRight }
                                 first <- finish
-                            addPaint gs.FillAlpha None true (Group(localToPage, 1.0, [DrawGlyphs(vec2 0.0 0.0, List.ofSeq runs, Solid(fillColor gs))]))
+                            let runs = List.ofSeq runs
+                            let color = fillColor gs
+                            let main = Group(localToPage, 1.0, [DrawGlyphs(vec2 0.0 0.0, runs, Solid color)])
+                            let command =
+                                if isFourChannel () then
+                                    let fourth = Group(localToPage, 1.0, [DrawGlyphs(vec2 0.0 0.0, runs, Solid (fourthColor gs.FillK color))])
+                                    Components4(main, fourth)
+                                else main
+                            addPaint gs.FillAlpha None true command
                         elif fill || stroke || clipping then
                             for glyphFont, glyph in glyphs do
                                 let size = fontSize / Text.unitsPerEm glyphFont
@@ -652,7 +731,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     let masks = paths |> List.map (fun segs -> FillPath(segs, Solid Color.white, NonZero))
                     Mask(masks, children)
 
-            let streamStack = Collections.Generic.Stack<Token[] * int * PdfObj * Matrix3x2 * bool * PdfColor.WorkingSpace option * (int * bool * bool * ColorSpaceConversion option) option>()
+            let streamStack = Collections.Generic.Stack<Token[] * int * PdfObj * Matrix3x2 * bool * PdfColor.WorkingSpace option * (int * bool * bool * PdfColor.WorkingSpace option) option>()
             let mutable tokenArr = tokens |> Array.ofList
             let mutable tokenCount = tokenArr.Length
             let mutable i = 0
@@ -665,11 +744,16 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                 | None -> ()
 
             let paintImage image =
-                match PdfImages.decode opts.DecodeJpeg toTarget doc currentResources image { (fillColor gs) with A = 255uy } 0 with
-                | Some (w, h, pixels, geometry, softImageMask, geometricMask) ->
+                match PdfImages.decode opts.DecodeJpeg toImageTarget (isFourChannel ()) doc currentResources
+                    image { (fillColor gs) with A = 255uy } gs.FillK 0 with
+                | Some (w, h, pixels, geometry, softImageMask, geometricMask, fourth) ->
                     let interpolate = Pdf.dictGet doc "Interpolate" image |> Option.map (Pdf.deref doc) = Some (PdfBool true)
                     let ctm, alpha = gs.CTM, gs.FillAlpha
-                    let command = Group(ctm, alpha, [BitmapPaint.command pixels w h interpolate])
+                    let main = Group(ctm, alpha, [BitmapPaint.command pixels w h interpolate])
+                    let command =
+                        match fourth with
+                        | Some k -> Components4(main, Group(ctm, alpha, [BitmapPaint.command k w h interpolate]))
+                        | None -> main
                     let intrinsic =
                         if softImageMask && not gs.AlphaIsShape then
                             Some (lazy (
@@ -703,13 +787,12 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                 clipStack.RemoveAt(clipStack.Count - 1)
                                 poppingClips2 <- false
                         match groupStart with
-                        | Some (start, isolated, knockout, conversion) ->
+                        | Some (start, isolated, knockout, childWorking) ->
                             let children = cmds |> Seq.skip start |> Seq.toList
                             cmds.RemoveRange(start, cmds.Count - start)
                             let group =
-                                match conversion with
-                                | Some conversion -> ColorManagedGroup(conversion, isolated, knockout, gs.FillAlpha, blendMode gs.BlendMode, gs.SoftMask, children)
-                                | None -> TransparencyGroup(isolated, knockout, gs.FillAlpha, blendMode gs.BlendMode, gs.SoftMask, children)
+                                managedGroup (prevWorking |> Option.defaultValue PdfColor.displaySpace) childWorking
+                                    isolated knockout gs.FillAlpha (blendMode gs.BlendMode) gs.SoftMask children
                             if gs.AlphaIsShape && (gs.FillAlpha <> 1.0 || gs.SoftMask.IsSome) then
                                 let alpha, mask = gs.FillAlpha, gs.SoftMask
                                 let shape = lazy (
@@ -892,31 +975,72 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                                     let encodedComponent i =
                                                         let value = max limits.[2*i] (min limits.[2*i+1] values.[i])
                                                         byte (int (clamp 0.0 1.0 value * 255.0 + 0.5))
-                                                    let r = encodedComponent 0
-                                                    let g, b = if count = 1 then r, r else encodedComponent 1, encodedComponent 2
-                                                    let backdrop = Pixel.fromColor { R = r; G = g; B = b; A = 255uy }
-                                                    // BC is the group backdrop even outside its BBox. Seed
-                                                    // the whole device surface independently of the CTM.
-                                                    let seed _ _ (pixels: uint32[]) =
-                                                        Array.fill pixels 0 pixels.Length backdrop
-                                                        pixels
-                                                    Filtered([Custom seed], []) :: bounded
-                                            let convert _ _ (pixels: uint32[]) =
-                                                pixels |> Array.map (fun pixel ->
-                                                    let c = Pixel.toColor pixel
-                                                    let value =
-                                                        if not luminosity then float c.A / 255.0
+                                                    match maskWorking with
+                                                    | Some target when target.FourChannel.IsSome ->
+                                                        let struct(c,m,y,k) = PdfColor.toWorkingCmyk target space values
+                                                        let x0,y0,x1,y1 = viewport.Bounds
+                                                        let whole = [MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0); LineTo(vec2 x1 y1); LineTo(vec2 x0 y1); Close]
+                                                        let primary = FillPath(whole, Solid(Color.rgb c m y), NonZero)
+                                                        let fourth = FillPath(whole, Solid(Color.rgb k k k), NonZero)
+                                                        Components4(primary, fourth) :: bounded
+                                                    | _ ->
+                                                        let r = encodedComponent 0
+                                                        let g, b = if count = 1 then r, r else encodedComponent 1, encodedComponent 2
+                                                        let backdrop = Pixel.fromColor { R = r; G = g; B = b; A = 255uy }
+                                                        // BC is the group backdrop even outside its BBox.
+                                                        let seed _ _ (pixels: uint32[]) =
+                                                            Array.fill pixels 0 pixels.Length backdrop
+                                                            pixels
+                                                        Filtered([Custom seed], []) :: bounded
+                                            match maskWorking with
+                                            | Some target when luminosity && target.FourChannel.IsSome ->
+                                                let forward, _ = target.FourChannel.Value
+                                                let x0,y0,x1,y1 = viewport.Bounds
+                                                let requested = if scale > 0.0 then scale else 1.0
+                                                let resolution = requested * min 1.0 (sqrt (4000000.0 / ((x1-x0)*(y1-y0)*requested*requested)))
+                                                let width = max 1 (int (ceil ((x1-x0)*resolution)))
+                                                let height = max 1 (int (ceil ((y1-y0)*resolution)))
+                                                let sx,sy = float width/(x1-x0), float height/(y1-y0)
+                                                let toPixels =
+                                                    { M11 = sx; M12 = 0.0; M21 = 0.0; M22 = -sy
+                                                      DX = -x0*sx; DY = y1*sy }
+                                                let primary, fourth = opts.Rasterize4 width height [Group(toPixels, 1.0, input)]
+                                                let pixels = Framebuffer.tryGetArray primary |> Option.get
+                                                let black = Framebuffer.tryGetArray fourth |> Option.get
+                                                for index in 0 .. pixels.Length-1 do
+                                                    let color = pixels.[index]
+                                                    let alpha = Pixel.a color
+                                                    let lightness =
+                                                        if alpha = 0uy then 0.0
                                                         else
-                                                            let r, g, b = float c.R / 255.0, float c.G / 255.0, float c.B / 255.0
-                                                            match maskWorking with
-                                                            | Some target when not target.IsDisplay && not target.IsGray ->
-                                                                let struct(_, y, _) = target.ToPcs r g b
-                                                                clamp 0.0 1.0 y
-                                                            | _ -> 0.3 * r + 0.59 * g + 0.11 * b
-                                                    let mapped = match transfer with Some fn -> fn value | None -> value
-                                                    let a = byte (clamp 0.0 255.0 (mapped * 255.0))
-                                                    Pixel.fromColor { R = a; G = a; B = a; A = a })
-                                            [Filtered([Custom convert], input)]
+                                                            let unpremul channel =
+                                                                min 1.0 (float channel / float alpha)
+                                                            let struct(_, y, _) =
+                                                                forward (unpremul (Pixel.r color)) (unpremul (Pixel.g color))
+                                                                    (unpremul (Pixel.b color)) (unpremul (Pixel.r black.[index]))
+                                                            clamp 0.0 1.0 y
+                                                    let value = match transfer with Some fn -> fn lightness | None -> lightness
+                                                    let maskAlpha = byte (clamp 0.0 255.0 (value * 255.0))
+                                                    pixels.[index] <- Pixel.pack maskAlpha maskAlpha maskAlpha maskAlpha
+                                                let toPage = { M11 = x1-x0; M12 = 0.0; M21 = 0.0; M22 = y1-y0; DX = x0; DY = y0 }
+                                                [Group(toPage, 1.0, [BitmapPaint.command pixels width height true])]
+                                            | _ ->
+                                                let convert _ _ (pixels: uint32[]) =
+                                                    pixels |> Array.map (fun pixel ->
+                                                        let c = Pixel.toColor pixel
+                                                        let value =
+                                                            if not luminosity then float c.A / 255.0
+                                                            else
+                                                                let r, g, b = float c.R / 255.0, float c.G / 255.0, float c.B / 255.0
+                                                                match maskWorking with
+                                                                | Some target when not target.IsDisplay && not target.IsGray ->
+                                                                    let struct(_, y, _) = target.ToPcs r g b
+                                                                    clamp 0.0 1.0 y
+                                                                | _ -> 0.3 * r + 0.59 * g + 0.11 * b
+                                                        let mapped = match transfer with Some fn -> fn value | None -> value
+                                                        let a = byte (clamp 0.0 255.0 (mapped * 255.0))
+                                                        Pixel.fromColor { R = a; G = a; B = a; A = a })
+                                                [Filtered([Custom convert], input)]
                                     gs <- { gs with SoftMask = Some maskCommands }
                                 | None -> ()
                             | None -> ()
@@ -931,11 +1055,11 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                             | _ -> 4, "DeviceCMYK"
                         let values = Array.init count (fun _ -> popNum ()) |> Array.rev
                         let source = PdfColor.device count |> Option.map (fun space -> space, values)
-                        let color = source |> Option.map (fun s -> sourceColor s 1.0) |> Option.defaultValue Color.black
+                        let color, k = source |> Option.map (fun s -> sourceColor s 1.0) |> Option.defaultValue (Color.black,0uy)
                         if op = op.ToLowerInvariant() then
-                            gs <- { gs with FillColor = color; FillSource = source; ColorSpace = name; FillPattern = None }
+                            gs <- { gs with FillColor = color; FillK = k; FillSource = source; ColorSpace = name; FillPattern = None }
                         else
-                            gs <- { gs with StrokeColor = color; StrokeSource = source; StrokeColorSpace = name; StrokePattern = None }
+                            gs <- { gs with StrokeColor = color; StrokeK = k; StrokeSource = source; StrokeColorSpace = name; StrokePattern = None }
                     | "cs" ->
                         let csName = popName ()
                         gs <- { gs with ColorSpace = resolveColorSpace csName; FillPattern = None }
@@ -947,21 +1071,21 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         let nums = ops |> List.choose (function TNumber n -> Some n | _ -> None)
                         let space = if gs.ColorSpace.StartsWith("Pattern:") then gs.ColorSpace.Substring(8) else gs.ColorSpace
                         let source = PdfColor.resolve doc currentResources (PdfName space) |> Option.map (fun s -> s, List.toArray nums)
-                        let color = source |> Option.map (fun s -> sourceColor s gs.FillAlpha) |> Option.defaultWith (fun () ->
+                        let color, k = source |> Option.map (fun s -> sourceColor s gs.FillAlpha) |> Option.defaultWith (fun () ->
                             if working.IsSome && not nums.IsEmpty then invalidOp "Unsupported PDF paint color space for transparency blending"
-                            pdfColorToColor space nums gs.FillAlpha)
+                            pdfColorToColor space nums gs.FillAlpha, 0uy)
                         let pattern = if gs.ColorSpace.StartsWith("Pattern") then ops |> List.tryPick (function TName n -> Some n | _ -> None) else None
-                        gs <- { gs with FillColor = color; FillSource = source; FillPattern = pattern }
+                        gs <- { gs with FillColor = color; FillK = k; FillSource = source; FillPattern = pattern }
                     | "SC" | "SCN" ->
                         let ops = popAllOperands ()
                         let nums = ops |> List.choose (function TNumber n -> Some n | _ -> None)
                         let space = if gs.StrokeColorSpace.StartsWith("Pattern:") then gs.StrokeColorSpace.Substring(8) else gs.StrokeColorSpace
                         let source = PdfColor.resolve doc currentResources (PdfName space) |> Option.map (fun s -> s, List.toArray nums)
-                        let color = source |> Option.map (fun s -> sourceColor s gs.StrokeAlpha) |> Option.defaultWith (fun () ->
+                        let color, k = source |> Option.map (fun s -> sourceColor s gs.StrokeAlpha) |> Option.defaultWith (fun () ->
                             if working.IsSome && not nums.IsEmpty then invalidOp "Unsupported PDF paint color space for transparency blending"
-                            pdfColorToColor space nums gs.StrokeAlpha)
+                            pdfColorToColor space nums gs.StrokeAlpha, 0uy)
                         let pattern = if gs.StrokeColorSpace.StartsWith("Pattern") then ops |> List.tryPick (function TName n -> Some n | _ -> None) else None
-                        gs <- { gs with StrokeColor = color; StrokeSource = source; StrokePattern = pattern }
+                        gs <- { gs with StrokeColor = color; StrokeK = k; StrokeSource = source; StrokePattern = pattern }
 
                     // ── Path Construction ──
                     | "m" -> let y = popNum () in let x = popNum () in path.MoveTo(x, y)
@@ -1092,7 +1216,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
 
                     | "sh" ->
                         let name = popName ()
-                        match Shading.tryRender toTarget doc currentResources name gs.CTM 1.0 viewport.Bounds scale with
+                        match Shading.tryRender toImageTarget (isFourChannel ()) doc currentResources name gs.CTM 1.0 viewport.Bounds scale with
                         | Some command ->
                             let color = if gs.FillAlpha = 1.0 then command else Group(Matrix3x2.identity, gs.FillAlpha, [command])
                             addPaint gs.FillAlpha None true color
@@ -1133,12 +1257,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                                     let child = groupWorkingSpace doc formResources group
                                                     let knockout = Pdf.dictGet doc "K" group |> Option.map (Pdf.deref doc) = Some (PdfBool true)
                                                     let isolated = Pdf.dictGet doc "I" group |> Option.map (Pdf.deref doc) = Some (PdfBool true)
-                                                    let parent = working |> Option.defaultValue PdfColor.displaySpace
-                                                    let conversion =
-                                                        child |> Option.bind (fun target ->
-                                                            if PdfColor.sameWorkingSpace parent target then None
-                                                            else Some (groupConversion parent target))
-                                                    child |> Option.orElse working, Some (cmds.Count, isolated, knockout, conversion)
+                                                    child |> Option.orElse working, Some (cmds.Count, isolated, knockout, child)
                                                 | _ -> working, None
                                             streamStack.Push(tokenArr, i, currentResources, defaultCTM, defaultAlphaIsShape, working, groupStart)
                                             stateStack.Add(gs)
@@ -1685,10 +1804,8 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
                 pageGroupDict |> Option.bind (Pdf.dictGet doc "K") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
             // A page is isolated from the caller's backdrop.
             let pageGroup =
-                let contents = pageCommands @ annotationCommands
-                match pageWorking with
-                | Some target when not target.IsDisplay -> ColorManagedGroup(groupConversion PdfColor.displaySpace target, true, pageKnockout, 1.0, Normal, None, contents)
-                | _ -> TransparencyGroup(true, pageKnockout, 1.0, Normal, None, contents)
+                managedGroup PdfColor.displaySpace pageWorking true pageKnockout 1.0 Normal None
+                    (pageCommands @ annotationCommands)
             let scaledCmds = [Group(pageTransform, 1.0, [Clip(pageClip, NonZero, [pageGroup])])]
             let scaledCharBoxes =
                 Array.append pageChars annotationChars |> Array.map (fun cb ->

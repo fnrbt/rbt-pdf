@@ -130,9 +130,11 @@ let rec drawingEvents matrix clipped commands =
             yield! drawingEvents (Matrix3x2.multiply m matrix) clipped children
         | Clip (_, _, children) -> yield! drawingEvents matrix true children
         | TransparencyGroup (_, _, _, _, _, children)
-        | ColorManagedGroup (_, _, _, _, _, _, children) ->
+        | ColorManagedGroup (_, _, _, _, _, _, children)
+        | ColorManagedGroup4 (_, _, _, _, _, _, children) ->
             yield! drawingEvents matrix clipped children
         | WithShape (_, children) -> yield! drawingEvents matrix clipped children
+        | Components4 (first, _) -> yield! drawingEvents matrix clipped [first]
         | FillPath (segments, _, _) | StrokePath (segments, _) ->
             yield "path", clipped, [ for seg in segments do
                                         match seg with
@@ -155,6 +157,36 @@ let renderPixels content =
 [<EntryPoint>]
 let main _ =
     test "baseline" (fun () -> assertHello "baseline" (build normal onePage 1))
+
+    test "JBIG2 page and PDF image dimensions" (fun () ->
+        let uint32Bytes n =
+            [| byte (n >>> 24); byte (n >>> 16); byte (n >>> 8); byte n |]
+        let pageInfo pageWidth pageHeight =
+            Array.concat
+                [ [| 0uy; 0uy; 0uy; 0uy; 48uy; 0uy; 1uy; 0uy; 0uy; 0uy; 19uy |]
+                  uint32Bytes pageWidth; uint32Bytes pageHeight
+                  Array.zeroCreate 8; [| 4uy; 0uy; 0uy |] ]
+        let decode data w h = Rbt.Pdf.Render.Jbig2Decode.decode data None w h
+        let data = pageInfo 9 2
+        check "JBIG2 crops to PDF row stride and pads height"
+            (decode data 8 3 = Some [| 0uy; 0uy; 255uy |])
+        check "JBIG2 pads outside page bounds even with black default"
+            (decode data 10 2 = Some [| 0uy; 127uy; 0uy; 127uy |])
+        check "JBIG2 rejects zero page width" (decode (pageInfo 0 2) 8 2 = None))
+
+    test "JBIG2 extreme adaptive coordinates stay outside bitmap" (fun () ->
+        let data = Array.create 64 0x55uy
+        let context () = Rbt.Pdf.Render.Jbig2Bitmaps.Context(data, 0, data.Length)
+        let generic dx =
+            Rbt.Pdf.Render.Jbig2Bitmaps.decodeBitmap false 3 3 3 false None [| dx, 0 |] (context ())
+        check "JBIG2 generic coordinate arithmetic does not wrap"
+            (generic Int32.MinValue = generic (-1000))
+        let reference = [| [| 1uy; 0uy; 1uy |]; [| 0uy; 1uy; 0uy |] |]
+        let refinement offset adaptive =
+            Rbt.Pdf.Render.Jbig2Bitmaps.decodeRefinement 3 2 0 reference offset offset true
+                [| (-1, 0); (adaptive, adaptive) |] (context ())
+        check "JBIG2 refinement coordinate arithmetic does not wrap"
+            (refinement Int32.MinValue Int32.MaxValue = refinement 1000 (-1000)))
 
     test "JPX odd-phase multilevel tiles reconstruct pixels" (fun () ->
         // Generated from the formula below using FFmpeg jpeg2000, dwt53,
@@ -529,6 +561,112 @@ let main _ =
         draw (ColorManagedGroup(conversion, true, false, 0.5, Normal, Some mask, children))
         |> assertRgb "managed mask and opacity apply once" (45,191,45))
 
+    test "four-component groups preserve K across blending and nested boundaries" (fun () ->
+        let bounds = rect 0.0 0.0 16.0 16.0
+        let paint r g b k a =
+            Components4 (FillRect (bounds, Color.rgba r g b a),
+                         FillRect (bounds, Color.rgba k k k a))
+        let rgbToFour : ColorSpaceConversion4 =
+            { ParentComponents = 3; GroupComponents = 4; Complement = true
+              ToGroup = fun r g b _ -> struct (r, g, 0.0, b)
+              ToParent = fun c m _ k -> struct (c, m, k, 0.0) }
+        let swap : ColorSpaceConversion4 =
+            { ParentComponents = 4; GroupComponents = 4; Complement = true
+              ToGroup = fun c m y k -> struct (k, m, y, c)
+              ToParent = fun c m y k -> struct (k, m, y, c) }
+        let draw backdrop command =
+            let backend = Raster.create ()
+            backend.Init 16 16
+            backend.Submit [Clear backdrop; command]
+            let pixels = backend.Finish () |> Framebuffer.tryGetArray |> Option.get
+            pixels.[8*16+8]
+        let assertRgb label (r,g,b) pixel =
+            check label (abs (int (Pixel.r pixel) - r) <= 3
+                         && abs (int (Pixel.g pixel) - g) <= 3
+                         && abs (int (Pixel.b pixel) - b) <= 3
+                         && Pixel.a pixel = 255uy)
+        let group children = ColorManagedGroup4 (rgbToFour, true, false, 1.0, Normal, None, children)
+        draw Color.white (group [paint 51uy 76uy 0uy 0uy 255uy])
+        |> assertRgb "zero K" (51,76,0)
+        draw Color.white (group [paint 51uy 76uy 0uy 204uy 255uy])
+        |> assertRgb "independent K" (51,76,204)
+        let multiply =
+            ColorManagedGroup4 (rgbToFour, false, false, 1.0, Normal, None,
+                                [Blend (Multiply, [paint 128uy 153uy 0uy 128uy 255uy])])
+        draw (Color.rgb 51uy 76uy 102uy) multiply
+        |> assertRgb "subtractive nonisolated Multiply includes K" (153,183,179)
+        let identityFour : ColorSpaceConversion4 =
+            { ParentComponents = 4; GroupComponents = 4; Complement = true
+              ToGroup = fun c m y k -> struct (c, m, y, k)
+              ToParent = fun c m y k -> struct (c, m, y, k) }
+        let clipPath =
+            [MoveTo (vec2 0.0 0.0); LineTo (vec2 12.0 0.0)
+             LineTo (vec2 12.0 12.0); LineTo (vec2 0.0 12.0); Close]
+        let inner =
+            ColorManagedGroup4 (identityFour, false, false, 1.0, Normal, None,
+                                [Blend (Multiply, [paint 128uy 153uy 0uy 128uy 255uy])])
+        let wrapped =
+            Group (Matrix3x2.translate 2.0 2.0, 1.0,
+                   [Clip (clipPath, NonZero,
+                          [WithShape (lazy [FillRect (bounds, Color.white)], [inner])])])
+        draw Color.white (group [paint 51uy 76uy 0uy 102uy 255uy; wrapped])
+        |> assertRgb "transformed clipped nested nonisolated Multiply preserves K" (153,183,179)
+        let nested =
+            ColorManagedGroup4 (swap, true, false, 0.5, Normal, None,
+                                [paint 204uy 26uy 0uy 153uy 255uy])
+        draw Color.white (group [paint 51uy 76uy 0uy 102uy 255uy; nested])
+        |> assertRgb "nested conversion and opacity include K" (102,51,153)
+        let image = Framebuffer.create 1 1 (Color.rgb 20uy 30uy 40uy)
+        let blackPlane = Framebuffer.create 1 1 (Color.rgb 210uy 210uy 210uy)
+        let imagePaint =
+            Components4 (DrawImage (image, rect 0.0 0.0 1.0 1.0, bounds, false),
+                         DrawImage (blackPlane, rect 0.0 0.0 1.0 1.0, bounds, false))
+        draw Color.white (group [imagePaint])
+        |> assertRgb "image fourth component survives sampling" (20,30,210)
+        let firstPlane, fourthPlane =
+            Raster.rasterizeComponents 16 16 Matrix3x2.identity 0 true
+                [paint 20uy 30uy 40uy 210uy 128uy]
+        let firstPixel = (Framebuffer.tryGetArray firstPlane |> Option.get).[8*16+8]
+        let fourthPixel = (Framebuffer.tryGetArray fourthPlane |> Option.get).[8*16+8]
+        check "offscreen components preserve premultiplied alpha and K"
+            (Pixel.a firstPixel = 128uy && Pixel.a fourthPixel = 128uy
+             && abs (int (Pixel.r firstPixel) - 10) <= 1
+             && abs (int (Pixel.r fourthPixel) - 105) <= 1)
+        let halfMask = [FillRect (bounds, Color.rgba 255uy 255uy 255uy 128uy)]
+        let translucentInner =
+            ColorManagedGroup4 (identityFour, false, false, 0.5, Normal, Some halfMask,
+                                [paint 204uy 26uy 0uy 153uy 128uy])
+        let shapedInner = WithShape (lazy [FillRect (bounds, Color.white)], [translucentInner])
+        let basePaint = paint 51uy 76uy 0uy 102uy 255uy
+        draw Color.white (group [basePaint; shapedInner])
+        |> assertRgb "nested nonisolated alpha, opacity and mask" (70,70,108)
+        let knockoutNested =
+            ColorManagedGroup4 (rgbToFour, true, true, 1.0, Normal, None, [basePaint; shapedInner])
+        draw Color.white knockoutNested
+        |> assertRgb "nested nonisolated alpha under knockout" (249,226,242)
+        let masked =
+            ColorManagedGroup4 (rgbToFour, true, false, 1.0, Normal, Some halfMask,
+                                [paint 51uy 76uy 0uy 204uy 255uy])
+        draw Color.white masked
+        |> assertRgb "mask modulates K and color together" (153,165,229)
+        let knockout =
+            ColorManagedGroup4 (rgbToFour, true, true, 1.0, Normal, None,
+                                [paint 20uy 0uy 0uy 200uy 255uy
+                                 paint 50uy 0uy 0uy 100uy 128uy])
+        draw Color.white knockout
+        |> assertRgb "knockout uses one shared shape for all components" (152,127,177)
+        let difference =
+            group [paint 50uy 100uy 150uy 20uy 255uy
+                   Blend (Difference, [paint 200uy 100uy 50uy 200uy 255uy])]
+        draw Color.white difference
+        |> assertRgb "subtractive Difference includes K" (105,255,75)
+        for mode, expectedK in [Hue, 20; Saturation, 20; ColorMode, 20; Luminosity, 200] do
+            let blended =
+                group [paint 50uy 100uy 150uy 20uy 255uy
+                       Blend (mode, [paint 200uy 100uy 50uy 200uy 255uy])]
+            let pixel = draw Color.white blended
+            check $"nonseparable {mode} selects the correct K" (abs (int (Pixel.b pixel) - expectedK) <= 3))
+
     test "DeviceGray soft masks retain alpha and luminosity semantics" (fun () ->
         for subtype, paint in ["Alpha", "/Half gs 1 g"; "Luminosity", "0.5 g"] do
             let content = paint + " 0 0 100 100 re f"
@@ -861,7 +999,57 @@ let main _ =
         check "cyclic usecmap retains reachable mappings"
             (cyclic.IsVertical && Rbt.Pdf.Render.Fonts.cid cyclic 0x41 1 = 9))
 
-    test "CMYK ICC source PCS retains range and wide gamut" (fun () ->
+    test "DeviceCMYK groups retain a separate K and subtractive Multiply" (fun () ->
+        let cmyk = Rbt.Pdf.Render.PdfColor.device 4 |> Option.get
+        let working = Rbt.Pdf.Render.PdfColor.tryWorkingSpace cmyk |> Option.get
+        let struct(c,m,y,k) =
+            Rbt.Pdf.Render.PdfColor.toWorkingCmyk working cmyk [|0.1;0.2;0.3;0.7|]
+        check "native device components bypass RGB and preserve K"
+            (c = 26uy && m = 51uy && y = 77uy && k = 179uy)
+        let resources = "/ExtGState <</Multiply <</BM /Multiply>>>>"
+        let paint =
+            "0 0 0 0.5 k 0 0 40 20 re f " +
+            "/Multiply gs 0 0 0 0.25 k 20 0 20 20 re f " +
+            "0 0 0 0.625 k 40 0 20 20 re f"
+        let pixels = renderFixture
+                        "/MediaBox [0 0 60 20] /Group <</S /Transparency /CS /DeviceCMYK>>"
+                        "" resources [] paint 1.0 |> rasterize
+        let left, blended, direct = pixels.[10*60+10], pixels.[10*60+30], pixels.[10*60+50]
+        check "DeviceCMYK K=0.5 converts to exact mid-gray at page boundary"
+            (abs (int (Pixel.r left)-128) <= 3 && Pixel.g left = Pixel.r left && Pixel.b left = Pixel.r left)
+        check "fourth channel Multiply is subtractive, not RGB multiplication"
+            (abs (int (Pixel.r blended)-int (Pixel.r direct)) <= 3 &&
+             abs (int (Pixel.r direct)-96) <= 3))
+
+    test "CMYK shading, tiling and luminosity mask retain black component" (fun () ->
+        let page = "/MediaBox [0 0 60 20] /Group <</S /Transparency /CS /DeviceCMYK>>"
+        let gray p = abs (int (Pixel.r p) - 128) <= 5 &&
+                     abs (int (Pixel.g p) - 128) <= 5 &&
+                     abs (int (Pixel.b p) - 128) <= 5
+        let tileContent = "0 0 0 0.5 k 0 0 10 10 re f"
+        let tile =
+            $"<</Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources <<>> /Length {tileContent.Length}>>\nstream\n{tileContent}\nendstream"
+        let patterned =
+            renderFixture page "" "/Pattern <</P 5 0 R>>" [5,tile]
+                "/Pattern cs /P scn 0 0 60 20 re f" 1.0 |> rasterize
+        check "four-component tiling repeats encoded K, not flattened RGB" (gray patterned.[10*60+25])
+        let shading =
+            "<</ShadingType 2 /ColorSpace /DeviceCMYK /Coords [0 0 60 0] /Extend [true true] /Function <</FunctionType 2 /Domain [0 1] /C0 [0 0 0 0.5] /C1 [0 0 0 0.5] /N 1>>>>"
+        let shaded =
+            renderFixture page "" "/Shading <</Shade 5 0 R>>" [5,shading]
+                "/Shade sh" 1.0 |> rasterize
+        check "four-component axial shading interpolates K independently" (gray shaded.[10*60+25])
+        let maskContent = "0 0 0 0.5 k 0 0 30 20 re f"
+        let maskForm =
+            $"<</Type /XObject /Subtype /Form /BBox [0 0 30 20] /Group <</S /Transparency /CS /DeviceCMYK /I true>> /Length {maskContent.Length}>>\nstream\n{maskContent}\nendstream"
+        let resources = "/ExtGState <</M <</SMask <</S /Luminosity /BC [0 0 0 0] /G 5 0 R>>>>>>"
+        let masked =
+            renderFixture page "" resources [5,maskForm]
+                "0 0 0 1 k /M gs 0 0 60 20 re f" 1.0 |> rasterize
+        check "CMYK luminosity mask uses PCS Y from all four components"
+            (int (Pixel.r masked.[10*60+15]) > int (Pixel.r masked.[10*60+45]) + 20))
+
+    test "CMYK ICC source and bidirectional four-component blending preserve K" (fun () ->
         // ICC lut16 u1.15 XYZ: the fourth input selects X=0 or X=1.5.
         let offset, header, entries, channels = 144, 52, 2, 4
         let size = offset + header + 2*(channels*entries + 16*3 + 3*entries)
@@ -895,13 +1083,93 @@ let main _ =
             { IsDisplay = false; IsGray = false
               ToPcs = fun r g b -> struct(r,g,b)
               FromPcs = fun x y z -> struct(x/2.0,y,z)
-              ProfileSource = None }
+              FourChannel = None; ProfileSource = None }
         let convert k = Rbt.Pdf.Render.PdfColor.toWorkingRgb target space [|0.0;0.0;0.0;k|]
         // Range clips K without rescaling: X=1.5*K, then target R=X/2.
         let struct(r0,g0,b0) = convert 0.0
         let struct(r1,g1,b1) = convert 1.0
         check "ICC Range clips low fourth input" (r0 = 48uy && g0 = 64uy && b0 = 32uy)
-        check "ICC Range clips high fourth input without display clipping" (r1 = 143uy && g1 = 64uy && b1 = 32uy))
+        check "ICC Range clips high fourth input without display clipping" (r1 = 143uy && g1 = 64uy && b1 = 32uy)
+        // Turn the 4→3 forward LUT above into a bidirectional CMYK profile.
+        // A2B X=1.5*K; B2A receives XYZ encoded as X/2, so its K output
+        // has slope 4/3 over the encoded domain [0,.75].
+        let inverseSize = 52 + 2*(3*2 + 125*4 + 4*2)
+        let profile = Array.zeroCreate<byte> (size + 12 + inverseSize)
+        Array.blit bytes 0 profile 0 144
+        Array.blit bytes 144 profile 156 (size-144)
+        let u16 p n = profile.[p] <- byte (n >>> 8); profile.[p+1] <- byte n
+        let u32 p n =
+            profile.[p] <- byte (n >>> 24); profile.[p+1] <- byte (n >>> 16)
+            profile.[p+2] <- byte (n >>> 8); profile.[p+3] <- byte n
+        let sigAt p (s: string) = for i in 0..3 do profile.[p+i] <- byte s.[i]
+        let inverseOffset = size + 12
+        u32 0 profile.Length; u32 128 2; u32 136 156
+        sigAt 144 "B2A0"; u32 148 inverseOffset; u32 152 inverseSize
+        sigAt inverseOffset "mft2"
+        profile.[inverseOffset+8] <- 3uy
+        profile.[inverseOffset+9] <- 4uy
+        profile.[inverseOffset+10] <- 5uy
+        for axis in 0..2 do u32 (inverseOffset+12+axis*16) 65536
+        u16 (inverseOffset+48) 2; u16 (inverseOffset+50) 2
+        let mutable p = inverseOffset+52
+        let sample value = u16 p value; p <- p+2
+        for _ in 0..2 do sample 0; sample 65535
+        for x in 0..4 do
+            for _ in 0..24 do
+                sample 0; sample 0; sample 0
+                sample (min 65535 (x*65535/3))
+        for _ in 0..3 do sample 0; sample 65535
+        let profileStream = PdfStream (Map.ofList ["N", PdfInt 4L], profile)
+        let managed = PdfArray [PdfName "ICCBased"; profileStream]
+        let managedSpace = Rbt.Pdf.Render.PdfColor.resolve doc PdfNull managed |> Option.get
+        let working = Rbt.Pdf.Render.PdfColor.tryWorkingSpace managedSpace |> Option.get
+        let struct(c,m,y,k) =
+            Rbt.Pdf.Render.PdfColor.toWorkingCmyk working managedSpace [|0.0;0.0;0.0;0.5|]
+        check "source ICC CMYK retains K instead of reducing to three colors"
+            (c=0uy && m=0uy && y=0uy && k=128uy)
+        let struct(_,_,_,invertedK) =
+            Rbt.Pdf.Render.PdfColor.toWorkingCmyk working (Rbt.Pdf.Render.PdfColor.device 3 |> Option.get)
+                [|1.0;0.0;0.0|]
+        check "PCS inverse returns the fourth channel for RGB source" (invertedK > 0uy)
+        let image =
+            PdfStream
+                (Map.ofList ["Width", PdfInt 1L; "Height", PdfInt 1L; "BitsPerComponent", PdfInt 8L
+                             "ColorSpace", managed], [|0uy;0uy;0uy;128uy|])
+        let channel value = byte (max 0 (min 255 (int (value*255.0+0.5))))
+        let decoder _ = None
+        let imagePixels =
+            Rbt.Pdf.Render.PdfImages.decode decoder
+                (fun _ values -> struct(channel values.[0],channel values.[1],channel values.[2],channel values.[3]))
+                true doc PdfNull image Color.black 0uy 0 |> Option.get
+        let (_,_,_,_,_,_,fourth) = imagePixels
+        let fourthPixel = fourth |> Option.get |> Array.head
+        check "PDF ICC CMYK image keeps distinct unconverted black plane" (Pixel.r fourthPixel = 128uy)
+        let colorProfile = $"<</N 4 /Length {profile.Length}>>\nstream\n{text profile}\nendstream"
+        let resources = "/ColorSpace <</Managed [/ICCBased 6 0 R]>> /ExtGState <</Multiply <</BM /Multiply>>>> /XObject <</Fm 7 0 R>>"
+        let formContent = "q 20 0 0 20 20 0 cm /Im Do Q"
+        let form =
+            $"<</Type /XObject /Subtype /Form /BBox [20 0 40 20] /Group <</S /Transparency /CS [/ICCBased 6 0 R] /I false>> /Resources <</XObject <</Im 8 0 R>>>> /Length {formContent.Length}>>\nstream\n{formContent}\nendstream"
+        let imageData = [|0uy;0uy;0uy;64uy|]
+        let imageObject =
+            $"<</Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace [/ICCBased 6 0 R] /Length 4>>\nstream\n{text imageData}\nendstream"
+        let paint =
+            "/Managed cs 0 0 0 0.5 sc 0 0 40 20 re f " +
+            "/Multiply gs /Fm Do " +
+            "/Managed cs 0 0 0 0.625 sc 40 0 20 20 re f"
+        let pixels = renderFixture
+                        "/MediaBox [0 0 60 20] /Group <</S /Transparency /CS [/ICCBased 6 0 R]>>"
+                        "" resources [6,colorProfile;7,form;8,imageObject] paint 1.0 |> rasterize
+        let left, blended, direct = pixels.[10*60+10], pixels.[10*60+30], pixels.[10*60+50]
+        let forward, _ = working.FourChannel |> Option.get
+        let struct(x,y,z) = forward 0.0 0.0 0.0 0.5
+        let struct(er,eg,eb) = Rbt.Image.Codecs.Icc.xyzD50ToRgb x y z
+        let close actual expected = abs (int actual - int (expected*255.0+0.5)) <= 5
+        check "native CMYK page group converts black plate only at display boundary"
+            (close (Pixel.r left) er && close (Pixel.g left) eg && close (Pixel.b left) eb)
+        check "nonisolated Multiply Form blends the PDF image K against the CMYK backdrop"
+            (abs (int (Pixel.r blended) - int (Pixel.r direct)) <= 4 &&
+             abs (int (Pixel.g blended) - int (Pixel.g direct)) <= 4 &&
+             abs (int (Pixel.b blended) - int (Pixel.b direct)) <= 4))
 
     let loadLutFixture name =
         use stream = Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
@@ -1120,7 +1388,9 @@ let main _ =
                 match command with
                 | Group (_, _, children) | Clip (_, _, children)
                 | TransparencyGroup (_, _, _, _, _, children)
-                | ColorManagedGroup (_, _, _, _, _, _, children) -> yield! glyphIds children
+                | ColorManagedGroup (_, _, _, _, _, _, children)
+                | ColorManagedGroup4 (_, _, _, _, _, _, children) -> yield! glyphIds children
+                | Components4 (first, _) -> yield! glyphIds [first]
                 | DrawGlyphs (_, runs, _) ->
                     for run in runs do
                         for glyph in run.Glyphs do yield glyph.GlyphId

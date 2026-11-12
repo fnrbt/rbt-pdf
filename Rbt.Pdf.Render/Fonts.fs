@@ -51,7 +51,9 @@ let private cmapBlocks name (text: string) =
     |> Seq.cast<System.Text.RegularExpressions.Match>
     |> Seq.map (fun m -> m.Groups.[1].Value)
 
-let private hexValue (s: string) = System.Convert.ToInt32(s, 16)
+// Prefix explicitly: Fable's integer parser otherwise treats leading "0b"
+// in hexadecimal CMap values as a binary prefix, even with radix 16.
+let private hexValue (s: string) = System.Convert.ToInt32("0x" + s, 16)
 
 let private parseCodeSpaces text =
     [ for block in cmapBlocks "codespacerange" text do

@@ -34,7 +34,8 @@ let private renderOptions font cmaps =
       CjkFont = lazy (fallbackRequested <- true; cjkFont)
       CMaps = cmaps
       DecodeJpeg = ImageSource.decodeJpeg
-      Rasterize = Rbt.Renderer.CanvasBackend.rasterize }
+      Rasterize = Rbt.Renderer.CanvasBackend.rasterize
+      Rasterize4 = Rbt.Renderer.CanvasBackend.rasterizeComponents }
 
 let private send (message: obj) (transfers: obj[]) : unit =
     emitJsExpr (message, transfers) "self.postMessage($0, $1)"

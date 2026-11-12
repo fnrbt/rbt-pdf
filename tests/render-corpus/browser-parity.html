@@ -64,6 +64,11 @@ window.Worker = class extends NativeWorker {
 const root = new URL('./results/browser-parity/vendor/', location.href);
 const rbtRoot = new URL(new URLSearchParams(location.search).get('rbt') || 'rbt/package/', root);
 const pdfjsRoot = new URL('pdfjs/package/', root);
+// Record the Canvas profile explicitly. Readback mode alone does not eliminate
+// font variation in the managed browser; comparisons use an isolated Chromium
+// profile rather than altering fonts or accepting noisy pixels as a baseline.
+const referenceReadback = new URLSearchParams(location.search).get('referenceCanvas') === 'readback';
+const referenceCanvasProfile = referenceReadback ? 'readback' : 'display';
 const viewerElement = document.querySelector('#viewer');
 const status = document.querySelector('#status');
 const TIMEOUT_MS = 60000;
@@ -159,12 +164,14 @@ async function pdfjsRender(bytes, pageNumber, maxSide, sharedScale) {
   const start = now();
   try {
     return await withTimeout(async signal => {
-      let loadingTask, documentProxy, renderTask;
+      let loadingTask, documentProxy, renderTask, destruction;
       const cleanup = () => {
         if (renderTask) { try { renderTask.cancel(); } catch (_) {} renderTask = null; }
-        if (loadingTask) { loadingTask.destroy().catch(() => {}); loadingTask = null; }
+        if (loadingTask) { destruction = loadingTask.destroy(); loadingTask = null; }
+        return destruction || Promise.resolve();
       };
-      signal.addEventListener('abort', cleanup, { once: true });
+      const abortCleanup = () => { cleanup().catch(() => {}); };
+      signal.addEventListener('abort', abortCleanup, { once: true });
       try {
         loadingTask = pdfjs.getDocument({
           data: bytes.slice(),
@@ -181,7 +188,7 @@ async function pdfjsRender(bytes, pageNumber, maxSide, sharedScale) {
         const viewport = page.getViewport({ scale });
         const canvas = document.createElement('canvas');
         canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
-        const context = canvas.getContext('2d');
+        const context = canvas.getContext('2d', { willReadFrequently: referenceReadback });
         context.fillStyle = 'white'; context.fillRect(0, 0, canvas.width, canvas.height);
         renderTask = page.render({ canvasContext: context, canvas, viewport, intent: 'display', background: 'white', annotationMode: pdfjs.AnnotationMode.ENABLE });
         await renderTask.promise;
@@ -192,10 +199,12 @@ async function pdfjsRender(bytes, pageNumber, maxSide, sharedScale) {
         const text = content.items.map(item => item.str || '').join('');
         const png = canvas.toDataURL('image/png');
         show('pdfjs', png);
-        return { ok: true, width: canvas.width, height: canvas.height, png, text, seconds: (now() - start) / 1000 };
+        return { ok: true, width: canvas.width, height: canvas.height, png, text,
+          canvasProfile: referenceCanvasProfile, canvasAttributes: context.getContextAttributes(),
+          seconds: (now() - start) / 1000 };
       } finally {
-        signal.removeEventListener('abort', cleanup);
-        cleanup();
+        signal.removeEventListener('abort', abortCleanup);
+        await cleanup();
       }
     }, 'pdf.js');
   } catch (error) { return failure(error, start); }
@@ -230,7 +239,7 @@ async function render(url, pageNumber, maxSide = 800) {
   queue = result.catch(() => {});
   return result;
 }
-window.parity = { ready: false, render, workerStats, error: null };
+window.parity = { ready: false, render, workerStats, referenceCanvasProfile, error: null };
 try {
   [{ openPdf }, pdfjs] = await Promise.all([
     import(new URL('dist/App.js', rbtRoot).href),
@@ -238,7 +247,7 @@ try {
   ]);
   pdfjs.GlobalWorkerOptions.workerSrc = new URL('build/pdf.worker.mjs', pdfjsRoot).href;
   window.parity.ready = true;
-  status.textContent = 'Ready';
+  status.textContent = `Ready (pdf.js Canvas: ${referenceCanvasProfile})`;
 } catch (error) {
   window.parity.error = errorString(error);
   status.textContent = `Module load failed: ${window.parity.error}`;

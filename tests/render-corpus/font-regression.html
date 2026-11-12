@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>PDF font CMap browser regression</title></head>
+<body>
+<pre id="result">Running…</pre>
+<iframe id="parity" title="Browser rendering comparison" style="width:1px;height:1px;border:0"></iframe>
+<script type="module">
+// Run against the pinned package by default; ?rbt=/ selects the source build.
+// The real nonembedded specimen and Adobe CMaps exercise the same path as the viewer.
+const result = document.querySelector('#result');
+window.fontRegression = { done: false, ok: false };
+const root = new URL('./results/browser-parity/vendor/', location.href);
+const rbt = new URL(new URLSearchParams(location.search).get('rbt') || 'rbt/package/', root);
+const pdfUrl = new URL('./downloads/perf_text_cjk_nonembedded.pdf', location.href);
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+async function bytes(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Fetch ${url}: ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+async function run() {
+  const [pdf, fonts, maps, util, data, gbk, unicode] = await Promise.all([
+    import(new URL('dist/Rbt.Pdf/Rbt.Pdf.js', rbt)),
+    import(new URL('dist/Rbt.Pdf.Render/Fonts.js', rbt)),
+    import(new URL('dist/fable_modules/fable-library-js.4.28.0/Map.js', rbt)),
+    import(new URL('dist/fable_modules/fable-library-js.4.28.0/Util.js', rbt)),
+    bytes(pdfUrl), bytes(new URL('assets/cmaps/GBK-EUC-H', rbt)),
+    bytes(new URL('assets/cmaps/Adobe-GB1-UCS2', rbt)),
+  ]);
+  const cmaps = maps.ofArray([['GBK-EUC-H', gbk], ['Adobe-GB1-UCS2', unicode]], { Compare: util.comparePrimitives });
+  const doc = pdf.Pdf_openData(data);
+  const page = pdf.Pdf_getPage(doc, 1);
+  const resources = pdf.Pdf_getPageInheritable(doc, page, 'Resources');
+  const font = fonts.resolve(cmaps, doc, resources, 'F2');
+  // GBK mappings independently checked against the GBK encoding and the
+  // published Adobe GB1 CMaps. 0b04/0b05/0b5b are hexadecimal CID keys.
+  const cases = [
+    [0xb4ad, 1328, '喘'], [0xc4a1, 2820, '摹'], [0xc4a2, 2821, '蘑'],
+    [0xc4f8, 2907, '镍'], [0xc6d7, 3062, '谱'],
+  ];
+  const observed = cases.map(([code, expectedCid, expected]) => {
+    const source = new Uint8Array([code >>> 8, code & 255]);
+    const decoded = fonts.sourceCodes(font, source);
+    check(decoded.length === 1 && decoded[0][0] === code && decoded[0][1].length === 2, `Incorrect source code ${code.toString(16)}`);
+    const cid = fonts.cid(font, code, 2);
+    const label = fonts.label(font, code, source);
+    check(cid === expectedCid, `Incorrect CID for ${code.toString(16)}: ${cid}`);
+    check(label === expected, `Incorrect Unicode for ${code.toString(16)}: ${JSON.stringify(label)}, expected ${expected}`);
+    return { code: code.toString(16), cid, label };
+  });
+  const frame = document.querySelector('#parity');
+  const url = new URL('./browser-parity.html', location.href);
+  if (new URLSearchParams(location.search).has('rbt')) url.searchParams.set('rbt', new URLSearchParams(location.search).get('rbt'));
+  frame.src = url;
+  await new Promise((resolve, reject) => { frame.onload = resolve; frame.onerror = reject; });
+  // iframe load does not wait for the comparison module's dynamic imports.
+  const parity = await new Promise((resolve, reject) => {
+    const deadline = performance.now() + 60000;
+    function ready() {
+      const value = frame.contentWindow.parity;
+      if (value?.error) reject(new Error(value.error));
+      else if (value?.ready) resolve(value);
+      else if (performance.now() >= deadline) reject(new Error('Comparison harness startup timed out'));
+      else requestAnimationFrame(ready);
+    }
+    ready();
+  });
+  const rendered = await parity.render(pdfUrl.href, 1, 1200);
+  check(rendered.fable.ok, `Viewer failed: ${rendered.fable.error}`);
+  check(rendered.pdfjs.ok, `Reference failed: ${rendered.pdfjs.error}`);
+  const expected = '喘挥御搽锅中撬虹垫团葱懂镍谱垄巧您氓全';
+  check(rendered.fable.text.includes(expected), 'Viewer text does not contain the expected GBK row');
+  check(rendered.pdfjs.text.includes(expected), 'Reference text does not contain the expected GBK row');
+  return { observed, viewerDimensions: [rendered.fable.width, rendered.fable.height], referenceDimensions: [rendered.pdfjs.width, rendered.pdfjs.height], dpr: devicePixelRatio };
+}
+try {
+  const details = await run();
+  window.fontRegression = { done: true, ok: true, ...details };
+} catch (error) {
+  window.fontRegression = { done: true, ok: false, error: String(error?.stack || error) };
+}
+result.textContent = JSON.stringify(window.fontRegression, null, 2);
+</script>
+</body>
+</html>

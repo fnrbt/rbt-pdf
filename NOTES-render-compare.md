@@ -385,3 +385,51 @@ not universal latency or adversarial-resource bounds.
   Chromium's fractional clip-edge coverage remain documented limitations.
 - Reproducible comparison tooling and detailed evidence are described in
   `tests/render-corpus/README.md`.
+
+## Browser reliability and lifecycle (0.1.18)
+
+- Correct Fable CMap hexadecimal parsing when values begin with `0b`. Explicit
+  `0x` prefixes preserve Adobe CID-to-Unicode mappings; GBK `c4f8` renders and
+  extracts as `镍` rather than `Äø`. Five browser mapping cases and the full GBK
+  specimen row pass; native regressions and Fable compilation pass.
+- Evict canvas/text-layer DOM nodes, not only their contents, and release page
+  placeholders on viewer disposal. A single 500-page session retains seven live
+  canvas/text-layer pairs at settled checkpoints instead of 500 visited pairs.
+  Page/color checks, rapid navigation/zoom, replacement, and disposal pass;
+  562 delivered bitmaps close and all four workers terminate.
+- Controlled embedded Latin/CJK comparisons separate rasterization from font
+  substitution. No shared font/graphics correction was justified by their
+  remaining pixel differences.
+- Two full 106-page passes in a dedicated Chromium process reproduce all Fable
+  pixels and 105 pdf.js pages exactly. The dense-Form reference retains 25 varying
+  pixels with maximum channel delta 3; no tolerance or pixel rewriting hides it.
+  Only the CJK specimen changes in Fable versus the preceding source baseline.
+- Reproduction steps, environment limits and evidence are in the corpus README,
+  “Browser reliability, controlled fonts and 500-page lifecycle”.
+- Add five size/hash-pinned real documents: a 229-page digital manual, a 443-page
+  scanned book, and Devanagari, Chinese and Arabic reports. The manifest records
+  source-specific rights; downloads remain outside the repository and packages.
+- Handle mismatched PDF/JBIG2 page dimensions by composing their intersection
+  with the PDF output stride. The real scan and mask decode identically to
+  Poppler across 24,461,236 pixels. Precompute overflow-safe coordinate windows
+  instead of doing per-pixel 64-bit arithmetic in Fable's JBIG2 loops.
+- Support DeviceCMYK and bidirectional ICC CMYK transparency groups, retaining
+  the black component through images, text, paths, patterns, shadings and
+  luminosity masks. Generic four-component compositing lives in Renderer 0.1.16;
+  explicit four-output ICC inverses live in Image 0.1.6.
+- Evaluate nested component groups once against their live backdrop and reuse
+  compositor scratch surfaces. Avoid eagerly decoding browser JPEG previews
+  that the native-component PDF image path never consumes.
+- Bound the viewer to one outstanding render and prioritize actual viewport
+  overlap before nearby prefetch pages. The final 500-page run checks every
+  page, closes all 530 delivered bitmaps, terminates all four workers, and
+  observes a peak of one pending render.
+- Final real-document workloads complete without rendering errors. Eight
+  four-component Canvas scenes match native pixels exactly; the existing
+  106-page browser corpus remains pixel-identical to the prior corrected source.
+  The previously rejected UNESCO CMYK cover now renders against both references.
+  Image-heavy pages remain slow; zoom discards stale results but cannot interrupt
+  a synchronous decode already executing in the worker.
+- A controlled, post-GC worker comparison on Chinese GEM page 3 retains 42.1%
+  less V8 backing storage than 0.1.17 with identical full-canvas pixels and text
+  length. This is scoped worker storage, not total browser memory.
