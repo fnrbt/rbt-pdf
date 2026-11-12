@@ -2147,6 +2147,19 @@ module FontResolve =
                                                 else 0
                                         map.[code] <- gid
                             found <- true
+                // Symbolic subset TrueType fonts commonly carry only a Macintosh
+                // format-0 cmap: its 256 entries map PDF character bytes directly
+                // to glyph IDs. Prefer format 4/6 above when both are present.
+                if not found then
+                    for i in 0..numSub-1 do
+                        if not found then
+                            let sOff = cmapOff + 4 + i * 8
+                            let subtableOff = cmapOff + r32 (sOff + 4)
+                            if r subtableOff = 0 && r (subtableOff + 2) >= 262
+                               && subtableOff + 262 <= data.Length then
+                                for code in 0..255 do
+                                    map.[code] <- int data.[subtableOff + 6 + code]
+                                found <- true
                 if found then Some map else None
         with _ -> None
 

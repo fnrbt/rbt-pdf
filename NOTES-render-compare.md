@@ -128,6 +128,9 @@ matching the document widths. The original is now pinned in the corpus.
   headers, palettes/component mappings and some codeblock styles are rejected.
 - The 36 bundled CMaps remain a selected subset. Vertical CID `W2`/`DW2`,
   inherited CMaps and mixed-width codes now have focused regressions.
+- Supplied normal annotation appearances render with state selection, visibility,
+  placement, Form clipping and transparency. Missing widget appearances/states
+  still require synthesis; interactive forms and NoZoom/NoRotate are not covered.
 - Transparency supports the standard blend modes, isolated/non-isolated and
   knockout groups, and alpha/luminosity soft masks. Page and Form groups support
   DeviceRGB, invertible RGB matrix/TRC ICC spaces, and RGB LUT profiles with
@@ -321,3 +324,25 @@ not universal latency or adversarial-resource bounds.
   painting everything red. Fixed in the script, not the product.
 - `?url=` param only reads on full page load; in-page dropdown switching via
   dispatchEvent needs `{bubbles:true}`. Dev-shell quirks, not product bugs.
+
+## Full-corpus comparison and font/appearance fixes
+
+- All 85 PDFs / 606 pages were rendered against Poppler: native completed 606,
+  Poppler 605, with its known malformed-JPX SIGSEGV as the only execution failure.
+  All paired dimensions matched. This is execution coverage, not 606 visual passes.
+- Visually triaged all 105 paired non-stress pages. All 500 stress pages passed
+  color, bounds and OCR page-number checks in both renderers. Browser baseline:
+  all 53 upstream pages.
+- Fixed simple-font source decoding incorrectly following a wider ToUnicode
+  codespace, missing format-0 symbolic TrueType glyph maps, and omitted supplied
+  annotation appearances. Appearance painting reuses normal Form semantics.
+- Fixed shared GL text rasterization at untransformed font sizes. Axis-aligned
+  glyphs use device resolution and preserve horizontal stretch; other transformed
+  small outline fonts use scalable distance fields.
+- Seven affected/control documents / eight pages were checked on native, Poppler,
+  browser and live software GL. Native regressions, Fable compilation and twelve
+  generic GL text checks pass. Widget appearance synthesis remains unsupported.
+- Large JPX and JBIG2 differences were not blindly “fixed”: independent JPX alpha
+  calculations agree with our pixels, and all 8,415,000 JBIG2 source pixels match
+  Poppler extraction. The latter differs in display reduction filtering. See the
+  corpus README for per-page evidence and unresolved reference/quality differences.

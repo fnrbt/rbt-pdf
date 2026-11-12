@@ -243,7 +243,12 @@ let resolve (cmaps: Map<string, byte[]>) (doc: PdfDocument) (resources: PdfObj) 
         |> Option.map (fun name -> loadCMap cmaps doc (Some (PdfName ("Adobe-" + name + "-UCS2"))))
         |> Option.map (fun cmap -> cmap.Unicode)
         |> Option.defaultValue Map.empty
-    let spaces = if List.isEmpty encoding.Spaces then unicode.Spaces else encoding.Spaces
+    // Simple fonts always consume one byte per character. A ToUnicode CMap
+    // can advertise a wider codespace even when its actual mappings use
+    // one-byte source codes; that codespace must not change text decoding.
+    let spaces = if pfi.IsComposite then
+                     if List.isEmpty encoding.Spaces then unicode.Spaces else encoding.Spaces
+                 else [1, 0, 255]
     let verticalOriginY, verticalAdvance, verticalMetrics = verticalWidths doc descendant
     let writingMode =
         get "Encoding"

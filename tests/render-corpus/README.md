@@ -360,3 +360,80 @@ also pass on native and GL, including lazy shape evaluation, zero-opacity
 knockout and nested managed groups. Native regressions and the Fable build pass.
 Evidence is targeted and uses software GL, not physical-GPU or full-corpus
 conformance certification.
+
+## Full-corpus comparison
+
+The 0.1.14 baseline ran `verify.py --all-pages --jobs 4` at an 800-pixel maximum
+side on all **85 PDFs / 606 pages**, after manifest size/hash validation.
+Native completed **606/606** pages; Poppler completed **605/606**. The sole
+execution failure was Poppler's SIGSEGV on `upstream-bug-jpx`; no native
+crashes, missing outputs or timeouts occurred. All 605 paired page dimensions
+matched. Completion is not a visual pass.
+
+All **105 paired non-stress pages** were visually triaged using ranked
+reference/native/difference contact sheets, with enlarged inspections for sparse
+text. All **500 stress pages**, in both renderers, passed rectangle-color,
+outside-bounds and OCR checks against their individual `Page NNNN` labels.
+The browser also rendered all **53 upstream pages**. This is not a full
+606-page browser or GL run.
+
+The baseline exposed missing tax-form labels, missing supplied annotation
+appearances, and missing-glyph boxes in `upstream-rotated`. The latter ranked
+near the bottom by mean pixel difference because its page is mostly blank:
+numeric rankings alone would miss it.
+
+Not every large difference warrants changing the renderer:
+
+- All **8,415,000 JBIG2 source pixels** in the dense scan match independent
+  Poppler extraction. The displayed difference is reduction filtering: native
+  samples the binary image while Poppler's reference contains gray coverage.
+- Independent FFmpeg JPX samples and scalar premultiplied/matte calculations
+  match native, browser and GL at all 24 checked positions. Poppler's colors
+  in `upstream-jpx-smaskindata` are not the expected output.
+- ICC/AIS fixtures require their independent color/compositing oracles rather
+  than Poppler equality. Existing ICC pixel expectations still match the
+  full-run native images.
+- The missing lower-left panel in `upstream-function-based-shading` uses
+  `floor` on real values and then integer-only `mod`. Native/browser reject
+  that invalid calculator program; Poppler paints a black panel. Neither is
+  evidence of a correctly rendered checkerboard.
+- `upstream-embedded-font` paints a Chinese glyph natively but not in Poppler;
+  the reference disagreement remains unresolved. Font outlines, antialiasing,
+  thin-stroke coverage, mesh tessellation and cubic interpolation also retain
+  visible differences; they are not blanket visual approvals.
+
+Local evidence: `results/full-corpus-baseline-report.json`,
+`full-corpus-ranking.json`, `full-corpus-triage.json`, `full-triage-00.png`
+through `full-triage-13.png`, `full-stress-page-checks.json`, and
+`full-image-oracles.json`. These generated artifacts remain excluded from git.
+
+### Corpus-driven corrections
+
+- Simple fonts consume one byte per character regardless of the `/ToUnicode`
+  codespace. This restores labels and fine print in `upstream-160f-2019`.
+- Embedded symbolic TrueType fonts accept format-0 byte-to-glyph cmaps,
+  restoring `upstream-rotated` instead of painting missing-glyph boxes.
+- Normal annotation appearance streams render with selected `/AS`, visibility
+  flags, Rect placement and normal Form clipping/transparency semantics. Pages
+  containing only annotations render too. This restores supplied tax-form
+  fields and the controls in `upstream-form-two-pages`.
+- Shared Renderer GL text uses device-resolution glyph bitmaps for axis-aligned
+  scales, including horizontal stretch. Other transformed small outline text
+  uses scalable distance fields. One-point PDF text no longer expands a
+  one-pixel bitmap into blocks.
+
+After correction, **7 affected/control PDFs / 8 pages** completed on native,
+Poppler, browser and live software GL; their images were inspected. Native
+regressions and Fable compilation pass. Twelve focused shared-Renderer GL
+checks cover transformations and small-text scale equivalence. Browser disposal
+checks terminate each worker and empty the viewer root.
+
+This does **not** synthesize widget appearances when `/AP` is absent, nor missing
+states such as `/Off`; the tax form has 16 widgets without appearances and two
+checkboxes without an off-state appearance. Interactive forms, annotation
+appearance synthesis, and NoZoom/NoRotate behavior are not established by this
+pass. Previously listed reference/quality disagreements remain separately
+classified rather than declared fixed.
+
+Post-fix evidence: `results/full-corpus-fixed-report.json`,
+`full-fixed-backends.json`, and `full-fixed-backends.png`.

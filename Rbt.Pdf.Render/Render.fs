@@ -1242,6 +1242,94 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
 
             cmds |> Seq.toList, charBoxes.ToArray()
 
+let private annotationNumber (doc: PdfDocument) value =
+    match Pdf.deref doc value with
+    | PdfInt n -> Some (float n)
+    | PdfReal n when not (Double.IsNaN n || Double.IsInfinity n) -> Some n
+    | _ -> None
+
+let private annotationBox (doc: PdfDocument) value =
+    match Pdf.deref doc value with
+    | PdfArray [a; b; c; d] ->
+        match annotationNumber doc a, annotationNumber doc b, annotationNumber doc c, annotationNumber doc d with
+        | Some x0, Some y0, Some x1, Some y1 when x0 <> x1 && y0 <> y1 ->
+            Some (min x0 x1, min y0 y1, max x0 x1, max y0 y1)
+        | _ -> None
+    | _ -> None
+
+let private appearanceMatrix (doc: PdfDocument) appearance =
+    match Pdf.dictGet doc "Matrix" appearance |> Option.map (Pdf.deref doc) with
+    | Some (PdfArray [a; b; c; d; e; f]) ->
+        match List.map (annotationNumber doc) [a; b; c; d; e; f] with
+        | [Some a; Some b; Some c; Some d; Some e; Some f] ->
+            { M11 = a; M12 = b; M21 = c; M22 = d; DX = e; DY = f }
+        | _ -> Matrix3x2.identity
+    | _ -> Matrix3x2.identity
+
+let private appearanceInvocation = "/Appearance Do"B
+
+let private renderAnnotations opts doc page resources working viewport scale =
+    let commands = ResizeArray<Cmd>()
+    let boxes = ResizeArray<CharBox>()
+    match Pdf.dictGet doc "Annots" page |> Option.map (Pdf.deref doc) with
+    | Some (PdfArray annotations) ->
+        for annotation in annotations do
+            let flags =
+                match Pdf.dictGet doc "F" annotation |> Option.map (Pdf.deref doc) with
+                | Some (PdfInt n) -> n
+                | _ -> 0L
+            // Invisible, Hidden and NoView annotations do not appear on screen.
+            if flags &&& 35L = 0L then
+                let appearance =
+                    Pdf.dictGet doc "AP" annotation
+                    |> Option.bind (Pdf.dictGet doc "N")
+                    |> Option.bind (fun normal ->
+                        match Pdf.deref doc normal with
+                        | PdfStream _ -> Some normal
+                        | PdfDict states ->
+                            match Pdf.dictGet doc "AS" annotation |> Option.map (Pdf.deref doc) with
+                            | Some (PdfName state) -> Map.tryFind state states
+                            | _ when states.Count = 1 -> states |> Map.toSeq |> Seq.head |> snd |> Some
+                            | _ -> None
+                        | _ -> None)
+                match appearance |> Option.map (Pdf.deref doc), Pdf.dictGet doc "Rect" annotation |> Option.bind (annotationBox doc) with
+                | Some (PdfStream (dictionary, data) as appearance), Some (x0, y0, x1, y1) ->
+                    match Pdf.dictGet doc "BBox" appearance |> Option.bind (annotationBox doc) with
+                    | Some (bx0, by0, bx1, by1) ->
+                        let matrix = appearanceMatrix doc appearance
+                        let corners =
+                            [| vec2 bx0 by0; vec2 bx1 by0; vec2 bx0 by1; vec2 bx1 by1 |]
+                            |> Array.map (Matrix3x2.transformVec2 matrix)
+                        let minX = corners |> Array.minBy (fun p -> p.X) |> fun p -> float p.X
+                        let minY = corners |> Array.minBy (fun p -> p.Y) |> fun p -> float p.Y
+                        let maxX = corners |> Array.maxBy (fun p -> p.X) |> fun p -> float p.X
+                        let maxY = corners |> Array.maxBy (fun p -> p.Y) |> fun p -> float p.Y
+                        if maxX > minX && maxY > minY then
+                            let placement =
+                                Matrix3x2.multiply (Matrix3x2.translate (-minX) (-minY))
+                                    (Matrix3x2.multiply (Matrix3x2.scale ((x1 - x0) / (maxX - minX)) ((y1 - y0) / (maxY - minY)))
+                                        (Matrix3x2.translate x0 y0))
+                            let appearanceResources =
+                                Pdf.dictGet doc "Resources" appearance |> Option.defaultValue resources
+                            // Reuse Form BBox clipping, Matrix and transparency semantics.
+                            let form =
+                                PdfStream (dictionary |> Map.add "Subtype" (PdfName "Form")
+                                                      |> Map.add "Resources" appearanceResources, data)
+                            let invocationResources =
+                                PdfDict (Map.ofList ["XObject", PdfDict (Map.ofList ["Appearance", form])])
+                            let painted, chars =
+                                renderContent opts doc invocationResources appearanceInvocation
+                                    { defaultState with CTM = placement } working viewport scale 0
+                            let rect =
+                                [ MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0)
+                                  LineTo(vec2 x1 y1); LineTo(vec2 x0 y1); Close ]
+                            commands.Add(Clip(rect, NonZero, painted))
+                            boxes.AddRange chars
+                    | _ -> ()
+                | _ -> ()
+    | _ -> ()
+    commands |> Seq.toList, boxes.ToArray()
+
 let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: float) : (Cmd list * float * float * CharBox[]) option =
     match Pdf.getPage doc pageNum with
     | None -> None
@@ -1255,29 +1343,32 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
             let pageTransform = Matrix3x2.multiply viewport.Transform (Matrix3x2.scale scale scale)
             let resources = Pdf.getPageInheritable doc pageObj "Resources" |> Option.defaultValue (PdfDict Map.empty)
             let contentData = PageOps.getPageContents doc pageObj
-            if contentData.Length = 0 then Some ([], pageW, pageH, [||])
-            else
-                let pageGroupDict =
-                    Pdf.getPageInheritable doc pageObj "Group"
-                    |> Option.filter (fun group -> Pdf.dictGet doc "S" group |> Option.map (Pdf.deref doc) = Some (PdfName "Transparency"))
-                let pageWorking = pageGroupDict |> Option.bind (groupWorkingSpace doc resources)
-                let pageCommands, charBoxes = renderContent opts doc resources contentData defaultState pageWorking viewport scale 0
-                let x0, y0, x1, y1 = viewport.Bounds
-                let pageClip =
-                    [ MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0)
-                      LineTo(vec2 x1 y1); LineTo(vec2 x0 y1); Close ]
-                let pageKnockout =
-                    pageGroupDict |> Option.bind (Pdf.dictGet doc "K") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
-                // A page is isolated from the caller's backdrop.
-                let pageGroup =
-                    match pageWorking with
-                    | Some target when not target.IsDisplay -> ColorManagedGroup(groupConversion PdfColor.displaySpace target, true, pageKnockout, 1.0, Normal, None, pageCommands)
-                    | _ -> TransparencyGroup(true, pageKnockout, 1.0, Normal, None, pageCommands)
-                let scaledCmds = [Group(pageTransform, 1.0, [Clip(pageClip, NonZero, [pageGroup])])]
-                let scaledCharBoxes =
-                    charBoxes |> Array.map (fun cb ->
-                        let p0 = Matrix3x2.transformVec2 pageTransform (vec2 cb.X cb.Y)
-                        let p1 = Matrix3x2.transformVec2 pageTransform (vec2 (cb.X + cb.W) (cb.Y + cb.H))
-                        { cb with X = float (min p0.X p1.X); Y = float (min p0.Y p1.Y)
-                                  W = float (abs (p1.X - p0.X)); H = float (abs (p1.Y - p0.Y)) })
-                Some (scaledCmds, pageW, pageH, scaledCharBoxes)
+            let pageGroupDict =
+                Pdf.getPageInheritable doc pageObj "Group"
+                |> Option.filter (fun group -> Pdf.dictGet doc "S" group |> Option.map (Pdf.deref doc) = Some (PdfName "Transparency"))
+            let pageWorking = pageGroupDict |> Option.bind (groupWorkingSpace doc resources)
+            let pageCommands, pageChars =
+                if contentData.Length = 0 then [], [||]
+                else renderContent opts doc resources contentData defaultState pageWorking viewport scale 0
+            let annotationCommands, annotationChars =
+                renderAnnotations opts doc pageObj resources pageWorking viewport scale
+            let x0, y0, x1, y1 = viewport.Bounds
+            let pageClip =
+                [ MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0)
+                  LineTo(vec2 x1 y1); LineTo(vec2 x0 y1); Close ]
+            let pageKnockout =
+                pageGroupDict |> Option.bind (Pdf.dictGet doc "K") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+            // A page is isolated from the caller's backdrop.
+            let pageGroup =
+                let contents = pageCommands @ annotationCommands
+                match pageWorking with
+                | Some target when not target.IsDisplay -> ColorManagedGroup(groupConversion PdfColor.displaySpace target, true, pageKnockout, 1.0, Normal, None, contents)
+                | _ -> TransparencyGroup(true, pageKnockout, 1.0, Normal, None, contents)
+            let scaledCmds = [Group(pageTransform, 1.0, [Clip(pageClip, NonZero, [pageGroup])])]
+            let scaledCharBoxes =
+                Array.append pageChars annotationChars |> Array.map (fun cb ->
+                    let p0 = Matrix3x2.transformVec2 pageTransform (vec2 cb.X cb.Y)
+                    let p1 = Matrix3x2.transformVec2 pageTransform (vec2 (cb.X + cb.W) (cb.Y + cb.H))
+                    { cb with X = float (min p0.X p1.X); Y = float (min p0.Y p1.Y)
+                              W = float (abs (p1.X - p0.X)); H = float (abs (p1.Y - p0.Y)) })
+            Some (scaledCmds, pageW, pageH, scaledCharBoxes)

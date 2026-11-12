@@ -179,6 +179,59 @@ let main _ =
                 (digest = "a9070589b0c09b9a70cc23f04447295ddd863f2bef6509994f898a73c96fe7e9")
         | _ -> check "irreversible MCT JPX dimensions and components" false)
 
+    test "simple fonts retain byte codes despite a wider ToUnicode codespace" (fun () ->
+        let cmap = "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n2 beginbfchar\n<41> <0041>\n<42> <0042>\nendbfchar\n"
+        let font = "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 66 /Widths [600 600] /ToUnicode 6 0 R>>"
+        let mapped = $"<</Length {cmap.Length}>>\nstream\n{cmap}endstream"
+        let commands, width, height, chars =
+            renderFixture "/MediaBox [0 0 100 100]" "" "/Font <</F1 5 0 R>>"
+                [5,font; 6,mapped] "BT /F1 20 Tf 10 50 Td (AB) Tj ET" 1.0
+        check "both simple-font characters remain readable" (chars |> Array.map (fun box -> box.Char) = [|"A"; "B"|])
+        let expected = renderFixture "/MediaBox [0 0 100 100]" "" "/Font <</F1 5 0 R>>"
+                           [5,font.Replace(" /ToUnicode 6 0 R", "")] "BT /F1 20 Tf 10 50 Td (AB) Tj ET" 1.0 |> rasterize
+        check "ToUnicode codespace cannot change simple-font painted glyphs"
+            (rasterize (commands, width, height, chars) = expected))
+
+    test "symbolic TrueType format-0 cmap maps PDF bytes to glyphs" (fun () ->
+        let data = Array.zeroCreate<byte> 302
+        data.[5] <- 1uy
+        latin1 "cmap" |> Array.iteri (fun i b -> data.[12+i] <- b)
+        data.[23] <- 28uy
+        data.[31] <- 1uy
+        data.[33] <- 1uy
+        data.[39] <- 12uy
+        data.[42] <- 1uy
+        data.[43] <- 6uy
+        data.[47] <- 3uy
+        let descriptor = PdfDict (Map.ofList ["Flags", PdfInt 4L; "FontFile2", PdfStream (Map.empty, data)])
+        let font = PdfDict (Map.ofList ["Subtype", PdfName "TrueType"; "FontDescriptor", descriptor])
+        let resources = PdfDict (Map.ofList ["Font", PdfDict (Map.ofList ["F1", font])])
+        let info = FontResolve.resolve (Pdf.openData (build normal onePage 1)) resources "F1"
+        check "format-0 byte selects embedded glyph, not Unicode fallback"
+            (info.ByteToGlyph |> Option.exists (fun map -> map.[1] = 3 && map.[2] = 0)))
+
+    test "annotation-only pages place normal appearances and respect state and visibility" (fun () ->
+        let red = "1 0 0 rg -100 -100 300 300 re f\n"
+        let blue = "0 0 1 rg -100 -100 300 300 re f\n"
+        let form paint = $"<</Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0 1 10 0] /Length {String.length paint}>>\nstream\n{paint}endstream"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [10 20 60 50] /AS /On /AP <</N <</Off 6 0 R /On 7 0 R>>>>>>"
+              6, form red
+              7, form blue
+              8, "<</Type /Annot /Subtype /Widget /Rect [65 20 95 50] /F 32 /AP <</N 6 0 R>>>>" ]
+        let pixels = renderFixture "/MediaBox [0 0 100 100] /Annots [5 0 R 8 0 R]" "" "" objects "" 1.0 |> rasterize
+        check "selected normal appearance lands in annotation Rect" (pixels.[65*100+35] = Pixel.pack 255uy 0uy 0uy 255uy)
+        check "appearance overflow is clipped" (pixels.[65*100+5] = 0xffffffffu)
+        check "NoView appearance is absent" (pixels.[65*100+80] = 0xffffffffu))
+
+    test "annotation appearances retain transformed Form clipping and transparency groups" (fun () ->
+        let paint = "1 0 0 rg -100 -100 300 300 re f /Difference gs 0 0 1 rg -100 -100 300 300 re f"
+        let form = $"<</Subtype /Form /BBox [0 0 10 10] /Matrix [1 1 -1 1 0 0] /Group <</S /Transparency /I true>> /Resources <</ExtGState <</Difference <</BM /Difference>>>>>> /Length {paint.Length}>>\nstream\n{paint}endstream"
+        let objects = [5, "<</Type /Annot /Subtype /Widget /Rect [10 10 90 90] /AP <</N 6 0 R>>>>"; 6,form]
+        let pixels = renderFixture "/MediaBox [0 0 100 100] /Annots [5 0 R]" "" "" objects "" 1.0 |> rasterize
+        check "appearance group blends its paints" (pixels.[50*100+50] = Pixel.pack 255uy 0uy 255uy 255uy)
+        check "rotated Form BBox excludes annotation corner" (pixels.[85*100+15] = 0xffffffffu))
+
     test "closed stroke joins differ from coincident open endpoints" (fun () ->
         let closed = renderPixels "8 w 10 10 20 20 re S"
         let openPath = renderPixels "8 w 10 10 m 30 10 l 30 30 l 10 30 l 10 10 l S"
@@ -811,7 +864,9 @@ let main _ =
             check $"rotation {rotation}: cropped origin" (points.Head = vec2 expectedX expectedY)
         let empty, w, h, _ =
             renderFixture "/MediaBox [100 200 400 600]" "/CropBox [120 230 320 330] /Rotate 90" "" [] "" 1.0
-        check "empty page retains rotated cropped dimensions" (w = 100.0 && h = 200.0 && List.isEmpty empty)
+        check "empty page retains rotated cropped dimensions" (w = 100.0 && h = 200.0)
+        check "empty page remains visually blank"
+            (rasterize (empty, w, h, [||]) |> Array.forall ((=) 0xffffffffu))
         let pixels =
             renderFixture "/MediaBox [100 200 340 360]" "" "" [] "1 0 0 rg 120 220 65 45 re f" 1.0 |> rasterize
         check "nonzero MediaBox paints visible content" (pixels.[130 * 240 + 30] = Pixel.pack 0uy 0uy 255uy 255uy))
