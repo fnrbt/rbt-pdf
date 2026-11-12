@@ -99,6 +99,15 @@ let renderFixture pageEntries parentEntries resources extraObjects content scale
     let doc = Pdf.openData (build normal objects 1)
     renderPage (RenderOptions.native ()) doc 1 scale |> Option.get
 
+let renderWidgetFixture (annotations: string) (acro: string) (objects: (int * string) list) =
+    let page = $"<</Type /Page /Parent 2 0 R /MediaBox [0 0 180 120] /Annots [{annotations}]>>"
+    let document =
+        build normal ([1, $"<</Type /Catalog /Pages 2 0 R /AcroForm <<{acro}>>>>"
+                       2, "<</Type /Pages /Kids [3 0 R] /Count 1>>"
+                       3, page
+                       ] @ objects) 1
+    renderPage (RenderOptions.native ()) (Pdf.openData document) 1 1.0 |> Option.get
+
 let renderContent content =
     let cmds, _, _, _ = renderFixture "/MediaBox [0 0 300 400]" "" "" [] content 1.0
     cmds
@@ -231,6 +240,191 @@ let main _ =
         let pixels = renderFixture "/MediaBox [0 0 100 100] /Annots [5 0 R]" "" "" objects "" 1.0 |> rasterize
         check "appearance group blends its paints" (pixels.[50*100+50] = Pixel.pack 255uy 0uy 255uy 255uy)
         check "rotated Form BBox excludes annotation corner" (pixels.[85*100+15] = 0xffffffffu))
+
+    test "missing widget normal appearances inherit text state and AcroForm fonts" (fun () ->
+        let font = "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /LastChar 68 /Widths [500 500 500 500]>>"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [10 10 110 35] /Parent 6 0 R /MK <</BG [1 0 0]>>>>"
+              6, "<</FT /Tx /V (ABCD) /Q 2 /MaxLen 3 /Kids [5 0 R] /Parent 7 0 R>>"
+              7, "<</DA (/F1 10 Tf 0 0 1 rg)>>"
+              8, font ]
+        let cmds, w, h, chars = renderWidgetFixture "5 0 R" "/DR <</Font <</F1 8 0 R>>>>" objects
+        check "inherited text value and MaxLen clip to three glyphs" (chars |> Array.map (fun c -> c.Char) = [|"A";"B";"C"|])
+        check "inherited right alignment positions the first glyph in the right half" (chars.Length = 3 && chars.[0].X > 75.)
+        let pixels = rasterize (cmds, w, h, chars)
+        check "widget MK background paints red within Rect" (pixels.[97*180+35] = Pixel.pack 0uy 0uy 255uy 255uy)
+        check "missing widget does not paint outside Rect" (pixels.[97*180+5] = 0xffffffffu))
+
+    test "cyclic field parents stop at AcroForm DA and hidden widgets stay invisible" (fun () ->
+        let font = "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /LastChar 90 /Widths ["
+                   + (String.replicate 26 "500 ") + "]>>"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [20 20 100 50] /Parent 6 0 R>>"
+              6, "<</FT /Tx /V (A) /Parent 7 0 R /Kids [5 0 R]>>"
+              7, "<</Parent 6 0 R>>"
+              8, "<</Type /Annot /Subtype /Widget /Rect [110 20 170 50] /FT /Tx /V (H) /F 2 /MK <</BG [1 0 0]>>>>"
+              9, font ]
+        let cmds, w, h, chars =
+            renderWidgetFixture "5 0 R 8 0 R"
+                "/DA (/F1 0 Tf 0 g) /DR <</Font <</F1 9 0 R>>>>" objects
+        check "cyclic Parents resolve AcroForm DA and inherited value" (chars |> Array.map (fun c -> c.Char) = [|"A"|])
+        let pixels = rasterize (cmds, w, h, chars)
+        check "Hidden widget background and text remain absent" (pixels.[85*180+130] = 0xffffffffu))
+
+    test "missing widget appearances distinguish off, selected radio and supplied AP" (fun () ->
+        let blue = "0 0 1 rg 0 0 20 20 re f\n"
+        let blueForm = $"<</BBox [0 0 20 20] /Length {blue.Length}>>\nstream\n{blue}endstream"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [10 10 30 30] /Parent 11 0 R /AS /Off /MK <</BC [0]>>>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [40 10 60 30] /Parent 12 0 R /AS /Off>>"
+              7, "<</Type /Annot /Subtype /Widget /Rect [70 10 90 30] /Parent 13 0 R /AS /Off /MK <</BC [0]>> /AP <</N <</Oui 15 0 R>>>>>>"
+              8, "<</Type /Annot /Subtype /Widget /Rect [100 10 120 30] /Parent 13 0 R /AS /Non /AP <</N <</Non 14 0 R>>>>>>"
+              9, "<</Type /Annot /Subtype /Widget /Rect [130 10 150 30] /FT /Btn /V /Off /AP <</N 14 0 R>>>>"
+              10, "<</Type /Annot /Subtype /Widget /Rect [155 10 175 30] /FT /Btn /Ff 65536>>"
+              11, "<</FT /Btn /V /Off /Kids [5 0 R]>>"
+              12, "<</FT /Btn /V /Yes /Kids [6 0 R]>>"
+              13, "<</FT /Btn /Ff 32768 /V /Non /Kids [7 0 R 8 0 R]>>"
+              14, blueForm
+              15, blueForm ]
+        let result = renderWidgetFixture "5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R" "" objects
+        let pixels = rasterize result
+        let at x y = pixels.[(120-y)*180+x]
+        let darkInterior x = [ for y in 15..25 do for offset in -6..6 -> at (x+offset) y ] |> List.filter ((=) 0xff000000u) |> List.length
+        check "Off checkbox paints outline without a check" (darkInterior 20 = 0 && at 10 20 <> 0xffffffffu)
+        check "field V paints check even if widget AS is stale Off" (darkInterior 50 > 0)
+        check "missing radio Off paints an empty circle, not a square" (at 80 20 = 0xffffffffu && at 72 20 <> 0xffffffffu && at 70 20 = 0xffffffffu)
+        check "selected radio supplied normal appearance remains authoritative" (at 110 20 = Pixel.pack 255uy 0uy 0uy 255uy)
+        check "supplied stream wins over widget value" (at 140 20 = Pixel.pack 255uy 0uy 0uy 255uy)
+        check "pushbutton without AP is not a checkbox" (at 165 20 = 0xffffffffu))
+
+    test "radio /Opt names Kids indices even with duplicate export values" (fun () ->
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [20 20 50 50] /Parent 7 0 R /AS /Off>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [80 20 110 50] /Parent 7 0 R /AS /Off>>"
+              7, "<</FT /Btn /Ff 32768 /V /1 /Opt [(Same) (Same)] /Kids [5 0 R 6 0 R]>>"
+              8, "<</Type /Annot /Subtype /Widget /Rect [120 20 140 40] /Parent 10 0 R /AS /Off>>"
+              9, "<</Type /Annot /Subtype /Widget /Rect [150 20 170 40] /Parent 10 0 R /AS /Off>>"
+              10, "<</FT /Btn /Ff 33587200 /V /0 /Opt [(Same) (Same)] /Kids [8 0 R 9 0 R]>>" ]
+        let pixels = renderWidgetFixture "5 0 R 6 0 R 8 0 R 9 0 R" "" objects |> rasterize
+        let at x y = pixels.[(120-y)*180+x]
+        check "numeric /1 selects only the second duplicate export" (at 35 35 = 0xffffffffu && at 95 35 = 0xff000000u)
+        check "RadiosInUnison selects equal exports together" (at 130 30 = 0xff000000u && at 160 30 = 0xff000000u))
+
+    test "duplicate radio on-state respects explicit AS unless RadiosInUnison" (fun () ->
+        let blue = "0 0 1 rg 0 0 20 20 re f\n"
+        let form = $"<</BBox [0 0 20 20] /Length {blue.Length}>>\nstream\n{blue}endstream"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [20 20 50 50] /Parent 7 0 R /AS /Yes /AP <</N <</Yes 11 0 R>>>>>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [70 20 100 50] /Parent 7 0 R /AS /Off /AP <</N <</Yes 11 0 R>>>>>>"
+              7, "<</FT /Btn /Ff 32768 /V /Yes /Kids [5 0 R 6 0 R]>>"
+              8, "<</Type /Annot /Subtype /Widget /Rect [120 20 140 40] /Parent 10 0 R /AS /Off /AP <</N <</Yes 11 0 R>>>>>>"
+              9, "<</Type /Annot /Subtype /Widget /Rect [150 20 170 40] /Parent 10 0 R /AS /Off /AP <</N <</Yes 11 0 R>>>>>>"
+              10, "<</FT /Btn /Ff 33587200 /V /Yes /Kids [8 0 R 9 0 R]>>"
+              11, form ]
+        let pixels = renderWidgetFixture "5 0 R 6 0 R 8 0 R 9 0 R" "" objects |> rasterize
+        let at x y = pixels.[(120-y)*180+x]
+        check "supplied selected radio wins, sibling missing Off stays unselected"
+            (at 35 35 = Pixel.pack 255uy 0uy 0uy 255uy && at 85 35 = 0xffffffffu)
+        check "unison with duplicated on-state paints both marks"
+            (at 130 30 = 0xff000000u && at 160 30 = 0xff000000u))
+
+    test "MK caption styling and transparent border retain separate DA ink" (fun () ->
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [10 20 40 50] /FT /Btn /Ff 32768 /V /Off /MK <</CA (8) /BC []>> /BS <</W 3>>>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [50 20 80 50] /FT /Btn /Ff 32768 /V /Yes /MK <</CA (8) /BC []>> /BS <</W 3>>>>"
+              7, "<</Type /Annot /Subtype /Widget /Rect [90 20 120 50] /FT /Btn /Ff 32768 /V /Off /MK <</CA (8) /BC [0]>>>>"
+              8, "<</Type /Annot /Subtype /Widget /Rect [130 20 160 50] /FT /Btn /V /Yes /MK <</BC [1 0 0]>> /DA (/Z 12 Tf 0 0 1 rg)>>"
+              9, "<</Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats>>"
+              10, "<</Type /Annot /Subtype /Widget /Rect [10 70 40 100] /FT /Btn /Ff 32768 /V /Off /MK <</CA (8)>> /BS <</W 3>>>>" ]
+        let pixels =
+            renderWidgetFixture "5 0 R 6 0 R 7 0 R 8 0 R 10 0 R"
+                "/DA (/Z 12 Tf 0 g) /DR <</Font <</Z 9 0 R>>>>" objects |> rasterize
+        let at x y = pixels.[(120-y)*180+x]
+        check "explicit empty BC leaves Off caption border transparent" (at 10 35 = 0xffffffffu && at 25 35 = 0xffffffffu)
+        check "absent BC does not invent an Off border even with explicit width" (at 10 85 = 0xffffffffu && at 25 85 = 0xffffffffu)
+        check "ZapfDingbats caption 8 selects an X without forcing a circle" (at 65 35 = 0xff000000u && at 50 35 = 0xffffffffu)
+        check "caption-styled Off uses a square outline without a round glyph" (at 90 35 <> 0xffffffffu && at 93 35 = 0xffffffffu)
+        let interior = [for x in 135..155 do for y in 26..44 -> at x y]
+        check "red MK border does not override blue DA check mark"
+            (at 130 35 = Pixel.pack 0uy 0uy 255uy 255uy
+             && (interior |> List.exists ((=) (Pixel.pack 255uy 0uy 0uy 255uy)))))
+
+    test "radio Off honors circular border color and explicit stroke width" (fun () ->
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [20 20 50 50] /FT /Btn /V /Off /Ff 32768 /AS /Off /BS <</W 3>> /MK <</BC [1 0 0]>>>>" ]
+        let pixels = renderWidgetFixture "5 0 R" "" objects |> rasterize
+        let at x y = pixels.[(120-y)*180+x]
+        check "radio border uses MK red rather than black" (at 23 35 = Pixel.pack 0uy 0uy 255uy 255uy)
+        check "radio center and rectangular bounding-box edge stay empty" (at 35 35 = 0xffffffffu && at 20 35 = 0xffffffffu))
+
+    test "comb fields honor alignment and size font for an individual cell" (fun () ->
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [10 20 40 50] /FT /Tx /Ff 16777216 /MaxLen 5 /Q 0 /V (A)>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [70 20 100 50] /FT /Tx /Ff 16777216 /MaxLen 5 /Q 1 /V (A)>>"
+              7, "<</Type /Annot /Subtype /Widget /Rect [130 20 160 50] /FT /Tx /Ff 16777216 /MaxLen 5 /Q 2 /V (A)>>"
+              8, "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /LastChar 65 /Widths [1000]>>" ]
+        let _, _, _, chars =
+            renderWidgetFixture "5 0 R 6 0 R 7 0 R" "/DA (/F1 0 Tf 0 g) /DR <</Font <</F1 8 0 R>>>>" objects
+        check "comb right and center alignment offset cells" (chars.Length = 3
+            && chars.[0].X - 10. < chars.[1].X - 70. && chars.[1].X - 70. < chars.[2].X - 130.)
+        check "comb auto-size fits glyph inside a single cell" (chars.Length = 3 && chars.[0].W <= 5.))
+
+    test "text fields decode PDFDocEncoding and select actual font source codes" (fun () ->
+        let cmap = "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfchar\n<002A> <2022>\nendbfchar\n"
+        let font = "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding <</BaseEncoding /MacRomanEncoding /Differences [199 /bullet]>> /FirstChar 199 /LastChar 199 /Widths [1000]>>"
+        let cid = "<</Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica /CIDSystemInfo <</Registry (Adobe) /Ordering (Identity) /Supplement 0>> /DW 1000>>"
+        let composite = "<</Type /Font /Subtype /Type0 /BaseFont /Helvetica /Encoding /Identity-H /DescendantFonts [10 0 R] /ToUnicode 11 0 R>>"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [20 20 80 50] /FT /Tx /V (\\200) /DA (/S 12 Tf 0 g)>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [100 20 160 50] /FT /Tx /V <FEFF2022> /DA (/C 12 Tf 0 g)>>"
+              8, font
+              9, composite
+              10, cid
+              11, $"<</Length {cmap.Length}>>\nstream\n{cmap}endstream" ]
+        let _, _, _, chars =
+            renderWidgetFixture "5 0 R 6 0 R" "/DR <</Font <</S 8 0 R /C 9 0 R>>>>" objects
+        check "PDFDoc byte 0x80 and UTF-16 field values both paint bullet" (chars |> Array.map (fun c -> c.Char) = [|"\u2022";"\u2022"|])
+        check "simple custom Differences and composite ToUnicode use real source widths" (chars.Length = 2 && chars.[0].W > 10. && chars.[1].W > 10.))
+
+    test "multiline wraps unbroken text at glyph boundaries without dropping spaces" (fun () ->
+        let font = "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 72 /Widths ["
+                   + (String.replicate 41 "500 ") + "]>>"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [20 10 50 100] /FT /Tx /Ff 4096 /V (ABCDEFGH) /DA (/F1 12 Tf 0 g)>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [70 10 110 100] /FT /Tx /Ff 4096 /V (A  B) /DA (/F1 12 Tf 0 g)>>"
+              7, font ]
+        let _, _, _, chars =
+            renderWidgetFixture "5 0 R 6 0 R" "/DR <</Font <</F1 7 0 R>>>>" objects
+        let word = chars |> Array.filter (fun c -> c.X < 55.)
+        let spaced = chars |> Array.filter (fun c -> c.X > 65.)
+        check "long word retains all glyphs and wraps before clipping" (word.Length = 8
+            && word.[0].Y = word.[3].Y && abs (word.[0].Y - word.[4].Y) > 6.)
+        check "multiline preserves repeated spaces as source characters" (spaced |> Array.map (fun c -> c.Char) = [|"A";" ";" ";"B"|]))
+
+    test "multiline, password, comb, auto-size and rotation are distinct widget layouts" (fun () ->
+        let font = "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 122 /Widths ["
+                   + (String.replicate 91 "500 ") + "]>>"
+        let objects =
+            [ 5, "<</Type /Annot /Subtype /Widget /Rect [10 55 90 110] /Parent 9 0 R>>"
+              6, "<</Type /Annot /Subtype /Widget /Rect [95 75 175 105] /Parent 10 0 R>>"
+              7, "<</Type /Annot /Subtype /Widget /Rect [10 10 110 40] /Parent 11 0 R>>"
+              8, "<</Type /Annot /Subtype /Widget /Rect [125 10 175 40] /Parent 12 0 R /MK <</R 90 /BG [0 1 0]>>>>"
+              9, "<</FT /Tx /Ff 4096 /DA (/F1 12 Tf 0 g) /V (AA\\nBB) /Kids [5 0 R]>>"
+              10, "<</FT /Tx /Ff 8192 /DA (/F1 12 Tf 0 g) /V (SECRET) /Kids [6 0 R]>>"
+              11, "<</FT /Tx /Ff 16777216 /MaxLen 5 /DA (/F1 12 Tf 0 g) /V (ABC) /Kids [7 0 R]>>"
+              12, "<</FT /Tx /DA (/F1 0 Tf 0 g) /V (A) /Kids [8 0 R]>>"
+              13, font ]
+        let cmds, w, h, chars = renderWidgetFixture "5 0 R 6 0 R 7 0 R 8 0 R" "/DR <</Font <</F1 13 0 R>>>>" objects
+        let aa = chars |> Array.filter (fun c -> c.Char = "A" && c.Y < 65. && c.X < 90.)
+        let bb = chars |> Array.filter (fun c -> c.Char = "B" && c.Y < 65. && c.X < 90.)
+        check "multiline text uses separate rows" (aa.Length = 2 && bb.Length = 2 && abs (aa.[0].Y-bb.[0].Y) > 6.)
+        let stars = chars |> Array.filter (fun c -> c.Char = "*")
+        check "password never reveals source letters" (stars.Length = 6 && not (chars |> Array.exists (fun c -> c.Char = "S")))
+        let comb = chars |> Array.filter (fun c -> c.Y > 75. && c.X < 120.)
+        check "comb cells space glyph origins by MaxLen" (comb.Length = 3 && comb.[1].X-comb.[0].X > 15.)
+        let pixels = rasterize (cmds, w, h, chars)
+        check "rotated MK background remains in widget Rect" (pixels.[95*180+145] = Pixel.pack 0uy 255uy 0uy 255uy
+                                                                  && pixels.[95*180+122] = 0xffffffffu))
 
     test "closed stroke joins differ from coincident open endpoints" (fun () ->
         let closed = renderPixels "8 w 10 10 20 20 re S"

@@ -98,8 +98,8 @@ matching the document widths. The original is now pinned in the corpus.
 
 ### Assets, packaging and remaining limits
 
-- Rbt.Image **0.1.4**, Rbt.Text **0.1.7**, and
-  Rbt.Renderer/Core/Canvas **0.1.11** are published through the normal protected
+- Rbt.Image **0.1.5**, Rbt.Text **0.1.7**, and
+  Rbt.Renderer/Core/Canvas **0.1.14** are published through the normal protected
   Forge tag actions. The earlier missing-native-package incident was fixed in
   Forge; no manual rollout is needed for these library releases.
 - Codec ports retain Apache-2.0 attribution and the bundled PDF.js license.
@@ -129,8 +129,11 @@ matching the document widths. The original is now pinned in the corpus.
 - The 36 bundled CMaps remain a selected subset. Vertical CID `W2`/`DW2`,
   inherited CMaps and mixed-width codes now have focused regressions.
 - Supplied normal annotation appearances render with state selection, visibility,
-  placement, Form clipping and transparency. Missing widget appearances/states
-  still require synthesis; interactive forms and NoZoom/NoRotate are not covered.
+  placement, Form clipping and transparency. Missing text-field, checkbox and
+  radio appearances are synthesized without replacing valid supplied appearances.
+  Text synthesis uses AcroForm fonts and source encodings; hidden widgets remain
+  invisible. Interactive editing, pushbutton/choice/signature synthesis, rich-text
+  layout and NoZoom/NoRotate remain unsupported.
 - Transparency supports the standard blend modes, isolated/non-isolated and
   knockout groups, and alpha/luminosity soft masks. Page and Form groups support
   DeviceRGB, invertible RGB matrix/TRC ICC spaces, and RGB LUT profiles with
@@ -346,3 +349,20 @@ not universal latency or adversarial-resource bounds.
   calculations agree with our pixels, and all 8,415,000 JBIG2 source pixels match
   Poppler extraction. The latter differs in display reduction filtering. See the
   corpus README for per-page evidence and unresolved reference/quality differences.
+
+## Widget appearances and shared reduction (0.1.16)
+
+- Missing text-field, checkbox and radio appearances now synthesize from inherited
+  field state; valid supplied appearances remain authoritative. Caption styling,
+  numeric `/Opt` child states, unison radios and absent/empty border colors are covered.
+- The fractional premultiplied resampling kernel lives in Image 0.1.5.
+  Renderer 0.1.14 owns transformed reduction sizing and Raster/Canvas/GL dispatch;
+  PDF opts into reduction without changing decoded source pixels.
+- The final full run covers 85 PDFs / 606 native pages, with 605 Poppler pairs.
+  Only the known Poppler JPX crash remains an execution failure. Eighteen changed
+  pages were visually reviewed; all 500 stress-page native outputs remain byte-identical.
+- Nine focused pages run on all three backends with independent widget/image/alpha
+  samples and browser worker-disposal checks. Dense JBIG2 comparison error improves
+  16.2%; other sampling metrics are mixed. Cross-backend thin-line differences remain.
+- Detailed evidence and remaining form limitations are in
+  `tests/render-corpus/README.md`, “Missing widget appearances and image reduction”.

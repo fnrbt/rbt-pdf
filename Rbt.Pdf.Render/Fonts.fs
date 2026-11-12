@@ -296,6 +296,22 @@ let private nameToUnicode =
     |> Map.add "space" " "
     |> Map.add "hyphen" "-"
 
+let private pdfDocLow = "\u02d8\u02c7\u02c6\u02d9\u02dd\u02db\u02da\u02dc"
+let private pdfDocHigh =
+    "\u2022\u2020\u2021\u2026\u2014\u2013\u0192\u2044\u2039\u203a\u2212\u2030\u201e\u201c\u201d\u2018\u2019\u201a\u2122\ufb01\ufb02\u0141\u0152\u0160\u0178\u017d\u0131\u0142\u0153\u0161\u017e\u0000\u20ac"
+
+/// AcroForm strings use PDFDocEncoding, not a font's byte encoding.
+let decodePdfString (data: byte[]) =
+    if data.Length >= 2 && data.[0] = 0xfeuy && data.[1] = 0xffuy then
+        [| for i in 2 .. 2 .. data.Length - 2 -> char ((int data.[i] <<< 8) ||| int data.[i+1]) |]
+        |> System.String
+    else
+        [| for b in data ->
+            let code = int b
+            if code >= 0x18 && code <= 0x1f then pdfDocLow.[code - 0x18]
+            elif code >= 0x80 && code <= 0xa0 then pdfDocHigh.[code - 0x80]
+            else char b |] |> System.String
+
 let glyphName (fi: FontInfo) code =
     Map.tryFind code fi.EncodingDiffs
     |> Option.defaultWith (fun () -> FontResolve.glyphNameForByte fi.Encoding code)
@@ -354,6 +370,71 @@ let sourceCodes (fi: FontInfo) (data: byte[]) =
         result.Add(code, data.[offset .. offset + length - 1])
         offset <- offset + length
     result.ToArray()
+/// Build a Unicode-to-source-code encoder for this field's selected PDF font.
+/// An unmapped character has no safe replacement code in an arbitrary PDF font.
+let textEncoder (fi: FontInfo) : string -> byte[] option =
+    if fi.IsComposite && fi.UnicodeEncoded && fi.UnicodeMap.IsEmpty then
+        fun text -> Some [| for c in text do yield byte (int c >>> 8); yield byte (int c &&& 255) |]
+    else
+        let one = System.Collections.Generic.Dictionary<char, byte[]>()
+        let many = ResizeArray<string * byte[]>()
+        let seenMany = System.Collections.Generic.HashSet<string>()
+        let add (label: string) (bytes: byte[]) =
+            if label.Length = 1 then
+                if not (one.ContainsKey label.[0]) then one.[label.[0]] <- bytes
+            elif label.Length > 1 && seenMany.Add label then
+                many.Add(label, bytes)
+        if fi.IsComposite then
+            for KeyValue((length, code), label) in fi.UnicodeMap do
+                if length >= 1 && length <= 4 then
+                    add label [| for shift in length-1 .. -1 .. 0 -> byte (code >>> (shift*8)) |]
+            if fi.CIDMap.IsEmpty then
+                for KeyValue((_, cid), label) in fi.CIDUnicode do
+                    if cid >= 0 && cid <= 65535 then add label [| byte (cid >>> 8); byte cid |]
+            else
+                for KeyValue((length, code), cid) in fi.CIDMap do
+                    match Map.tryFind (2, cid) fi.CIDUnicode with
+                    | Some label when length >= 1 && length <= 4 ->
+                        add label [| for shift in length-1 .. -1 .. 0 -> byte (code >>> (shift*8)) |]
+                    | _ -> ()
+        else
+            // Explicit ToUnicode and Differences override the base encoding.
+            for KeyValue((length, code), label) in fi.UnicodeMap do
+                if length = 1 && code >= 0 && code <= 255 then add label [|byte code|]
+            for KeyValue(code, _) in fi.EncodingDiffs do
+                if code >= 0 && code <= 255 then
+                    let source = [|byte code|]
+                    add (label fi code source) source
+            for code in 0 .. 255 do
+                let source = [|byte code|]
+                add (label fi code source) source
+        fun text ->
+            let result = ResizeArray<byte>()
+            let mutable offset = 0
+            let mutable valid = true
+            while valid && offset < text.Length do
+                let mutable matchLength = 0
+                let mutable matchBytes = [||]
+                for (label, source) in many do
+                    if label.Length > matchLength && label.Length <= text.Length - offset then
+                        let mutable matched = 0
+                        while matched < label.Length && text.[offset + matched] = label.[matched] do
+                            matched <- matched + 1
+                        if matched = label.Length then
+                            matchLength <- label.Length
+                            matchBytes <- source
+                if matchLength = 0 then
+                    match one.TryGetValue text.[offset] with
+                    | true, bytes -> matchLength <- 1; matchBytes <- bytes
+                    | _ when fi.IsComposite && fi.UnicodeEncoded ->
+                        matchLength <- 1
+                        matchBytes <- [| byte (int text.[offset] >>> 8); byte (int text.[offset] &&& 255) |]
+                    | _ -> valid <- false
+                if valid then
+                    result.AddRange matchBytes
+                    offset <- offset + matchLength
+            if valid then Some (result.ToArray()) else None
+
 
 let cid (fi: FontInfo) code length =
     Map.tryFind (length, code) fi.CIDMap |> Option.defaultValue code

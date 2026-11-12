@@ -407,7 +407,7 @@ Local evidence: `results/full-corpus-baseline-report.json`,
 through `full-triage-13.png`, `full-stress-page-checks.json`, and
 `full-image-oracles.json`. These generated artifacts remain excluded from git.
 
-### Corpus-driven corrections
+### Corpus-driven corrections (PDF 0.1.15)
 
 - Simple fonts consume one byte per character regardless of the `/ToUnicode`
   codespace. This restores labels and fine print in `upstream-160f-2019`.
@@ -428,12 +428,64 @@ regressions and Fable compilation pass. Twelve focused shared-Renderer GL
 checks cover transformations and small-text scale equivalence. Browser disposal
 checks terminate each worker and empty the viewer root.
 
-This does **not** synthesize widget appearances when `/AP` is absent, nor missing
-states such as `/Off`; the tax form has 16 widgets without appearances and two
-checkboxes without an off-state appearance. Interactive forms, annotation
-appearance synthesis, and NoZoom/NoRotate behavior are not established by this
-pass. Previously listed reference/quality disagreements remain separately
-classified rather than declared fixed.
+That pass did **not** synthesize widget appearances when `/AP` or the selected
+state was absent. Subsequent object inspection corrected the tax-form inventory:
+its 16 widgets without appearances are **nine pushbuttons and seven hidden text
+fields**, not 16 missing visible fields. The two missing `/Off` appearances belong
+to **radio buttons**, not checkboxes. Hidden widgets must remain invisible.
+Interactive forms and NoZoom/NoRotate were not established by that pass.
+Previously listed reference/quality disagreements remain separately classified.
 
 Post-fix evidence: `results/full-corpus-fixed-report.json`,
 `full-fixed-backends.json`, and `full-fixed-backends.png`.
+
+### Missing widget appearances and image reduction
+
+Missing text-field, checkbox and radio appearances are synthesized; supplied
+appearance streams and valid selected states remain authoritative. Text fields
+use inherited field values, AcroForm font resources and default appearance,
+including alignment, multiline wrapping, comb cells, rotation and password masking.
+Font encoding uses actual source codes rather than replacing unsupported text
+with question marks. Hidden widgets remain hidden.
+
+Button synthesis respects `/MK` colors and captions, absent or empty border colors,
+`/Opt` numeric child-state names and `RadiosInUnison`. In the tax form, the two
+missing Off states have transparent borders and a cross caption; synthesizing
+circles would add incorrect marks to the page's existing square boxes.
+These rules follow PDF 32000-1 tables 189 and 227 and §12.7.4.2.3
+([specification](https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf)).
+
+PDF image painting opts into device-scale area reduction. The shared
+premultiplied region filter belongs to **Rbt.Image**; transformed sizing and
+Raster/Canvas/GL dispatch belong to **Rbt.Renderer**. Decoded source pixels are
+unchanged. The original renderer `DrawImage` sampling contract is unchanged.
+
+This does not add interactive editing, pushbutton/choice/signature appearance
+synthesis, rich-text `/RV` layout, or NoZoom/NoRotate support. Text synthesis needs
+an available default-appearance font and representable source codes.
+
+Verification for PDF **0.1.16**, using published Image **0.1.5** and
+Renderer/Core/Canvas **0.1.14**:
+
+- All **85 PDFs / 606 pages** rerendered natively. Poppler completed **605**;
+  `upstream-bug-jpx` retains its reference-process SIGSEGV (exit -11), while native succeeds.
+- All 605 paired dimensions match. All **18 changed pages** were visually compared
+  with saved outputs and Poppler; all **500 stress-page native outputs are byte-identical**
+  to the saved baseline, with unchanged comparison metrics.
+- Dense JBIG2 mean absolute RGB error fell from **23.7860 to 19.9237** at 800 pixels
+  (16.2%). Other sampling/antialiasing metrics are mixed, not universally better.
+- **8 focused PDFs / 9 pages** completed on native, browser Canvas and Mesa GL.
+  Widget appearance, source-image coverage, alpha and JPX samples passed independent
+  pixel checks. Password appearance text remained masked; all eight browser workers
+  terminated and their viewer roots emptied.
+- Native regressions and Fable compilation pass. Six shared reduction cases pass
+  on CPU, Canvas and GL. Image's six resampler checks pass; both target assemblies
+  compile, and netstandard2.0 matches net10.0 on 18 JPEG/WebP/PNG frame/size cases.
+
+This is not pixel parity: thin-line rendering still differs across backends,
+notably the tax-form grid. Previously classified reference disagreements remain.
+Final evidence: `results/widget-reduction-full-report.json`,
+`widget-reduction-comparison.json`, `widget-final-backends.json`,
+`widget-final-oracles.json`, `widget-final-browser-lifecycle.json`,
+`widget-final-focus-backends.png`, `widget-final-triage-{0,1,2}.png`, and
+`widget-tax-radio-detail.png`.

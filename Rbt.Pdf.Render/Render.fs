@@ -1266,6 +1266,320 @@ let private appearanceMatrix (doc: PdfDocument) appearance =
         | _ -> Matrix3x2.identity
     | _ -> Matrix3x2.identity
 
+// A missing widget appearance is a Form, not page content: the normal Form
+// placement below supplies its BBox, resources, rotation and Rect clipping.
+let private widgetAppearance (opts: RenderOptions) (doc: PdfDocument) acro annotation (x0, y0, x1, y1) =
+    let get key node = Pdf.dictGet doc key node |> Option.map (Pdf.deref doc)
+    let rec inherited key visited depth node =
+        let identity =
+            match node with
+            | PdfIndirect reference -> Some reference
+            | _ -> None
+        if depth >= 64 || (identity |> Option.exists (fun reference -> Set.contains reference visited)) then None
+        else
+            match get key node with
+            | Some value -> Some value
+            | None ->
+                let visited = identity |> Option.map (fun reference -> Set.add reference visited) |> Option.defaultValue visited
+                Pdf.dictGet doc "Parent" node |> Option.bind (inherited key visited (depth + 1))
+    let field key = inherited key Set.empty 0 annotation
+    let integer = function Some (PdfInt n) -> n | _ -> 0L
+    let stringValue = function
+        | Some (PdfString bytes) -> Fonts.decodePdfString bytes
+        | Some (PdfName name) -> name
+        | _ -> ""
+    let number = annotationNumber doc
+    let color value =
+        match value with
+        | Some (PdfArray components) ->
+            match List.map (Pdf.deref doc >> number) components with
+            | [Some a] -> Some (sprintf "%s g" (a.ToString("0.###", Globalization.CultureInfo.InvariantCulture)))
+            | [Some a; Some b; Some c] ->
+                Some (String.concat " " ([a;b;c] |> List.map (fun n -> n.ToString("0.###", Globalization.CultureInfo.InvariantCulture))) + " rg")
+            | [Some a; Some b; Some c; Some d] ->
+                Some (String.concat " " ([a;b;c;d] |> List.map (fun n -> n.ToString("0.###", Globalization.CultureInfo.InvariantCulture))) + " k")
+            | _ -> None
+        | _ -> None
+    let fmt (n: float) = n.ToString("0.###", Globalization.CultureInfo.InvariantCulture)
+    let emit (builder: System.Text.StringBuilder) (parts: string list) =
+        builder.Append(String.concat " " parts).Append('\n') |> ignore
+    let mk = get "MK" annotation
+    let width, height = x1 - x0, y1 - y0
+    let rotation = mk |> Option.bind (get "R") |> Option.map (fun value -> integer (Some value)) |> Option.defaultValue 0L
+    let rotation = ((rotation % 360L) + 360L) % 360L
+    let w, h = if rotation = 90L || rotation = 270L then height, width else width, height
+    let matrix =
+        match rotation with
+        | 90L -> [0.; 1.; -1.; 0.; width; 0.]
+        | 180L -> [-1.; 0.; 0.; -1.; width; height]
+        | 270L -> [0.; -1.; 1.; 0.; 0.; height]
+        | _ -> [1.; 0.; 0.; 1.; 0.; 0.]
+    let background = mk |> Option.bind (get "BG") |> color
+    let borderColor = mk |> Option.bind (get "BC") |> color
+    let border =
+        get "BS" annotation |> Option.bind (get "W") |> Option.bind number
+        |> Option.orElseWith (fun () ->
+            match get "Border" annotation with
+            | Some (PdfArray (_ :: _ :: lineWidth :: _)) -> number (Pdf.deref doc lineWidth)
+            | _ -> None)
+        |> Option.defaultValue 1.0
+    let style = get "BS" annotation |> Option.bind (get "S")
+    let kind = field "FT"
+    let ff = integer (field "Ff")
+    let radio = ff &&& (1L <<< 15) <> 0L
+    let push = ff &&& (1L <<< 16) <> 0L
+    let caption = mk |> Option.bind (get "CA") |> Option.map (fun value -> stringValue (Some value))
+    let roundBorder = radio && caption.IsNone
+    let stroke =
+        borderColor
+        |> Option.map (fun source -> source.Replace(" rg", " RG").Replace(" g", " G").Replace(" k", " K"))
+    let paint = System.Text.StringBuilder()
+    background |> Option.iter (fun paintColor ->
+        emit paint [paintColor; "0 0"; fmt w; fmt h; "re f"])
+    if border > 0.0 && not roundBorder then
+        stroke |> Option.iter (fun strokeColor ->
+            let inset = border / 2.0
+            emit paint [strokeColor; fmt border; "w"]
+            match style with
+            | Some (PdfName "U") -> emit paint [fmt inset; fmt inset; "m"; fmt (w-inset); fmt inset; "l S"]
+            | _ when w > border && h > border ->
+                emit paint [fmt inset; fmt inset; fmt (w-border); fmt (h-border); "re S"]
+            | _ -> ())
+    let resources = acro |> Option.bind (get "DR") |> Option.defaultValue (PdfDict Map.empty)
+    let normal = get "AP" annotation |> Option.bind (get "N")
+    let stateNames =
+        match normal with Some (PdfDict states) -> states |> Map.toList |> List.map fst |> List.filter ((<>) "Off") | _ -> []
+    let state = get "AS" annotation |> Option.bind (function PdfName name -> Some name | _ -> None)
+    let value = field "V" |> Option.map (fun value -> stringValue (Some value)) |> Option.defaultValue ""
+    let parent = Pdf.dictGet doc "Parent" annotation
+    let kidIndex =
+        match parent |> Option.bind (get "Kids") with
+        | Some (PdfArray kids) -> kids |> List.tryFindIndex ((=) annotation)
+        | _ -> None
+    let options =
+        match field "Opt" with
+        | Some (PdfArray items) -> Some items
+        | _ -> None
+    // With /Opt, AP on-state names (and V) are Kids indices, not export strings.
+    let indexedOnState =
+        match options, kidIndex with
+        | Some items, Some index when index < items.Length -> Some (string index)
+        | _ -> None
+    let onState =
+        indexedOnState |> Option.orElseWith (fun () ->
+            match state with
+            | Some name when name <> "Off" -> Some name
+            | _ ->
+                match stateNames with
+                | [name] -> Some name
+                | _ when radio && (parent |> Option.bind (get "Kids") |> Option.exists (function PdfArray (_ :: _ :: _) -> true | _ -> false)) -> None
+                | _ when value <> "" && value <> "Off" -> Some value
+                | _ -> Some "Yes")
+        |> Option.defaultValue ""
+    let radiosInUnison = ff &&& (1L <<< 25) <> 0L
+    let uniqueRadio =
+        if not radio || radiosInUnison then true
+        else
+            match parent |> Option.bind (get "Kids") with
+            | Some (PdfArray kids) ->
+                let active = kids |> List.tryFind (fun kid -> get "AS" kid = Some (PdfName value))
+                let firstMatching =
+                    kids |> List.tryFind (fun kid ->
+                        match get "AP" kid |> Option.bind (get "N") with
+                        | Some (PdfDict states) -> states.ContainsKey value
+                        | _ -> false)
+                match active |> Option.orElse firstMatching with
+                | Some chosen -> chosen = annotation
+                | None -> true
+            | _ -> true
+    let selected =
+        (value <> "" && value <> "Off" && value = onState && uniqueRadio)
+        || (radio && radiosInUnison
+            && (match options, kidIndex, Int32.TryParse value with
+                | Some items, Some index, (true, chosen) when index < items.Length && chosen >= 0 && chosen < items.Length ->
+                    stringValue (Some (Pdf.deref doc items.[index])) = stringValue (Some (Pdf.deref doc items.[chosen]))
+                | _ -> false))
+    let parseDefaultAppearance () =
+        let da =
+            field "DA" |> Option.orElseWith (fun () -> acro |> Option.bind (get "DA"))
+            |> Option.bind (function PdfString bytes -> Some bytes | _ -> None)
+            |> Option.defaultValue [||]
+        let tokens = tokenize da |> List.toArray
+        let mutable fontName = ""
+        let mutable fontSize = 0.0
+        let mutable ink = "0 g"
+        for i in 0 .. tokens.Length - 1 do
+            match tokens.[i] with
+            | TOperator "Tf" when i >= 2 ->
+                match tokens.[i-2], tokens.[i-1] with
+                | TName name, TNumber size -> fontName <- name; fontSize <- size
+                | _ -> ()
+            | TOperator "g" when i >= 1 ->
+                match tokens.[i-1] with TNumber a -> ink <- fmt a + " g" | _ -> ()
+            | TOperator "rg" when i >= 3 ->
+                match tokens.[i-3], tokens.[i-2], tokens.[i-1] with
+                | TNumber a, TNumber b, TNumber c -> ink <- String.concat " " [fmt a; fmt b; fmt c; "rg"]
+                | _ -> ()
+            | TOperator "k" when i >= 4 ->
+                match tokens.[i-4], tokens.[i-3], tokens.[i-2], tokens.[i-1] with
+                | TNumber a, TNumber b, TNumber c, TNumber d -> ink <- String.concat " " [fmt a; fmt b; fmt c; fmt d; "k"]
+                | _ -> ()
+            | _ -> ()
+        fontName, fontSize, ink
+    (match kind with
+     | Some (PdfName "Tx") ->
+        let fontName, specifiedSize, daColor = parseDefaultAppearance ()
+        let raw = stringValue (field "V") |> fun text -> text.Replace("\r\n", "\n").Replace('\r', '\n')
+        let raw = if ff &&& (1L <<< 13) <> 0L then String('*', raw.Length) else raw
+        let multiline = ff &&& (1L <<< 12) <> 0L
+        let comb = ff &&& (1L <<< 24) <> 0L && not multiline && ff &&& (1L <<< 13) = 0L
+        let maxLen = field "MaxLen" |> integer |> int
+        let raw = if maxLen > 0 && raw.Length > maxLen then raw.Substring(0, maxLen) else raw
+        let raw = if multiline then raw else raw.Replace('\n', ' ')
+        let font =
+            Pdf.dictGet doc "Font" resources |> Option.bind (Pdf.dictGet doc fontName)
+        if fontName <> "" && font.IsSome then
+            let info = Fonts.resolve opts.CMaps doc resources fontName
+            let encode = Fonts.textEncoder info
+            // No universal replacement byte exists for a PDF font's private encoding.
+            let bytes text = encode text |> Option.defaultValue [||]
+            let measure text =
+                Fonts.sourceCodes info (bytes text)
+                |> Array.sumBy (fun (code, data) ->
+                    float (Fonts.charWidth info (if info.IsComposite then Fonts.cid info code data.Length else code)) / 1000.0)
+            let margin = max 2.0 (border + 1.0)
+            let available = max 0.0 (w - 2.0 * margin)
+            let lines = ResizeArray<string>()
+            if multiline then
+                for paragraph in raw.Split('\n') do
+                    let line = System.Text.StringBuilder()
+                    let mutable lineWidth = 0.0
+                    let mutable i = 0
+                    while i < paragraph.Length do
+                        let glyphLength =
+                            if Char.IsHighSurrogate paragraph.[i] && i + 1 < paragraph.Length
+                               && Char.IsLowSurrogate paragraph.[i+1] then 2 else 1
+                        let glyph = paragraph.Substring(i, glyphLength)
+                        let advance = measure glyph
+                        if line.Length > 0 && (lineWidth + advance) * (if specifiedSize > 0.0 then specifiedSize else 12.0) > available then
+                            lines.Add(line.ToString())
+                            line.Clear() |> ignore
+                            lineWidth <- 0.0
+                        line.Append(glyph) |> ignore
+                        lineWidth <- lineWidth + advance
+                        i <- i + glyphLength
+                    lines.Add(line.ToString())
+            else lines.Add raw
+            let maxWidth =
+                if comb && maxLen > 0 then raw |> Seq.map (string >> measure) |> Seq.fold max 0.0
+                else lines |> Seq.map measure |> Seq.fold max 0.0
+            let size =
+                if specifiedSize > 0.0 then specifiedSize
+                else
+                    let fitWidth =
+                        if maxWidth <= 0.0 then 12.0
+                        elif comb && maxLen > 0 then max 0.0 (w / float maxLen - 2.0) / maxWidth
+                        else available / maxWidth
+                    min 12.0 (min fitWidth (max 1.0 ((h - 2.0 * margin) / (if multiline then float lines.Count * 1.2 else 1.0))))
+                    |> max 1.0
+            let lineHeight = size * 1.2
+            let align = field "Q" |> integer
+            let quote (data: byte[]) =
+                "(" + (data |> Array.map (fun b -> "\\" + Convert.ToString(int b, 8).PadLeft(3, '0')) |> String.concat "") + ")"
+            if available > 0.0 && h > 2.0 * margin
+               && (lines |> Seq.forall (fun line -> (encode line).IsSome)) then
+                emit paint ["q"; fmt margin; fmt margin; fmt available; fmt (h-2.0*margin); "re W n"]
+                emit paint ["BT"; daColor; "/" + fontName; fmt size; "Tf"]
+                if comb && maxLen > 0 then
+                    let cell = w / float maxLen
+                    let offset = if align = 1L then float (maxLen - raw.Length) / 2.0
+                                 elif align = 2L then float (maxLen - raw.Length) else 0.0
+                    for i in 0 .. min (raw.Length - 1) (maxLen - 1) do
+                        let ch = string raw.[i]
+                        let x = (float i + offset) * cell + (cell - measure ch * size) / 2.0
+                        emit paint ["1 0 0 1"; fmt x; fmt ((h-size)/2.0); "Tm"; quote (bytes ch); "Tj"]
+                else
+                    for i in 0 .. lines.Count - 1 do
+                        let line = lines.[i]
+                        let lineWidth = measure line * size
+                        let x = if align = 1L then (w-lineWidth)/2.0 elif align = 2L then w-margin-lineWidth else margin
+                        let y = if multiline then h-margin-size-float i * lineHeight else (h-size)/2.0
+                        emit paint ["1 0 0 1"; fmt x; fmt y; "Tm"; quote (bytes line); "Tj"]
+                emit paint ["ET Q"]
+            Some resources
+        else None
+     | Some (PdfName "Btn") when not push ->
+        let size = min w h
+        if roundBorder then
+            let radius = size * 0.40
+            let cx, cy = w / 2.0, h / 2.0
+            let circle r =
+                let k = 0.5522847498 * r
+                emit paint [fmt (cx+r); fmt cy; "m"; fmt (cx+r); fmt (cy+k); fmt (cx+k); fmt (cy+r); fmt cx; fmt (cy+r); "c"]
+                emit paint [fmt (cx-k); fmt (cy+r); fmt (cx-r); fmt (cy+k); fmt (cx-r); fmt cy; "c"]
+                emit paint [fmt (cx-r); fmt (cy-k); fmt (cx-k); fmt (cy-r); fmt cx; fmt (cy-r); "c"]
+                emit paint [fmt (cx+k); fmt (cy-r); fmt (cx+r); fmt (cy-k); fmt (cx+r); fmt cy; "c h"]
+            if border > 0.0 then
+                stroke |> Option.iter (fun strokeColor ->
+                    emit paint [strokeColor; fmt border; "w"]
+                    circle radius
+                    emit paint ["S"])
+            if selected then
+                let _, _, ink = parseDefaultAppearance ()
+                emit paint [ink]
+                circle (radius * 0.55)
+                emit paint ["f"]
+        elif selected then
+            match caption with
+            | Some text when text <> "" ->
+                let fontName, fontSize, ink = parseDefaultAppearance ()
+                let font =
+                    Pdf.dictGet doc "Font" resources |> Option.bind (Pdf.dictGet doc fontName)
+                let baseFont = font |> Option.bind (get "BaseFont")
+                let markerInk = ink.Replace(" rg", " RG").Replace(" g", " G").Replace(" k", " K")
+                let thickness = max 1.0 (size * 0.09)
+                match baseFont, text with
+                // Annex D.6: ZapfDingbats 3/4 are ticks, 5..8 are crosses.
+                | Some (PdfName "ZapfDingbats"), ("5" | "6" | "7" | "8") ->
+                    emit paint [markerInk; fmt thickness; "w"]
+                    emit paint [fmt (w*0.22); fmt (h*0.22); "m"; fmt (w*0.78); fmt (h*0.78); "l S"]
+                    emit paint [fmt (w*0.22); fmt (h*0.78); "m"; fmt (w*0.78); fmt (h*0.22); "l S"]
+                | Some (PdfName "ZapfDingbats"), ("3" | "4") ->
+                    emit paint [markerInk; fmt thickness; "w"]
+                    emit paint [fmt (w*0.18); fmt (h*0.5); "m"; fmt (w*0.42); fmt (h*0.24); "l"; fmt (w*0.82); fmt (h*0.77); "l S"]
+                | _ ->
+                    font |> Option.iter (fun _ ->
+                        let info = Fonts.resolve opts.CMaps doc resources fontName
+                        (Fonts.textEncoder info) text
+                        |> Option.iter (fun source ->
+                            let advance =
+                                Fonts.sourceCodes info source
+                                |> Array.sumBy (fun (code, bytes) ->
+                                    Fonts.charWidth info (if info.IsComposite then Fonts.cid info code bytes.Length else code) / 1000.0)
+                            let size =
+                                if fontSize > 0.0 then fontSize
+                                elif advance > 0.0 then min (h*0.7) (w*0.8/advance)
+                                else h*0.7
+                            let quote =
+                                "(" + (source |> Array.map (fun b -> "\\" + Convert.ToString(int b, 8).PadLeft(3, '0')) |> String.concat "") + ")"
+                            emit paint ["BT"; ink; "/" + fontName; fmt size; "Tf"]
+                            emit paint ["1 0 0 1"; fmt ((w-advance*size)/2.0); fmt ((h-size)/2.0); "Tm"; quote; "Tj ET"]))
+            | Some _ -> ()
+            | None ->
+                let _, _, ink = parseDefaultAppearance ()
+                let markerInk = ink.Replace(" rg", " RG").Replace(" g", " G").Replace(" k", " K")
+                emit paint [markerInk; fmt (max 1.0 (size * 0.09)); "w"]
+                emit paint [fmt (w*0.18); fmt (h*0.5); "m"; fmt (w*0.42); fmt (h*0.24); "l"; fmt (w*0.82); fmt (h*0.77); "l S"]
+        Some resources
+     | _ -> None)
+    |> Option.map (fun formResources ->
+        let data = latin1Bytes (paint.ToString())
+        let dictionary =
+            Map.ofList ["BBox", PdfArray [PdfInt 0L; PdfInt 0L; PdfReal w; PdfReal h]
+                        "Matrix", PdfArray (List.map PdfReal matrix)
+                        "Resources", formResources]
+        PdfStream (dictionary, data))
+
 let private appearanceInvocation = "/Appearance Do"B
 
 let private renderAnnotations opts doc page resources working viewport scale =
@@ -1280,7 +1594,8 @@ let private renderAnnotations opts doc page resources working viewport scale =
                 | _ -> 0L
             // Invisible, Hidden and NoView annotations do not appear on screen.
             if flags &&& 35L = 0L then
-                let appearance =
+                let rect = Pdf.dictGet doc "Rect" annotation |> Option.bind (annotationBox doc)
+                let suppliedAppearance =
                     Pdf.dictGet doc "AP" annotation
                     |> Option.bind (Pdf.dictGet doc "N")
                     |> Option.bind (fun normal ->
@@ -1292,7 +1607,17 @@ let private renderAnnotations opts doc page resources working viewport scale =
                             | _ when states.Count = 1 -> states |> Map.toSeq |> Seq.head |> snd |> Some
                             | _ -> None
                         | _ -> None)
-                match appearance |> Option.map (Pdf.deref doc), Pdf.dictGet doc "Rect" annotation |> Option.bind (annotationBox doc) with
+                    |> Option.filter (fun value ->
+                        match Pdf.deref doc value with
+                        | PdfStream _ -> Pdf.dictGet doc "BBox" value |> Option.bind (annotationBox doc) |> Option.isSome
+                        | _ -> false)
+                let appearance =
+                    match suppliedAppearance, rect, Pdf.dictGet doc "Subtype" annotation |> Option.map (Pdf.deref doc) with
+                    | Some existing, _, _ -> Some existing
+                    | None, Some rect, Some (PdfName "Widget") ->
+                        widgetAppearance opts doc (Pdf.dictGet doc "AcroForm" doc.Catalog) annotation rect
+                    | _ -> None
+                match appearance |> Option.map (Pdf.deref doc), rect with
                 | Some (PdfStream (dictionary, data) as appearance), Some (x0, y0, x1, y1) ->
                     match Pdf.dictGet doc "BBox" appearance |> Option.bind (annotationBox doc) with
                     | Some (bx0, by0, bx1, by1) ->
