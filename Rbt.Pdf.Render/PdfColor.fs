@@ -14,12 +14,19 @@ type Space =
     | Lab of struct(float * float * float) * float[]
     | Icc of Icc.Profile * float[] * PdfObj
     | Indexed of int * Space * float[][]
+    | Separation of bool * Space * PdfFunctions.Function
 let isIndexed = function Indexed _ -> true | _ -> false
 let isIcc = function Icc _ -> true | _ -> false
 let isDeviceGray = function Gray -> true | _ -> false
 let device = function 1 -> Some Gray | 3 -> Some Rgb | 4 -> Some Cmyk | _ -> None
 
-let components = function Gray | CalGray _ -> 1 | Rgb | CalRgb _ | Lab _ -> 3 | Cmyk -> 4 | Icc (p,_,_) -> Icc.components p | Indexed _ -> 1
+let components = function Gray | CalGray _ | Separation _ -> 1 | Rgb | CalRgb _ | Lab _ -> 3 | Cmyk -> 4 | Icc (p,_,_) -> Icc.components p | Indexed _ -> 1
+/// /None denotes absence of marking, not a transparent paint object.
+let rec isNoPaint = function
+    | Separation (true, _, _) -> true
+    | Indexed (_, baseSpace, _) -> isNoPaint baseSpace
+    | _ -> false
+let isSeparation = function Separation _ -> true | _ -> false
 let private clamp v = max 0.0 (min 1.0 v)
 let private channel v = byte (int (clamp v * 255.0 + 0.5))
 let private number = function PdfInt n -> Some (float n) | PdfReal n when not (Double.IsNaN n || Double.IsInfinity n) -> Some n | _ -> None
@@ -72,6 +79,9 @@ let rec toRgb space (values: float[]) : struct(byte * byte * byte) =
         | Indexed (hi, baseSpace, palette) ->
             let index = max 0 (min hi (int (values.[0]+0.5)))
             let struct(r,g,b) = toRgb baseSpace palette.[index]
+            struct(float r / 255.0, float g / 255.0, float b / 255.0)
+        | Separation (_, alternate, tint) ->
+            let struct(r,g,b) = toRgb alternate (tint.Eval (clamp values.[0]))
             struct(float r / 255.0, float g / 255.0, float b / 255.0)
     struct(channel r,channel g,channel b)
 
@@ -197,17 +207,19 @@ let rec private toPcs space (values: float[]) =
     | Indexed (hi,baseSpace,palette) ->
         let index = max 0 (min hi (int (values.[0]+0.5)))
         toPcs baseSpace palette.[index]
+    | Separation (_,alternate,tint) -> toPcs alternate (tint.Eval (clamp values.[0]))
 
 /// Convert before quantization, without routing an out-of-gamut source through sRGB.
 /// Preserve all four encoded components when the target is a CMYK blending
 /// profile; converting through sRGB would lose the independent black plate.
-let toWorkingCmyk (target: WorkingSpace) space (values: float[]) =
+let rec toWorkingCmyk (target: WorkingSpace) space (values: float[]) =
     if isNull values || values.Length < components space then
         invalidArg "values" "PDF color component count mismatch"
     match target.FourChannel with
     | None -> invalidArg "target" "PDF blending target is not four-channel"
     | Some (_, inverse) ->
         match space with
+        | Separation (_,alternate,tint) -> toWorkingCmyk target alternate (tint.Eval (clamp values.[0]))
         | Cmyk when target.ProfileSource.IsNone ->
             struct(channel (clamp values.[0]),channel (clamp values.[1]),
                    channel (clamp values.[2]),channel (clamp values.[3]))
@@ -222,9 +234,13 @@ let toWorkingCmyk (target: WorkingSpace) space (values: float[]) =
             struct(channel c,channel m,channel y,channel k)
 
 /// Convert a source to the existing three-channel blending surfaces.
-let toWorkingRgb (target: WorkingSpace) space (values: float[]) =
+let rec toWorkingRgb (target: WorkingSpace) space (values: float[]) =
     if isNull values || values.Length < components space then invalidArg "values" "PDF color component count mismatch"
     elif target.FourChannel.IsSome then invalidArg "target" "Four-channel blending requires toWorkingCmyk"
+    elif (match space with Separation _ -> true | _ -> false) then
+        match space with
+        | Separation (_,alternate,tint) -> toWorkingRgb target alternate (tint.Eval (clamp values.[0]))
+        | _ -> failwith "unreachable"
     elif target.IsDisplay then toRgb space values
     elif (match space with Icc (_,_,source) -> sameIccSource target source | _ -> false) then
         let limits = bounds space
@@ -243,7 +259,7 @@ let toWorkingRgb (target: WorkingSpace) space (values: float[]) =
 /// Resolve PDF resource names, ICC stream Alternate and Indexed lookup tables.
 /// Unsupported ICC data uses its declared Alternate, or the PDF default Device
 /// space for /N when Alternate is absent; it is not treated as an ICC transform.
-let resolve (doc: PdfDocument) (resources: PdfObj) (colorSpace: PdfObj) : Space option =
+let private resolveCore parseProfile (doc: PdfDocument) (resources: PdfObj) (colorSpace: PdfObj) : Space option =
     let numbers obj =
         match Pdf.deref doc obj with
         | PdfArray xs ->
@@ -267,6 +283,13 @@ let resolve (doc: PdfDocument) (resources: PdfObj) (colorSpace: PdfObj) : Space 
             |> Option.bind (parse (depth+1))
         | PdfArray (head :: rest) ->
             match Pdf.deref doc head, rest with
+            | PdfName "Separation", [name; alternate; transform] ->
+                match Pdf.deref doc name, parse (depth+1) alternate, PdfFunctions.tryParse doc transform with
+                | PdfName name, Some alternate, Some tint
+                    when (match alternate with Indexed _ | Separation _ -> false | _ -> true)
+                         && tint.Inputs = 1 && tint.Outputs = components alternate ->
+                    Some (Separation((name = "None"), alternate, tint))
+                | _ -> None
             | PdfName ("Indexed" | "I"), baseSpace :: high :: lookup :: _ ->
                 match parse (depth+1) baseSpace, number (Pdf.deref doc high) with
                 | Some baseSpace, Some hi when hi >= 0.0 && hi <= 255.0 && hi = floor hi ->
@@ -313,7 +336,7 @@ let resolve (doc: PdfDocument) (resources: PdfObj) (colorSpace: PdfObj) : Space 
                         | _ -> None
                     match limits, Pdf.deref doc profile with
                     | Some limits, PdfStream _ ->
-                        let parsed = try Pdf.getStreamData doc profile |> Icc.tryParse with _ -> None
+                        let parsed = parseProfile profile
                         match parsed with
                         | Some icc when Icc.components icc = int count -> Some (Icc(icc,limits,profile))
                         | _ -> fallback ()
@@ -355,3 +378,23 @@ let resolve (doc: PdfDocument) (resources: PdfObj) (colorSpace: PdfObj) : Space 
             | _ -> None
         | _ -> None
     parse 0 colorSpace
+
+let private parseProfile doc profile =
+    try Pdf.getStreamData doc profile |> Icc.tryParse with _ -> None
+
+let resolve doc resources colorSpace =
+    resolveCore (parseProfile doc) doc resources colorSpace
+
+/// One content interpretation owns this cache; resource-dependent alternates
+/// still resolve in their own scope, while immutable ICC bytes parse only once.
+let internal createResolver doc =
+    let profiles = Collections.Generic.Dictionary<PdfObj, Icc.Profile option>(HashIdentity.Reference)
+    let cachedProfile profile =
+        let key = Pdf.deref doc profile
+        match profiles.TryGetValue key with
+        | true, value -> value
+        | _ ->
+            let value = parseProfile doc key
+            profiles.Add(key, value)
+            value
+    resolveCore cachedProfile doc

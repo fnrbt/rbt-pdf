@@ -8,9 +8,9 @@
        every build; nothing refers to a neighbouring checkout. The packages a
        Fable build uses carry their F# sources under fable/. -->
   <PropertyGroup>
-    <RbtTextPackageVersion Condition="'$(RbtTextPackageVersion)' == ''">0.1.7</RbtTextPackageVersion>
-    <RbtRendererCorePackageVersion Condition="'$(RbtRendererCorePackageVersion)' == ''">0.1.16</RbtRendererCorePackageVersion>
-    <RbtRendererPackageVersion Condition="'$(RbtRendererPackageVersion)' == ''">0.1.16</RbtRendererPackageVersion>
+    <RbtTextPackageVersion Condition="'$(RbtTextPackageVersion)' == ''">0.1.9</RbtTextPackageVersion>
+    <RbtRendererCorePackageVersion Condition="'$(RbtRendererCorePackageVersion)' == ''">0.1.17</RbtRendererCorePackageVersion>
+    <RbtRendererPackageVersion Condition="'$(RbtRendererPackageVersion)' == ''">0.1.17</RbtRendererPackageVersion>
     <RbtImagePackageVersion Condition="'$(RbtImagePackageVersion)' == ''">0.1.7</RbtImagePackageVersion>
   </PropertyGroup>
 </Project>

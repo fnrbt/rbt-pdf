@@ -1,15 +1,17 @@
 # PDF rendering corpus
 
-The collection contains **85 PDFs (3,281,868 bytes)**: 30 Mozilla pdf.js
+The collection contains **90 PDFs (56,240,780 bytes)**: 30 Mozilla pdf.js
 fixtures pinned to commit `94a48f3c844d4677b264b6e7c0a1e239c245189f`,
-one PDF Association PDF 2.0 example, and 54 generated fixtures.
+one PDF Association PDF 2.0 example, five long real-world documents, and 54
+generated fixtures.
 
 Coverage includes embedded/subset/Type 3/CID fonts, Arabic and CJK text,
 JPEG/JPEG2000/JBIG2, packed images and masks, transparency/blending,
 shading/patterns, Form XObjects and AcroForms, offset page boxes/rotation,
 text state and clipping, malformed streams, and multipage/performance cases.
-The collection has **606 pages**, including a generated 500-page document for
-scrolling, zoom cancellation and offscreen canvas eviction checks.
+The collection has **1,543 pages**, including 937 pages in the five real-world
+documents and a generated 500-page document for scrolling, zoom cancellation
+and offscreen canvas eviction checks.
 
 Two complementary sets:
 
@@ -933,3 +935,213 @@ This release uses the published **Rbt.Image 0.1.7** metadata API. Image was
 published first through Forge; an isolated, no-HTTP-cache NuGet restore verified
 the registry artifact and its source commit
 `8f8b5e364916c407f31eb527e5d6d6425aebcac8`, without the locally packed candidate.
+
+## Full published 0.1.19 corpus and resulting corrections
+
+The native baseline covers **all 1,543 pages in all 90 PDFs**, including the
+500-page synthetic and all 937 pages of the five long real-world documents.
+It uses isolated published NuGet packages, not the working tree, at an
+800-pixel maximum side; Poppler uses the PDF CropBox.
+
+- Native: 1,536 successes, seven failures.
+- Poppler: 1,542 successes; the known malformed `upstream-bug-jpx` crashes.
+- 1,535 paired comparisons, with no paired dimension mismatches.
+- Evidence: `results/full-0.1.19-native/{plan,report,ranking,provenance}.json`
+  and the per-page PNGs. A failed reference is retained, not counted as a match.
+
+The published **browser** baseline also covers every one of those 1,543 pages,
+using the actual viewer in Chromium 156 at DPR 1.25 and registry-verified
+pdfjs-dist 6.5.438, at the same 800-pixel maximum side:
+
+- Published viewer: 1,485 successful canvases and 58 bounded-render failures.
+- pdf.js: 1,543 successful canvases.
+- All 90 manifest document identities match; no missing or duplicate page
+  records. All 500 synthetic stress pages rendered in both engines.
+- 1,485 paired comparisons, no image errors or dimension mismatches, and 386
+  contact sheets. Pixel rankings are triage aids, not correctness thresholds.
+- Failures: Jungle pages 2, 3, 442 and 443; 53 Bhasha pages; Arabic page 70.
+- Authoritative evidence:
+  `results/full-0.1.19-browser/dpr-1.25/{report,metrics,visual-review}.json`,
+  per-page PNGs and contact sheets. An earlier disposable JSONL triage reader
+  mishandled Unicode line separators; its 1,541-record result is superseded by
+  these complete 1,543-record reports.
+
+The resulting source corrections are:
+
+| Problem | Correct ownership and correction |
+| --- | --- |
+| Arabic report page 70 and Bhasha page 4 fail; Bhasha page 185 loses its blue logo | PDF Separation tint functions and alternate spaces, sharing the existing Type 0/2/3/4 function parser with shadings. Preserve alternate CMYK K and ICC identity; `/None` contributes no paint or knockout shape. `/All` uses the alternate for composite display, not spot-plate overprint simulation. |
+| GNU manual glyphs are corrupted | `../rbt-text/opentype/Type1.fs`: correct hint-replacement and flex OtherSubrs results and preserve pending operands. |
+| Chinese GEM cover loses its embedded font and spaces digits too widely | Resolve indirect DescendantFonts arrays and indirect CID W/DW entries at PDF font boundaries. |
+| Four Jungle scan pages fail JPEG2000 decoding | PDF-specific terminated coding-pass lengths/MQ restarts, zero-length passes and vertically causal significance/sign contexts; context reset and segmentation symbols remain enforced. |
+| Bhasha page 50 exceeds 120 seconds natively | `../rbt-renderer/Raster.fs`: linear linked-list edge traversal for antialiased fills/gradients/clips, rather than quadratic indexed traversal. |
+| Browser component rendering repeatedly exceeds 60 seconds | `../rbt-renderer`: eliminate unnecessary full-surface work, use validated direct Fable pixel access, bound simple component composition by actual painted pixels, and convert fresh canvas buffers in place. |
+
+All seven failed native pages now render in targeted source checks:
+
+| Page | Corrected observed native time |
+| --- | ---: |
+| Arabic report 70 | 6.23 s |
+| Bhasha 4 | 1.58 s |
+| Bhasha 50 | 7.78 s |
+| Jungle 2, 3, 442, 443 | 1.59–1.99 s each |
+
+These are single observations, not stable performance thresholds. The five
+embedded JP2 images on those four scan pages also agree with independently
+decoded Poppler samples within one channel value; full rendered-page pixels
+still include different image reduction and antialiasing.
+
+The native PDF suite passes, including Separation/no-paint/knockout cases,
+indirect CID font positioning, and the real JPX regression. Shared Type 1
+format regressions and the renderer imagebench pass. The latter checks
+12,000-vertex contour coverage against equivalent simple geometry for both
+winding rules, solid/gradient paint and clipping.
+
+Source verification uses locally packed, **unpublished** Rbt.OpenType.Core
+**0.1.9** and Rbt.Renderer/Core/Canvas **0.1.17**, restored from
+`/tmp/rbt-full019-feed` with `RestoreAdditionalProjectSources`. Version 0.1.8
+of OpenType.Core already exists in the registry and does not contain this
+Type 1 correction. No sibling-checkout project references were introduced.
+Evidence: `results/full-0.1.19-fixes/native/{report,font-report,jpx-report}.json`
+and adjacent captures. The separate font report supersedes the initial GNU
+rows, which exposed the already-published 0.1.8 dependency collision.
+
+Not all pixel differences are renderer defects: malformed shading calculator
+input, ICC Range/backdrop oracle limitations, JPX SMaskInData reference
+differences, nonembedded font substitution, and reduction/antialiasing are
+tracked separately. The inspected Chinese/Bhasha images declare DeviceCMYK;
+their broad color shifts are differences in uncalibrated device-color models,
+not evidence of an ignored embedded ICC profile. DeviceN and full spot-plate
+overprint simulation are not added by the Separation correction.
+
+### Browser verification of the corrections
+
+Actual Chromium 156 at DPR 1.25 renders all seven previously failing native
+pages after the corrections, plus the GNU text, Chinese font and UNESCO logo
+cases. The four JPX scan pages complete in 6.6–12.1 seconds in the first source
+pass. Arabic 70 and Bhasha 50 initially still exceeded the browser's 60-second
+limit after the PDF-specific fixes; worker profiling identified avoidable
+full-surface work in the **shared renderer**, not a new JPEG decoder problem.
+
+`ComponentCompositor` now bulk-clears scratch storage, skips unpacking zero
+pixels, and avoids unchanged non-knockout accumulated-alpha writes.
+Further profiles exposed repeated checked pixel reads and full-surface passes
+after sparse component unpacking. Validated Fable loops now access pixels
+directly; simple nonnested, nonknockout Normal component objects restrict
+composition and alpha accumulation to their actual nonzero-alpha pixel range.
+Other blend modes, nested groups and knockout groups retain full-surface
+handling. No public raster callback API or approximate geometry was introduced.
+`CanvasImage` converts its fresh ImageData buffer in place with the same
+premultiplication rounding. No render timeout was increased.
+
+| Browser page | Earlier source attempt | Bounded compositor |
+| --- | ---: | ---: |
+| Bhasha 4 | 22.22 s | 3.97 s |
+| Bhasha 5 | >60 s | 19.39 s |
+| Bhasha 6 | 59.90 s | 15.68 s |
+| Arabic report 70 | >60 s | 22.22 s |
+| Bhasha 50 | >60 s | 16.67 s |
+
+The last two pages remain slow; completing them is not a claim of fast
+interactive rendering. These are individual end-to-end observations at an
+800-pixel maximum side. Actual page canvases were inspected. The two newly
+completed pages have the same dimensions as native output, with mean RGB
+channel differences of 1.474 and 0.950 respectively (0–255 scale).
+
+The shared imagebench's independent scalar component oracle, native PDF
+transparency/knockout regressions and Fable build pass. Browser pixel conversion
+matches the old formula exactly for 65,536 alpha/channel samples. The first
+shared optimization keeps ten successful page captures pixel-identical; the
+accumulation change also keeps Bhasha 4 and the transparency fixture
+pixel-identical. The bounded path preserves exact pixels on Bhasha 4, 6 and 50
+and Arabic 70. The independent scalar regression includes an entirely
+transparent component object, guarding the empty-range case.
+
+Evidence: `results/full-0.1.19-fixes/browser/report.json`,
+`browser-after-component/{report,canvas-conversion,pixel-comparison}.json`,
+`browser-after-accumulation/{report,pixel-comparison}.json`,
+`browser-bounded/{report,pixel-comparison}.json`,
+`browser-bounded-additional/{report,pixel-comparison}.json`,
+`browser-bounded-{third,fourth,fifth,sixth}/report.json`,
+`browser-final-visual/report.json`, and the `bhasha50/` worker CPU profiles under
+the same results directory.
+
+Final reconciliation verifies **all 58 published-browser failures now render**
+in targeted source checks, with successful pdf.js references and no recorded
+worker errors. All 53 affected Bhasha pages complete in approximately 4–39
+seconds; that upper end remains slow. The source coverage index records
+**65 distinct pages, all successful**, including the GNU page 17 and Chinese
+page 3 visual spot checks. See `results/full-0.1.19-fixes/source-coverage.json`,
+`source-verification.json` and `corpus-reconciliation.json`.
+
+This is targeted source verification, **not a full 1,543-page post-fix rerun**.
+The full comparison above measures published 0.1.19. Candidate dependency
+packages and PDF changes remain unpublished; no commit or tag was made.
+
+### Bounded component groups and repeated ICC parsing
+
+The next source pass targets the previously observed 39-second Bhasha page 100,
+not JPEG decoding. A direct worker profile attributed 20.5 seconds to component
+compositing and 16.8 seconds to color-space resolution, including repeated
+decompression and parsing of the same ICC profile.
+
+- `Render.fs` caches named color spaces by resource-dictionary identity and name.
+  A per-page `PdfColor` resolver shares parsed ICC profiles across content,
+  forms, masks and annotations without caching resource-dependent alternates
+  globally. The resource-shadowing regression checks parent/form/parent fill
+  colors and restored stroke colors.
+- `../rbt-renderer` supplies conservative device-space bounds and tightly packed
+  raster rectangles. Eligible nested component groups use region-local float32
+  surfaces, retaining exact backdrop precision rather than converting through
+  eight-bit RGB. Native and GL callbacks retain conservative full-surface bounds.
+- Canvas glyph paths cache their control-point bounds. Unknown geometry,
+  knockout groups and operators affecting pixels outside source coverage retain
+  safe full-surface handling.
+- Canvas reuses a full-coordinate scratch surface but clears and reads only
+  bounded rectangles. Drawing into translated small canvases was rejected:
+  it changed glyph coverage. An independent Canvas-only probe reproduced that
+  coordinate-sensitive rasterization; keeping original coordinates restores
+  exact component-plane pixels.
+
+| Bhasha page 100, 601×800 | Observed seconds |
+| --- | ---: |
+| Earlier source capture | 39.135 |
+| Corrected source, profiled | 2.121 |
+| pdf.js in the corrected run | 0.216 |
+
+This is approximately an 18-fold improvement, not pdf.js performance parity.
+The corrected page matches all 480,800 previous pixels exactly. Its remaining
+profile includes component-space conversion/ICC evaluation and checked Fable
+array access. Timings are individual end-to-end observations, not thresholds.
+
+The native PDF suite, shared imagebench and Fable build pass. Ten actual Canvas
+scenes preserve exact RGBA and both component planes across clipping,
+transforms, fractional edges, strokes, nested groups and masks. Four glyph
+placement scenarios also preserve exact pixels. An intervening Unicode writer
+change required a Fable-compatible scalar conversion; compiled JavaScript
+checks cover BMP/supplementary mappings and invalid scalar rejection.
+
+Evidence: `results/bounded-compositor/after-local-groups/{p100-report,proof}.json`,
+`canvas-equivalence.json`, `pixel-investigation/{crop-origin-evidence,glyph-comparison}.json`
+and `unicode-compatibility.json` under that results directory. Packages remain
+local, unpublished candidates.
+
+The final Chromium 156 / DPR 1.25 check rendered all 65 established targets
+successfully with both engines, with no worker errors. **All 65 Fable images
+match their previous source baselines pixel-for-pixel.** Bhasha page 100 took
+2.087 seconds versus pdf.js's 0.225 seconds in this unprofiled run; page 50
+took 3.089 seconds and Arabic page 70 took 2.081 seconds. Other bottlenecks
+remain: Chinese GEM page 1 took 18.978 seconds versus pdf.js's 1.044 seconds.
+This remains targeted verification, not a full 1,543-page post-fix rerun.
+`results/bounded-compositor/pages/report.json` records all timings and PNGs;
+`results/bounded-compositor/verification.json` records exact pixel comparisons
+and final local package SHA-256 identities.
+
+### Release 0.1.21
+
+The release packages the corrections and bounded-compositing work above,
+with Rbt.OpenType.Core 0.1.9, Rbt.Renderer/Core/Canvas 0.1.17 and the unchanged
+Rbt.Image 0.1.7. It retains the writer's per-occurrence CID/source-sequence
+mapping from the isolated 0.1.20 release. Verification scope remains the native
+suite, Fable build and 65 exact browser page comparisons described above;
+the historical “unpublished” notes refer to those pre-release measurements.

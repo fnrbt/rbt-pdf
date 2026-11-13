@@ -220,7 +220,7 @@ let resolve (cmaps: Map<string, byte[]>) (doc: PdfDocument) (resources: PdfObj) 
         | Some (PdfArray (cid :: _)) -> Some cid
         | _ -> None
     let defaultWidth =
-        match descendant |> Option.bind (Pdf.dictGet doc "DW") with
+        match descendant |> Option.bind (Pdf.dictGet doc "DW") |> Option.map (Pdf.deref doc) with
         | Some (PdfInt n) -> float n | Some (PdfReal n) -> n | _ -> 1000.0
     // Simple-font widths outside /FirstChar../LastChar use FontDescriptor /MissingWidth.
     let missingWidth =

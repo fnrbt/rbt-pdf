@@ -172,6 +172,7 @@ let cmykJpeg =
 [<EntryPoint>]
 let main _ =
     test "baseline" (fun () -> assertHello "baseline" (build normal onePage 1))
+    JpxRegression.run test check
 
     test "JBIG2 page and PDF image dimensions" (fun () ->
         let uint32Bytes n =
@@ -1143,6 +1144,74 @@ let main _ =
         check "cyclic usecmap retains reachable mappings"
             (cyclic.IsVertical && Rbt.Pdf.Render.Fonts.cid cyclic 0x41 1 = 9))
 
+    test "Separation tints preserve alternate components and no-paint shape" (fun () ->
+        let doc = Pdf.openData (build normal onePage 1)
+        let numbers xs = PdfArray (xs |> List.map PdfReal)
+        let fn domain c0 c1 =
+            PdfDict (Map.ofList ["FunctionType", PdfInt 2L; "Domain", numbers domain
+                                 "C0", numbers c0; "C1", numbers c1; "N", PdfInt 1L])
+        let transform = fn [0.0;1.0] [0.0;0.0;0.0;0.0] [0.0;0.0;0.0;1.0]
+        let spec name alternate f = PdfArray [PdfName "Separation"; PdfName name; alternate; f]
+        let resolve obj = Rbt.Pdf.Render.PdfColor.resolve doc PdfNull obj
+        let spot = resolve (spec "Ink" (PdfName "DeviceCMYK") transform) |> Option.get
+        let convert t = Rbt.Pdf.Render.PdfColor.toWorkingCmyk Rbt.Pdf.Render.PdfColor.deviceCmykSpace spot [|t|]
+        check "tint transform preserves CMYK black and clamps input"
+            (convert (-1.0) = struct(0uy,0uy,0uy,0uy) &&
+             convert 0.5 = struct(0uy,0uy,0uy,128uy) &&
+             convert 2.0 = struct(0uy,0uy,0uy,255uy))
+        let struct(r,g,b) = Rbt.Pdf.Render.PdfColor.toRgb spot [|0.5|]
+        check "tint is converted to display through the alternate" (r=128uy && g=128uy && b=128uy)
+        check "wrong function arity and illegal alternates rejected"
+            ((resolve (spec "Ink" (PdfName "DeviceRGB") transform)).IsNone &&
+             (resolve (spec "Ink" (PdfName "DeviceGray") (fn [0.0;1.0;0.0;1.0] [0.0] [1.0]))).IsNone &&
+             (resolve (spec "Ink" (PdfArray [PdfName "Indexed"; PdfName "DeviceGray"; PdfInt 1L; PdfString [|0uy;255uy|]]) (fn [0.0;1.0] [0.0] [1.0]))).IsNone)
+        let tint = "<</FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 0 0 1] /N 1>>"
+        let resources = $"/ColorSpace <</Spot [/Separation /Ink /DeviceCMYK {tint}] /AllInk [/Separation /All /DeviceCMYK {tint}]>>"
+        let pixels = renderFixture "/MediaBox [0 0 60 20] /Group <</S /Transparency /CS /DeviceCMYK>>" "" resources []
+                        "/Spot cs 0.5 sc 0 0 20 20 re f /AllInk cs 0.5 sc 20 0 20 20 re f /Spot cs 40 0 20 20 re f" 1.0 |> rasterize
+        check "spot and All paint alternate while initial tint is one"
+            (abs (int (Pixel.r pixels.[610])-128) <= 3 &&
+             abs (int (Pixel.r pixels.[630])-128) <= 3 && Pixel.r pixels.[650] < 4uy)
+        let gray = "<</FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1>>"
+        let content = "0 0 1 rg 0 0 100 100 re f /No cs 0 sc 0 0 100 100 re f"
+        let form = $"<</Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group <</S /Transparency /I true /K true>> /Resources <</ColorSpace <</No [/Separation /None /DeviceGray {gray}]>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let result = renderFixture "/MediaBox [0 0 100 100]" "" "/XObject <</F 5 0 R>>" [5,form] "/F Do" 1.0 |> rasterize
+        let p = result.[5050]
+        check "None does not knock out earlier blue in a knockout group" (Pixel.r p = 0uy && Pixel.g p = 0uy && Pixel.b p = 255uy))
+
+    test "named color spaces remain scoped across form resources" (fun () ->
+        let spot color =
+            $"[/Separation /Ink /DeviceRGB <</FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [{color}] /N 1>>]"
+        let red, blue = spot "1 0 0", spot "0 0 1"
+        let content = "/Spot cs 1 sc 20 0 20 20 re f"
+        let form =
+            $"<</Type /XObject /Subtype /Form /BBox [0 0 60 20] /Resources <</ColorSpace <</Spot {blue}>>>> /Length {content.Length}>>\nstream\n{content}\nendstream"
+        let resources = $"/ColorSpace <</Spot {red}>> /XObject <</F 5 0 R>>"
+        let pixels =
+            renderFixture "/MediaBox [0 0 60 20]" "" resources [5,form]
+                "/Spot cs 1 sc 0 0 20 20 re f /F Do 1 sc 40 0 20 20 re f /Spot CS 1 SC 2 w 0 2 m 60 2 l S" 1.0 |> rasterize
+        for x, expected in [10, (255uy,0uy,0uy); 30, (0uy,0uy,255uy); 50, (255uy,0uy,0uy)] do
+            let p = pixels.[10*60+x]
+            check $"color resource scope at {x}" ((Pixel.r p, Pixel.g p, Pixel.b p) = expected)
+        let stroke = pixels.[18*60+30]
+        check "stroke uses restored parent color resource"
+            (Pixel.r stroke = 255uy && Pixel.g stroke = 0uy && Pixel.b stroke = 0uy))
+
+    test "Separation images and strokes use tint and None never marks" (fun () ->
+        let tint = "<</FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [1 0 0] /N 1>>"
+        let resources = $"/ColorSpace <</Spot [/Separation /Ink /DeviceRGB {tint}] /No [/Separation /None /DeviceRGB {tint}]>> /XObject <</Im 5 0 R /NoIm 6 0 R /Stencil 7 0 R>>"
+        let image cs = $"<</Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /{cs} /Length 1>>\nstream\nÿ\nendstream"
+        let stencil = "<</Type /XObject /Subtype /Image /Width 1 /Height 1 /ImageMask true /BitsPerComponent 1 /Length 1>>\nstream\n\000\nendstream"
+        let content = "0 0 1 rg 0 0 80 20 re f q 20 0 0 20 0 0 cm /Im Do Q /Spot CS 1 SC 8 w 20 10 m 40 10 l S q 20 0 0 20 40 0 cm /NoIm Do Q /No cs q 20 0 0 20 60 0 cm /Stencil Do Q"
+        let pixels = renderFixture "/MediaBox [0 0 80 20]" "" resources [5,image "Spot"; 6,image "No"; 7,stencil] content 1.0 |> rasterize
+        let imagePixel, strokePixel, noneImage, noneStencil = pixels.[810], pixels.[830], pixels.[850], pixels.[870]
+        check "image and stroke use the Separation tint"
+            (Pixel.r imagePixel > 245uy && Pixel.b imagePixel < 10uy &&
+             Pixel.r strokePixel > 245uy && Pixel.b strokePixel < 10uy)
+        check "None image and stencil leave existing paint untouched"
+            (Pixel.b noneImage = 255uy && Pixel.r noneImage = 0uy &&
+             Pixel.b noneStencil = 255uy && Pixel.r noneStencil = 0uy))
+
     test "DeviceCMYK groups retain a separate K and subtractive Multiply" (fun () ->
         let cmyk = Rbt.Pdf.Render.PdfColor.device 4 |> Option.get
         let working = Rbt.Pdf.Render.PdfColor.tryWorkingSpace cmyk |> Option.get
@@ -1271,6 +1340,16 @@ let main _ =
             Rbt.Pdf.Render.PdfColor.toWorkingCmyk working managedSpace [|0.0;0.0;0.0;0.5|]
         check "source ICC CMYK retains K instead of reducing to three colors"
             (c=0uy && m=0uy && y=0uy && k=128uy)
+        let tint = PdfDict (Map.ofList [
+            "FunctionType", PdfInt 2L; "Domain", PdfArray [PdfInt 0L;PdfInt 1L]
+            "C0", PdfArray [PdfInt 0L;PdfInt 0L;PdfInt 0L;PdfInt 0L]
+            "C1", PdfArray [PdfInt 0L;PdfInt 0L;PdfInt 0L;PdfInt 1L]; "N", PdfInt 1L ])
+        let separation = PdfArray [PdfName "Separation"; PdfName "Ink"; managed; tint]
+        let separationSpace = Rbt.Pdf.Render.PdfColor.resolve doc PdfNull separation |> Option.get
+        let struct(sc,sm,sy,sk) =
+            Rbt.Pdf.Render.PdfColor.toWorkingCmyk working separationSpace [|0.5|]
+        check "Separation preserves ICC profile identity and its native K"
+            (sc=0uy && sm=0uy && sy=0uy && sk=128uy)
         let struct(_,_,_,invertedK) =
             Rbt.Pdf.Render.PdfColor.toWorkingCmyk working (Rbt.Pdf.Render.PdfColor.device 3 |> Option.get)
                 [|1.0;0.0;0.0|]
@@ -1586,7 +1665,23 @@ let main _ =
             let commands, _, _, _ =
                 renderFixture "/MediaBox [0 0 100 100]" "" "/Font <</F1 5 0 R>>" objects
                     $"BT /F1 40 Tf 1 0 0 1 20 40 Tm <{code}> Tj ET" 1.0
-            check $"CID glyph selection with {mapping} and {payload.Length}-byte map" (glyphIds commands = [expected]))
+            check $"CID glyph selection with {mapping} and {payload.Length}-byte map" (glyphIds commands = [expected])
+        let indirect =
+            [ 5, "<</Type /Font /Subtype /Type0 /BaseFont /Subset /Encoding /Identity-H /DescendantFonts 10 0 R>>"
+              6, "<</Type /Font /Subtype /CIDFontType2 /BaseFont /Subset /CIDSystemInfo <</Registry (Adobe) /Ordering (Identity) /Supplement 0>> /FontDescriptor 7 0 R /CIDToGIDMap /Identity /DW 12 0 R /W 11 0 R>>"
+              7, "<</Type /FontDescriptor /FontName /Subset /Flags 32 /FontFile2 9 0 R>>"
+              9, $"<</Length {fontData.Length}>>\nstream\n{fontData}\nendstream"
+              10, "[6 0 R]"
+              11, $"[{gid} [300]]"
+              12, "700" ]
+        let codes = gid.ToString("X4") + (gid + 1).ToString("X4")
+        let commands, _, _, boxes =
+            renderFixture "/MediaBox [0 0 100 100]" "" "/Font <</F1 5 0 R>>" indirect
+                $"BT /F1 40 Tf 1 0 0 1 20 40 Tm <{codes}> Tj ET" 1.0
+        check "indirect descendant array retains embedded glyphs" (glyphIds commands = [gid;gid+1])
+        check "indirect CID widths and default place successive glyphs"
+            (boxes.Length = 2 && near 20.0 boxes.[0].X && near 12.0 boxes.[0].W
+             && near 32.0 boxes.[1].X && near 28.0 boxes.[1].W))
 
     test "PDF page and nested Form blend independently of caller background" (fun () ->
         let formContent = "0 0 1 rg 0 0 80 30 re f"

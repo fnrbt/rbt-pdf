@@ -17,7 +17,7 @@ namespace Rbt.Pdf.Render
 open System
 open Rbt.Image.Codecs.ArithmeticDecoder
 
-type BitModel(width: int, height: int, subband: string, zeroBitPlanes: int, mb: int) =
+type BitModel(width: int, height: int, subband: string, zeroBitPlanes: int, mb: int, verticallyCausal: bool) =
     static let llLhLabels =
         [| 0uy;5uy;8uy;0uy;3uy;7uy;8uy;0uy;4uy;7uy;8uy;0uy;0uy;0uy;0uy;0uy;1uy;6uy;8uy;0uy;3uy;7uy;8uy;0uy;4uy;7uy;8uy;0uy;0uy;0uy;0uy;0uy;2uy;6uy;8uy;0uy;3uy;7uy;8uy;0uy;4uy;7uy;8uy;0uy;0uy;0uy;0uy;0uy;2uy;6uy;8uy;0uy;3uy;7uy;8uy;0uy;4uy;7uy;8uy;0uy;0uy;0uy;0uy;0uy;2uy;6uy;8uy;0uy;3uy;7uy;8uy;0uy;4uy;7uy;8uy |]
     static let hlLabels =
@@ -47,7 +47,7 @@ type BitModel(width: int, height: int, subband: string, zeroBitPlanes: int, mb: 
         | None -> invalidOp "BitModel decoder has not been set"
 
     let setNeighborsSignificance (row: int) (column: int) (index: int) =
-        if row > 0 then
+        if row > 0 && (not verticallyCausal || row % 4 <> 0) then
             let i = index - width
             if column > 0 then neighborsSignificance.[i - 1] <- neighborsSignificance.[i - 1] + 0x10uy
             if column + 1 < width then neighborsSignificance.[i + 1] <- neighborsSignificance.[i + 1] + 0x10uy
@@ -60,7 +60,6 @@ type BitModel(width: int, height: int, subband: string, zeroBitPlanes: int, mb: 
         if column > 0 then neighborsSignificance.[index - 1] <- neighborsSignificance.[index - 1] + 1uy
         if column + 1 < width then neighborsSignificance.[index + 1] <- neighborsSignificance.[index + 1] + 1uy
         neighborsSignificance.[index] <- neighborsSignificance.[index] ||| 0x80uy
-
     let decodeSignBit (row: int) (column: int) (index: int) =
         let mutable contribution = 0
         let left = column > 0 && coefficientsMagnitude.[index - 1] <> 0u
@@ -75,7 +74,7 @@ type BitModel(width: int, height: int, subband: string, zeroBitPlanes: int, mb: 
             else 0
         contribution <- horizontal * 3
         let above = row > 0 && coefficientsMagnitude.[index - width] <> 0u
-        let below = row + 1 < height && coefficientsMagnitude.[index + width] <> 0u
+        let below = row + 1 < height && (not verticallyCausal || row % 4 <> 3) && coefficientsMagnitude.[index + width] <> 0u
         if below then
             let s1 = int coefficientsSign.[index + width]
             contribution <- contribution + (if above then 1 - s1 - int coefficientsSign.[index - width] else 1 - s1 - s1)

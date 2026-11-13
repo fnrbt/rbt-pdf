@@ -36,6 +36,9 @@ type CodingStyle =
       MultipleComponentTransform: bool
       Reversible: bool
       ResetContextProbabilities: bool
+      TerminateEachPass: bool
+      VerticallyCausal: bool
+      PredictableTermination: bool
       SegmentationSymbolUsed: bool
       SopMarkerUsed: bool
       EphMarkerUsed: bool
@@ -119,7 +122,7 @@ let private readCodingStyle (reader: Reader) =
     let xb, yb = reader.Byte(), reader.Byte()
     require (xb <= 8 && yb <= 8 && xb + yb <= 8) "Invalid codeblock dimensions"
     let style = reader.Byte()
-    require (style &&& 0xDD = 0) "Unsupported codeblock coding style"
+    require (style &&& 0xC1 = 0) "Unsupported codeblock coding style"
     let transform = reader.Byte()
     require (transform <= 1) "Unsupported wavelet transform"
     let precincts =
@@ -135,6 +138,8 @@ let private readCodingStyle (reader: Reader) =
       CodeblockHeightExponent = yb + 2; ProgressionOrder = progression
       LayersCount = layers; MultipleComponentTransform = mct = 1
       Reversible = transform = 1; ResetContextProbabilities = style &&& 2 <> 0
+      TerminateEachPass = style &&& 4 <> 0; VerticallyCausal = style &&& 8 <> 0
+      PredictableTermination = style &&& 16 <> 0
       SegmentationSymbolUsed = style &&& 32 <> 0
       SopMarkerUsed = flags &&& 2 <> 0; EphMarkerUsed = flags &&& 4 <> 0
       Precincts = precincts }
@@ -421,12 +426,15 @@ let private parsePackets data start finish (tile: TileState) (structureCount: in
                             while reader.ReadBits 1 <> 0 do
                                 block.LengthBits <- block.LengthBits + 1
                                 require (block.LengthBits <= 30) "Excessive codeblock length exponent"
-                            let mutable logarithm, n = 0, passes
-                            while n > 1 do
-                                logarithm <- logarithm + 1
-                                n <- n >>> 1
-                            let length = reader.ReadBits (logarithm + block.LengthBits)
-                            pending.Add(block.Output, passes, length)
+                            let segments = if style.TerminateEachPass then passes else 1
+                            for _ = 1 to segments do
+                                let segmentPasses = if style.TerminateEachPass then 1 else passes
+                                let mutable logarithm, n = 0, segmentPasses
+                                while n > 1 do
+                                    logarithm <- logarithm + 1
+                                    n <- n >>> 1
+                                let length = reader.ReadBits (logarithm + block.LengthBits)
+                                pending.Add(block.Output, segmentPasses, length)
         reader.Align()
         if style.EphMarkerUsed then reader.Marker(0x92, true) |> ignore
         for block, passes, length in pending do

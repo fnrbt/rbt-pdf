@@ -17,12 +17,13 @@
     <Compile Include="JpxWavelets.fs" />
     <Compile Include="JpxPackets.fs" />
     <Compile Include="JpxDecode.fs" />
+    <Compile Include="PdfCalculator.fs" />
+    <Compile Include="PdfSampled.fs" />
+    <Compile Include="PdfFunctions.fs" />
     <Compile Include="PdfColor.fs" />
     <Compile Include="PdfImages.fs" />
     <Compile Include="Fonts.fs" />
     <Compile Include="PageGeometry.fs" />
-    <Compile Include="PdfCalculator.fs" />
-    <Compile Include="PdfSampled.fs" />
     <Compile Include="Shading.fs" />
     <Compile Include="Render.fs" />
   </ItemGroup>

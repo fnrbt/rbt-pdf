@@ -5,6 +5,7 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="JpxRegression.fs" />
     <Compile Include="Program.fs" />
     <EmbeddedResource Include="jpx-tiled.base64" LogicalName="jpx-tiled.base64" />
     <EmbeddedResource Include="jpx-tiled-mct.base64" LogicalName="jpx-tiled-mct.base64" />

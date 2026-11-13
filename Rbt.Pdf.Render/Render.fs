@@ -233,7 +233,7 @@ module RenderOptions =
 
 // ── Main Interpreter ─────────────────────────────────────
 
-let private groupWorkingSpace doc resources group =
+let private groupWorkingSpace doc resolveColor resources group =
     let rec isIcc depth value =
         if depth > 12 then false else
         match Pdf.deref doc value with
@@ -245,7 +245,7 @@ let private groupWorkingSpace doc resources group =
         | _ -> false
     Pdf.dictGet doc "CS" group
     |> Option.map (fun colorSpace ->
-        let space = PdfColor.resolve doc resources colorSpace
+        let space = resolveColor resources colorSpace
                     |> Option.defaultWith (fun () -> invalidOp "Unsupported PDF transparency-group color space")
         if isIcc 0 colorSpace && not (PdfColor.isIcc space) then
             invalidOp "Unsupported PDF transparency-group ICC profile"
@@ -282,7 +282,7 @@ let private managedGroup (parent: PdfColor.WorkingSpace) (child: PdfColor.Workin
         else ColorManagedGroup(groupConversion parent target, isolated, knockout, opacity, mode, mask, children)
     | _ -> TransparencyGroup(isolated, knockout, opacity, mode, mask, children)
 
-let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resources: PdfObj) (contentData: byte[]) (initialState: GraphicsState) (initialWorking: PdfColor.WorkingSpace option) (viewport: PageGeometry.Viewport) (scale: float) (depth: int) : Cmd list * CharBox[] =
+let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resolveColor: PdfObj -> PdfObj -> PdfColor.Space option) (resources: PdfObj) (contentData: byte[]) (initialState: GraphicsState) (initialWorking: PdfColor.WorkingSpace option) (viewport: PageGeometry.Viewport) (scale: float) (depth: int) : Cmd list * CharBox[] =
             if depth > 32 then invalidOp "PDF content recursion limit exceeded"
             let mutable currentResources = resources
             let mutable defaultCTM = initialState.CTM
@@ -304,8 +304,10 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                 | Some target when target.FourChannel.IsSome -> PdfColor.toWorkingCmyk target space values
                 | _ -> let struct(r,g,b) = toTarget space values in struct(r,g,b,0uy)
             let sourceColor (space, values) alpha =
-                let struct(r,g,b,k) = toImageTarget space values
-                Color.rgba r g b (byte (clamp 0.0 255.0 (alpha * 255.0))), k
+                if PdfColor.isNoPaint space then Color.black, 0uy
+                else
+                    let struct(r,g,b,k) = toImageTarget space values
+                    Color.rgba r g b (byte (clamp 0.0 255.0 (alpha * 255.0))), k
             let refreshColors state =
                 let fill, fillK = state.FillSource |> Option.map (fun source -> sourceColor source state.FillAlpha)
                                   |> Option.defaultValue (state.FillColor,state.FillK)
@@ -355,6 +357,25 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
             let textClip = ResizeArray<PathSeg list>()
             let mutable hasTextClip = false
             let fontCache = Collections.Generic.Dictionary<PdfObj, FontInfo>()
+            // A resource name is scoped to its resource dictionary. Reusing a
+            // parsed space avoids decoding the same ICC stream for every sc/SC.
+            // Reference identity avoids hashing resource trees and stream bytes.
+            let colorSpaces =
+                Collections.Generic.Dictionary<PdfObj, Collections.Generic.Dictionary<string, PdfColor.Space option>>(HashIdentity.Reference)
+            let resolveColorName name =
+                let names =
+                    match colorSpaces.TryGetValue currentResources with
+                    | true, names -> names
+                    | _ ->
+                        let names = Collections.Generic.Dictionary<string, PdfColor.Space option>()
+                        colorSpaces.Add(currentResources, names)
+                        names
+                match names.TryGetValue name with
+                | true, space -> space
+                | _ ->
+                    let space = resolveColor currentResources (PdfName name)
+                    names.Add(name, space)
+                    space
 
             // Clipping state
             let mutable pendingClip: (PathSeg list * FillRule) option = None
@@ -446,7 +467,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                 let tileViewport =
                                     { viewport with Bounds = (x0, y0, x1, y1); Width = x1 - x0; Height = y1 - y0; Transform = Matrix3x2.identity }
                                 let tileScale = scale * max (sqrt (patternToPage.M11 ** 2.0 + patternToPage.M12 ** 2.0)) (sqrt (patternToPage.M21 ** 2.0 + patternToPage.M22 ** 2.0))
-                                let tileCommands, _ = renderContent opts doc tileResources (Pdf.getStreamData doc pattern) tileState working tileViewport tileScale (depth + 1)
+                                let tileCommands, _ = renderContent opts doc resolveColor tileResources (Pdf.getStreamData doc pattern) tileState working tileViewport tileScale (depth + 1)
                                 let tileBounds = [MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0); LineTo(vec2 x1 y1); LineTo(vec2 x0 y1); Close]
                                 let cell = [Clip(tileBounds, NonZero, tileCommands)]
                                 // Render a single period, including cells that overlap it.
@@ -491,6 +512,21 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                     | _ -> [], lazy []
 
             let fourthColor value (original: Color) = Color.rgba value value value original.A
+            let noPaint source = source |> Option.exists (fun (space, _) -> PdfColor.isNoPaint space)
+            let initialColorSource name previous =
+                let needsReset space = PdfColor.isSeparation space || PdfColor.isNoPaint space
+                resolveColorName name
+                |> Option.filter (fun space -> needsReset space || (previous |> Option.exists (fun (old, _) -> needsReset old)))
+                |> Option.map (fun space ->
+                    let values =
+                        if PdfColor.isSeparation space then [|1.0|]
+                        else
+                            let count = PdfColor.components space
+                            let limits = PdfColor.ranges space
+                            Array.init count (fun i ->
+                                let value = if count = 4 && i = 3 then 1.0 else 0.0
+                                max limits.[2*i] (min limits.[2*i+1] value))
+                    space, values)
             let paintPath (segments: PathSeg list) fill stroke rule =
                 let bounds () =
                     let points =
@@ -507,7 +543,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         max y0 ((points |> List.minBy (fun p -> p.Y) |> fun p -> float p.Y) - margin),
                         min x1 ((points |> List.maxBy (fun p -> p.X) |> fun p -> float p.X) + margin),
                         min y1 ((points |> List.maxBy (fun p -> p.Y) |> fun p -> float p.Y) + margin)
-                if fill then
+                if fill && not (gs.ColorSpace <> "Pattern" && noPaint gs.FillSource) then
                     match gs.FillPattern with
                     | Some name ->
                         let color, shape = patternCommands name gs.FillColor gs.FillK gs.FillSource gs.FillAlpha (bounds ())
@@ -520,7 +556,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                 Components4(main, FillPath(segments, Solid (fourthColor gs.FillK color), rule))
                             else main
                         addPaint gs.FillAlpha None true command
-                if stroke && abs (gs.CTM.M11 * gs.CTM.M22 - gs.CTM.M12 * gs.CTM.M21) > 1e-12 then
+                if stroke && not (gs.StrokeColorSpace <> "Pattern" && noPaint gs.StrokeSource) && abs (gs.CTM.M11 * gs.CTM.M22 - gs.CTM.M12 * gs.CTM.M21) > 1e-12 then
                     let style = makeStroke gs
                     let strokeCommand paint =
                         if gs.CTM = Matrix3x2.identity then StrokePath(segments, { style with Paint = paint })
@@ -612,7 +648,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                             let glyphText = { M11 = gs.FontSize * horizontal; M12 = 0.0; M21 = 0.0; M22 = gs.FontSize; DX = advance * horizontal; DY = gs.TextRise + advanceY }
                             let glyphCTM = Matrix3x2.multiply (Matrix3x2.multiply (Matrix3x2.multiply fi.Type3Matrix glyphText) textMatrix) gs.CTM
                             let glyphResources = fi.Type3Resources |> Option.defaultValue currentResources
-                            let glyphCmds, _ = renderContent opts doc glyphResources data { gs with CTM = glyphCTM } working viewport scale (depth + 1)
+                            let glyphCmds, _ = renderContent opts doc resolveColor glyphResources data { gs with CTM = glyphCTM } working viewport scale (depth + 1)
                             cmds.AddRange glyphCmds
                         | _ -> ()
                         match fi.Type3Font, fi.EmbeddedFont, fi.ByteToGlyph, fi.IsComposite with
@@ -662,7 +698,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         let stroke = mode = 1 || mode = 2 || mode = 5 || mode = 6
                         let clipping = mode >= 4 && mode <= 7
                         if clipping then hasTextClip <- true
-                        if mode = 0 && gs.FillPattern.IsNone then
+                        if mode = 0 && gs.FillPattern.IsNone && not (noPaint gs.FillSource) then
                             // Keep ordinary text on the backends' cached glyph path.
                             let runs = ResizeArray<Text.GlyphRun>()
                             let mutable first = 0
@@ -744,9 +780,18 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                 | None -> ()
 
             let paintImage image =
-                match PdfImages.decode opts.DecodeJpeg toImageTarget (isFourChannel ())
-                    (working |> Option.forall (fun space -> space.IsDisplay)) doc currentResources
-                    image { (fillColor gs) with A = 255uy } gs.FillK 0 with
+                let stencil = Pdf.dictGet doc "ImageMask" image |> Option.map (Pdf.deref doc) = Some (PdfBool true)
+                let noMark = if stencil then noPaint gs.FillSource else
+                                Pdf.dictGet doc "ColorSpace" image
+                                |> Option.bind (resolveColor currentResources)
+                                |> Option.exists PdfColor.isNoPaint
+                let decoded =
+                    if noMark then None
+                    else
+                        PdfImages.decode opts.DecodeJpeg toImageTarget (isFourChannel ())
+                            (working |> Option.forall (fun space -> space.IsDisplay)) doc currentResources
+                            image { (fillColor gs) with A = 255uy } gs.FillK 0
+                match decoded with
                 | Some (w, h, pixels, geometry, softImageMask, geometricMask, fourth) ->
                     let interpolate = Pdf.dictGet doc "Interpolate" image |> Option.map (Pdf.deref doc) = Some (PdfBool true)
                     let ctm, alpha = gs.CTM, gs.FillAlpha
@@ -937,11 +982,11 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                         let declaredGray =
                                             groupDict
                                             |> Option.bind (Pdf.dictGet doc "CS")
-                                            |> Option.bind (PdfColor.resolve doc maskResources)
+                                            |> Option.bind (resolveColor maskResources)
                                             |> Option.exists PdfColor.isDeviceGray
                                         if declaredGray then Some PdfColor.deviceGraySpace
-                                        else groupDict |> Option.bind (groupWorkingSpace doc maskResources) |> Option.orElse working
-                                    let children, _ = renderContent opts doc maskResources (Pdf.getStreamData doc group) maskState maskWorking viewport scale (depth + 1)
+                                        else groupDict |> Option.bind (groupWorkingSpace doc resolveColor maskResources) |> Option.orElse working
+                                    let children, _ = renderContent opts doc resolveColor maskResources (Pdf.getStreamData doc group) maskState maskWorking viewport scale (depth + 1)
                                     let knockout = groupDict |> Option.bind (Pdf.dictGet doc "K") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
                                     let isolated = groupDict |> Option.bind (Pdf.dictGet doc "I") |> Option.map (Pdf.deref doc) = Some (PdfBool true)
                                     // The mask surface holds group-space pixels, not parent-space pixels.
@@ -965,7 +1010,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                                 if not luminosity then bounded
                                                 else
                                                     let colorSpace = groupDict |> Option.bind (Pdf.dictGet doc "CS") |> Option.defaultValue (PdfName "DeviceRGB")
-                                                    let space = PdfColor.resolve doc maskResources colorSpace |> Option.defaultWith (fun () -> invalidOp "Unsupported PDF soft-mask backdrop color space")
+                                                    let space = resolveColor maskResources colorSpace |> Option.defaultWith (fun () -> invalidOp "Unsupported PDF soft-mask backdrop color space")
                                                     let count = PdfColor.components space
                                                     let limits = PdfColor.ranges space
                                                     let values =
@@ -1063,15 +1108,27 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                             gs <- { gs with StrokeColor = color; StrokeK = k; StrokeSource = source; StrokeColorSpace = name; StrokePattern = None }
                     | "cs" ->
                         let csName = popName ()
-                        gs <- { gs with ColorSpace = resolveColorSpace csName; FillPattern = None }
+                        let name = resolveColorSpace csName
+                        let initial = initialColorSource name gs.FillSource
+                        match initial with
+                        | Some source ->
+                            let color, k = sourceColor source gs.FillAlpha
+                            gs <- { gs with ColorSpace = name; FillPattern = None; FillSource = initial; FillColor = color; FillK = k }
+                        | None -> gs <- { gs with ColorSpace = name; FillPattern = None }
                     | "CS" ->
                         let csName = popName ()
-                        gs <- { gs with StrokeColorSpace = resolveColorSpace csName; StrokePattern = None }
+                        let name = resolveColorSpace csName
+                        let initial = initialColorSource name gs.StrokeSource
+                        match initial with
+                        | Some source ->
+                            let color, k = sourceColor source gs.StrokeAlpha
+                            gs <- { gs with StrokeColorSpace = name; StrokePattern = None; StrokeSource = initial; StrokeColor = color; StrokeK = k }
+                        | None -> gs <- { gs with StrokeColorSpace = name; StrokePattern = None }
                     | "sc" | "scn" ->
                         let ops = popAllOperands ()
                         let nums = ops |> List.choose (function TNumber n -> Some n | _ -> None)
                         let space = if gs.ColorSpace.StartsWith("Pattern:") then gs.ColorSpace.Substring(8) else gs.ColorSpace
-                        let source = PdfColor.resolve doc currentResources (PdfName space) |> Option.map (fun s -> s, List.toArray nums)
+                        let source = resolveColorName space |> Option.map (fun s -> s, List.toArray nums)
                         let color, k = source |> Option.map (fun s -> sourceColor s gs.FillAlpha) |> Option.defaultWith (fun () ->
                             if working.IsSome && not nums.IsEmpty then invalidOp "Unsupported PDF paint color space for transparency blending"
                             pdfColorToColor space nums gs.FillAlpha, 0uy)
@@ -1081,7 +1138,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                         let ops = popAllOperands ()
                         let nums = ops |> List.choose (function TNumber n -> Some n | _ -> None)
                         let space = if gs.StrokeColorSpace.StartsWith("Pattern:") then gs.StrokeColorSpace.Substring(8) else gs.StrokeColorSpace
-                        let source = PdfColor.resolve doc currentResources (PdfName space) |> Option.map (fun s -> s, List.toArray nums)
+                        let source = resolveColorName space |> Option.map (fun s -> s, List.toArray nums)
                         let color, k = source |> Option.map (fun s -> sourceColor s gs.StrokeAlpha) |> Option.defaultWith (fun () ->
                             if working.IsSome && not nums.IsEmpty then invalidOp "Unsupported PDF paint color space for transparency blending"
                             pdfColorToColor space nums gs.StrokeAlpha, 0uy)
@@ -1255,7 +1312,7 @@ let rec private renderContent (opts: RenderOptions) (doc: PdfDocument) (resource
                                             let childWorking, groupStart =
                                                 match Pdf.dictGet doc "Group" xobj with
                                                 | Some group when Pdf.dictGet doc "S" group |> Option.map (Pdf.deref doc) = Some (PdfName "Transparency") ->
-                                                    let child = groupWorkingSpace doc formResources group
+                                                    let child = groupWorkingSpace doc resolveColor formResources group
                                                     let knockout = Pdf.dictGet doc "K" group |> Option.map (Pdf.deref doc) = Some (PdfBool true)
                                                     let isolated = Pdf.dictGet doc "I" group |> Option.map (Pdf.deref doc) = Some (PdfBool true)
                                                     child |> Option.orElse working, Some (cmds.Count, isolated, knockout, child)
@@ -1702,7 +1759,7 @@ let private widgetAppearance (opts: RenderOptions) (doc: PdfDocument) acro annot
 
 let private appearanceInvocation = "/Appearance Do"B
 
-let private renderAnnotations opts doc page resources working viewport scale =
+let private renderAnnotations opts doc resolveColor page resources working viewport scale =
     let commands = ResizeArray<Cmd>()
     let boxes = ResizeArray<CharBox>()
     match Pdf.dictGet doc "Annots" page |> Option.map (Pdf.deref doc) with
@@ -1763,7 +1820,7 @@ let private renderAnnotations opts doc page resources working viewport scale =
                             let invocationResources =
                                 PdfDict (Map.ofList ["XObject", PdfDict (Map.ofList ["Appearance", form])])
                             let painted, chars =
-                                renderContent opts doc invocationResources appearanceInvocation
+                                renderContent opts doc resolveColor invocationResources appearanceInvocation
                                     { defaultState with CTM = placement } working viewport scale 0
                             let rect =
                                 [ MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0)
@@ -1783,6 +1840,7 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
         match PageGeometry.tryGet doc pageObj with
         | None -> None
         | Some viewport ->
+            let resolveColor = PdfColor.createResolver doc
             let pageW = viewport.Width * scale
             let pageH = viewport.Height * scale
             let pageTransform = Matrix3x2.multiply viewport.Transform (Matrix3x2.scale scale scale)
@@ -1791,12 +1849,12 @@ let renderPage (opts: RenderOptions) (doc: PdfDocument) (pageNum: int) (scale: f
             let pageGroupDict =
                 Pdf.getPageInheritable doc pageObj "Group"
                 |> Option.filter (fun group -> Pdf.dictGet doc "S" group |> Option.map (Pdf.deref doc) = Some (PdfName "Transparency"))
-            let pageWorking = pageGroupDict |> Option.bind (groupWorkingSpace doc resources)
+            let pageWorking = pageGroupDict |> Option.bind (groupWorkingSpace doc resolveColor resources)
             let pageCommands, pageChars =
                 if contentData.Length = 0 then [], [||]
-                else renderContent opts doc resources contentData defaultState pageWorking viewport scale 0
+                else renderContent opts doc resolveColor resources contentData defaultState pageWorking viewport scale 0
             let annotationCommands, annotationChars =
-                renderAnnotations opts doc pageObj resources pageWorking viewport scale
+                renderAnnotations opts doc resolveColor pageObj resources pageWorking viewport scale
             let x0, y0, x1, y1 = viewport.Bounds
             let pageClip =
                 [ MoveTo(vec2 x0 y0); LineTo(vec2 x1 y0)

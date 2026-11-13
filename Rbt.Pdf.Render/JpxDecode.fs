@@ -20,6 +20,9 @@ open System
 open Rbt.Pdf.Render.JpxPackets
 
 let private invalid message = invalidOp ("JPX: " + message)
+// MQ initialization for a zero-length terminated pass reads an artificial
+// 0xFF marker (JPEG 2000 Annex C), not the following codeblock's bytes.
+let private emptyMqData = [| 255uy |]
 
 // DWT coefficients are level shifted to a signed interval. Map that interval to
 // the full eight-bit sample range; this also handles signed SIZ components.
@@ -75,7 +78,7 @@ let private writeTile (image: Image) (tile: Tile) (planes: Plane[]) (output: byt
                     output.[pos + c] <- sample image.Components.[c].Precision (get c x y)
 
 let private copyCoefficients (coefficients: float32[]) levelWidth originX originY (subband: Subband)
-                             delta mb reversible segmentation reset =
+                             delta mb reversible segmentation reset terminateEachPass verticallyCausal =
     let width = subband.X1 - subband.X0
     if width < 0 || mb < 0 || mb > 31 then invalid "invalid subband parameters"
     let right = (if subband.Kind.[0] = 'H' then 1 else 0) ^^^ (originX &&& 1)
@@ -97,15 +100,25 @@ let private copyCoefficients (coefficients: float32[]) levelWidth originX origin
                 length <- length + segment.Length
                 passes <- passes + segment.CodingPasses
             if length = 0 || length > 64000000 || passes = 0 then invalid "invalid codeblock data length"
-            let encoded = Array.zeroCreate<byte> length
-            let mutable at = 0
-            for segment in block.Segments do
-                Array.blit segment.Data segment.Start encoded at segment.Length
-                at <- at + segment.Length
-            let model = Rbt.Pdf.Render.BitModel(bw, bh, subband.Kind, block.ZeroBitPlanes, mb)
-            model.SetDecoder(Rbt.Image.Codecs.ArithmeticDecoder.Decoder(encoded, 0, length))
+            let model = Rbt.Pdf.Render.BitModel(bw, bh, subband.Kind, block.ZeroBitPlanes, mb, verticallyCausal)
+            if terminateEachPass then
+                if block.Segments.Count <> passes then invalid "invalid terminated codeblock pass count"
+            else
+                let encoded = Array.zeroCreate<byte> length
+                let mutable at = 0
+                for segment in block.Segments do
+                    Array.blit segment.Data segment.Start encoded at segment.Length
+                    at <- at + segment.Length
+                model.SetDecoder(Rbt.Image.Codecs.ArithmeticDecoder.Decoder(encoded, 0, length))
             let mutable pass = 2
-            for _ = 1 to passes do
+            for index = 0 to passes - 1 do
+                if terminateEachPass then
+                    let segment = block.Segments.[index]
+                    if segment.CodingPasses <> 1 then invalid "invalid terminated codeblock segment"
+                    if segment.Length = 0 then
+                        model.SetDecoder(Rbt.Image.Codecs.ArithmeticDecoder.Decoder(emptyMqData, 0, 1))
+                    else
+                        model.SetDecoder(Rbt.Image.Codecs.ArithmeticDecoder.Decoder(segment.Data, segment.Start, segment.Start + segment.Length))
                 match pass with
                 | 0 -> model.RunSignificancePropagationPass()
                 | 1 -> model.RunMagnitudeRefinementPass()
@@ -165,7 +178,7 @@ let private transformComponent (comp: Component) (tileComponent: TileComponent) 
                     if style.Reversible then 1.0
                     else (2.0 ** float (comp.Precision + gain - epsilon)) * (1.0 + float step.Mu / 2048.0)
                 let mb = quant.GuardBits + epsilon - 1
-                copyCoefficients coefficients w resolution.X0 resolution.Y0 subband delta mb style.Reversible style.SegmentationSymbolUsed style.ResetContextProbabilities
+                copyCoefficients coefficients w resolution.X0 resolution.Y0 subband delta mb style.Reversible style.SegmentationSymbolUsed style.ResetContextProbabilities style.TerminateEachPass style.VerticallyCausal
             ({ width = w; height = h; x0 = resolution.X0; y0 = resolution.Y0; items = coefficients }: JpxWavelets.Level))
     let result = JpxWavelets.reconstruct style.Reversible levels
     if result.width <> tileComponent.X1 - tileComponent.X0 || result.height <> tileComponent.Y1 - tileComponent.Y0 then
