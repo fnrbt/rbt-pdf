@@ -7,6 +7,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="ImageSource.fs" />
+    <Compile Include="WebCrypto.fs" />
     <Compile Include="WorkerRuntime.fs" />
     <Compile Include="WorkerClient.fs" />
     <Compile Include="TextLayer.fs" />

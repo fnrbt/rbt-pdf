@@ -125,8 +125,12 @@ let private render (id: int) (pageNum: int) (scale: float) : JS.Promise<unit> =
 let private openDocument (id: int) (bytes: byte[]) (baseUrl: string) : JS.Promise<unit> =
     assetsBase <- baseUrl.TrimEnd('/')
     loadAssets assetsBase
-    |> promiseMap (fun opts ->
+    |> promiseBind (fun opts ->
         let doc = Pdf.openData bytes
+        if Encryption.isEncrypted doc then
+            WebCrypto.decryptIfNeeded bytes |> promiseMap (fun plain -> opts, Pdf.openData plain)
+        else promiseReturn (opts, doc))
+    |> promiseMap (fun (opts, doc) ->
         let count = Pdf.getPageCount doc
         let sizes : float[][] =
             [| for n in 1 .. count do

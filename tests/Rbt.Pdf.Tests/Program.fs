@@ -169,6 +169,128 @@ let cmykJpeg =
     // 8x8 constant CMYK (0,128,128,0) with Adobe APP14 transform zero.
     Convert.FromBase64String("/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB/8AAFAgACAAIBAERAAIRAAMRAAQRAP/EACcAAAIAAAAAAAAAAAAAAAAAAAALEAEAAAAAAAAAAAAAAAAAAAAA/9oADgQBAAIAAwAEAAA/AF/4Bf8Av//Z")
 
+// ------------------------------------------------------------ encryption
+/// The host side of Encryption.Crypto, on System.Security.Cryptography.
+let netCrypto : Encryption.Crypto =
+    let aes (key: byte[]) =
+        let a = Security.Cryptography.Aes.Create()
+        a.Key <- key
+        a
+    { Md5 = fun b -> async { return Security.Cryptography.MD5.HashData b }
+      Sha256 = fun b -> async { return Security.Cryptography.SHA256.HashData b }
+      Sha384 = fun b -> async { return Security.Cryptography.SHA384.HashData b }
+      Sha512 = fun b -> async { return Security.Cryptography.SHA512.HashData b }
+      AesCbcEncrypt = fun key iv data -> async { use a = aes key in return a.EncryptCbc(data, iv, Security.Cryptography.PaddingMode.None) }
+      AesCbcDecrypt = fun key iv data -> async { use a = aes key in return a.DecryptCbc(data, iv, Security.Cryptography.PaddingMode.None) } }
+
+/// Test-side encryptor (the spec's encryption algorithms, written apart from
+/// the library's decryption) for RC4-128 (R3), AES-128 (R4) and AES-256 (R6).
+module Encrypt =
+    open System.Security.Cryptography
+    let md5 (b: byte[]) = MD5.HashData b
+    let pad =
+        [| 0x28uy; 0xBFuy; 0x4Euy; 0x5Euy; 0x4Euy; 0x75uy; 0x8Auy; 0x41uy; 0x64uy; 0x00uy; 0x4Euy; 0x56uy; 0xFFuy; 0xFAuy; 0x01uy; 0x08uy
+           0x2Euy; 0x2Euy; 0x00uy; 0xB6uy; 0xD0uy; 0x68uy; 0x3Euy; 0x80uy; 0x2Fuy; 0x0Cuy; 0xA9uy; 0xFEuy; 0x64uy; 0x53uy; 0x69uy; 0x7Auy |]
+    let padded (pw: string) = let b = latin1 pw in Array.append b (Array.sub pad 0 (32 - b.Length))
+    let rc4 (key: byte[]) (data: byte[]) =
+        let s = Array.init 256 id
+        let mutable j = 0
+        for i in 0 .. 255 do
+            j <- (j + s.[i] + int key.[i % key.Length]) % 256
+            let t = s.[i] in s.[i] <- s.[j]; s.[j] <- t
+        let mutable i = 0
+        j <- 0
+        data |> Array.map (fun b ->
+            i <- (i + 1) % 256
+            j <- (j + s.[i]) % 256
+            let t = s.[i] in s.[i] <- s.[j]; s.[j] <- t
+            b ^^^ byte s.[(s.[i] + s.[j]) % 256])
+    let xorKey (key: byte[]) i = key |> Array.map (fun b -> b ^^^ byte i)
+    let aesRaw encrypt (key: byte[]) (iv: byte[]) (data: byte[]) mode =
+        use a = Aes.Create()
+        a.Key <- key
+        if encrypt then a.EncryptCbc(data, iv, mode) else a.DecryptCbc(data, iv, mode)
+    let hash2B (pw: byte[]) (salt: byte[]) (udata: byte[]) =
+        let mutable k = SHA256.HashData(Array.concat [ pw; salt; udata ])
+        let mutable round = 0
+        let mutable e = Array.empty
+        while round < 64 || int e.[e.Length - 1] > round - 32 do
+            let k1 = Array.concat [ pw; k; udata ]
+            e <- aesRaw true (Array.sub k 0 16) (Array.sub k 16 16) (Array.concat (List.replicate 64 k1)) PaddingMode.None
+            let m = Numerics.BigInteger(Array.append (Array.rev (Array.sub e 0 16)) [| 0uy |]) % Numerics.BigInteger 3
+            k <- (if m.IsZero then SHA256.HashData e elif m.IsOne then SHA384.HashData e else SHA512.HashData e)
+            round <- round + 1
+        Array.sub k 0 32
+    let le32 (v: int) = BitConverter.GetBytes v
+
+    /// `plain` encrypted with revision `r` (3, 4 or 6), P = `p`.
+    let pdf (r: int) (user: string) (owner: string) (p: int) (plain: byte[]) =
+        let doc = Pdf.openData plain
+        let id0 = Array.init 16 (fun i -> byte (i * 7 + 1))
+        let objects =
+            [ for n in 1 .. doc.XRef.Length - 1 do
+                match doc.XRef.[n] with
+                | InUse _ -> yield n, Pdf.deref doc (PdfIndirect (n, 0))
+                | _ -> () ]
+        let hex (b: byte[]) = "<" + bytesToHex b + ">"
+        let fileKey, encDict =
+            if r = 6 then
+                let fk = RandomNumberGenerator.GetBytes 32
+                let salts = RandomNumberGenerator.GetBytes 32
+                let vs, ks, ovs, oks = salts.[0..7], salts.[8..15], salts.[16..23], salts.[24..31]
+                let u = Array.concat [ hash2B (Encoding.UTF8.GetBytes user) vs [||]; vs; ks ]
+                let ue = aesRaw true (hash2B (Encoding.UTF8.GetBytes user) ks [||]) (Array.zeroCreate 16) fk PaddingMode.None
+                let o = Array.concat [ hash2B (Encoding.UTF8.GetBytes owner) ovs u; ovs; oks ]
+                let oe = aesRaw true (hash2B (Encoding.UTF8.GetBytes owner) oks u) (Array.zeroCreate 16) fk PaddingMode.None
+                fk, $"<</Filter /Standard /V 5 /R 6 /Length 256 /CF <</StdCF <</CFM /AESV3 /AuthEvent /DocOpen /Length 32>>>> /StmF /StdCF /StrF /StdCF /O {hex o} /U {hex u} /OE {hex oe} /UE {hex ue} /P {p} /Perms {hex (Array.zeroCreate 16)}>>"
+            else
+                let n = 16
+                let iterate (h: byte[]) = let mutable h = h in (for _ in 1 .. 50 do h <- md5 (Array.sub h 0 n)); Array.sub h 0 n
+                let ok = iterate (md5 (padded owner))
+                let mutable o = rc4 ok (padded user)
+                for i in 1 .. 19 do o <- rc4 (xorKey ok i) o
+                let fk = iterate (md5 (Array.concat [ padded user; o; le32 p; id0 ]))
+                let mutable u = rc4 fk (md5 (Array.append pad id0))
+                for i in 1 .. 19 do u <- rc4 (xorKey fk i) u
+                let u = Array.append u (Array.zeroCreate 16)
+                let filters = if r = 4 then "/V 4 /R 4 /Length 128 /CF <</StdCF <</CFM /AESV2 /Length 16>>>> /StmF /StdCF /StrF /StdCF" else "/V 2 /R 3 /Length 128"
+                fk, $"<</Filter /Standard {filters} /O {hex o} /U {hex u} /P {p}>>"
+        let objKey num =
+            if r = 6 then fileKey
+            else
+                let salt = if r = 4 then "sAlT"B else [||]
+                let h = md5 (Array.concat [ fileKey; [| byte num; byte (num >>> 8); byte (num >>> 16); 0uy; 0uy |]; salt ])
+                Array.sub h 0 16
+        let enc num (data: byte[]) =
+            if r = 3 then rc4 (objKey num) data
+            else
+                let iv = RandomNumberGenerator.GetBytes 16
+                Array.append iv (aesRaw true (objKey num) iv data PaddingMode.PKCS7)
+        let rec strings num obj =
+            match obj with
+            | PdfString b -> PdfString (enc num b)
+            | PdfArray xs -> PdfArray (xs |> List.map (strings num))
+            | PdfDict d -> PdfDict (d |> Map.map (fun _ v -> strings num v))
+            | PdfStream (h, data) -> PdfStream (h |> Map.map (fun _ v -> strings num v), enc num data)
+            | o -> o
+        let encNum = (objects |> List.map fst |> List.max) + 1
+        let sb = StringBuilder()
+        sb.Append("%PDF-1.7\n") |> ignore
+        let offsets = Collections.Generic.Dictionary<int, int>()
+        for num, obj in objects do
+            offsets.[num] <- sb.Length
+            sb.Append($"{num} 0 obj\n").Append(Output.serialize (strings num obj)).Append("\nendobj\n") |> ignore
+        offsets.[encNum] <- sb.Length
+        sb.Append($"{encNum} 0 obj\n{encDict}\nendobj\n") |> ignore
+        let xrefPos = sb.Length
+        sb.Append($"xref\n0 {encNum + 1}\n0000000000 65535 f \n") |> ignore
+        for n in 1 .. encNum do
+            match offsets.TryGetValue n with
+            | true, off -> sb.Append(off.ToString("D10")).Append(" 00000 n \n") |> ignore
+            | _ -> sb.Append("0000000000 00000 f \n") |> ignore
+        sb.Append($"trailer\n<</Size {encNum + 1} /Root 1 0 R /Encrypt {encNum} 0 R /ID [{hex id0} {hex id0}]>>\nstartxref\n{xrefPos}\n%%%%EOF\n") |> ignore
+        latin1 (sb.ToString())
+
 [<EntryPoint>]
 let main _ =
     test "baseline" (fun () -> assertHello "baseline" (build normal onePage 1))
@@ -2241,6 +2363,61 @@ let main _ =
         check "forms: placed from the top-left" (content.Contains $"1 0 0 1 72 {baseline.ToString(Globalization.CultureInfo.InvariantCulture)} Tm")
         let threw = try Forms.stamp (Pdf.openData (build normal onePage 1)) [ { Page = 2; X = 0.0; Y = 0.0; Text = "x"; Size = 10.0 } ]; false with _ -> true
         check "forms: a missing page is refused" threw)
+
+    // ---------------------------------------------------------- encryption
+    test "encryption: RC4 matches the published test vector" (fun () ->
+        check "encryption: rc4" (bytesToHex (Encryption.rc4 "Key"B "Plaintext"B) = "BBF316E8D940AF0AD3"))
+
+    let infoFixture () =
+        [ 1, "<</Type /Catalog /Pages 2 0 R>>"
+          2, "<</Type /Pages /Kids [3 0 R] /Count 1>>"
+          3, "<</Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Contents 4 0 R>>"
+          4, "<</Length 16>>\nstream\nBT (Hello) Tj ET\nendstream" ]
+
+    let run (a: Async<'a>) = Async.RunSynchronously a
+    let fillOnlyP = -1052  // print, annotate and fill forms; no modify, copy or assemble
+
+    for r in [ 3; 4; 6 ] do
+        test $"encryption: R{r} with no user password opens, decrypts strings and streams, and reports permissions" (fun () ->
+            let encrypted = Encrypt.pdf r "" "owner-secret" fillOnlyP (formFixture ())
+            check $"encryption R{r}: the fixture is encrypted" (Encryption.isEncrypted (Pdf.openData encrypted))
+            let result = Encryption.decrypt netCrypto "" encrypted |> run
+            let doc = Pdf.openData result.Data
+            check $"encryption R{r}: no longer encrypted" (not (Encryption.isEncrypted doc))
+            check $"encryption R{r}: field values decrypted" ((fieldNamed doc "locked").Value = "keep" && (fieldNamed doc "name").Tooltip = "Business name")
+            check $"encryption R{r}: user, not owner" (not result.Owner)
+            check $"encryption R{r}: permissions" (result.Permissions.FillForms && result.Permissions.Print && not result.Permissions.Modify && not result.Permissions.Assemble)
+            let filled = Forms.fill doc [ "name", "Hang Chu LLC" ]
+            check $"encryption R{r}: fillable after decrypting" (filled.Filled = [ "name" ] && (fieldNamed (Pdf.openData (Forms.toBytes doc)) "name").Value = "Hang Chu LLC")
+            let content = pageContent (Pdf.openData (Encryption.decrypt netCrypto "" (Encrypt.pdf r "" "o" -4 (build normal (infoFixture ()) 1)) |> run).Data) 1
+            check $"encryption R{r}: page content decrypted" (content.Contains "BT (Hello) Tj ET")
+            let asOwner = Encryption.decrypt netCrypto "owner-secret" encrypted |> run
+            check $"encryption R{r}: the owner password gives every permission" (asOwner.Owner && asOwner.Permissions.Modify))
+
+        test $"encryption: R{r} with a user password needs it" (fun () ->
+            let encrypted = Encrypt.pdf r "open-me" "owner-secret" -4 (formFixture ())
+            let message pw = try Encryption.decrypt netCrypto pw encrypted |> run |> ignore; "" with e -> e.Message
+            check $"encryption R{r}: no password" (message "" = "The PDF needs a password to open.")
+            check $"encryption R{r}: wrong password" (message "nope" = "The password is not correct for this PDF.")
+            let result = Encryption.decrypt netCrypto "open-me" encrypted |> run
+            check $"encryption R{r}: right password" ((fieldNamed (Pdf.openData result.Data) "locked").Value = "keep"))
+
+    test "encryption: an unencrypted file is returned as it is" (fun () ->
+        let plain = build normal onePage 1
+        let result = Encryption.decrypt netCrypto "" plain |> run
+        check "encryption: same bytes" (Object.ReferenceEquals(result.Data, plain) && result.Owner))
+
+    // A real encrypted file, when present locally (not committed).
+    match Environment.GetEnvironmentVariable "RBT_PDF_ENCRYPTED_SAMPLE" with
+    | null | "" -> ()
+    | path ->
+        test "encryption: local sample decrypts and lists its fields" (fun () ->
+            let result = Encryption.decrypt netCrypto "" (IO.File.ReadAllBytes path) |> run
+            let doc = Pdf.openData result.Data
+            let fields = Forms.fields doc
+            printfn "  sample: %d pages, %d fields, P=%d fill=%b" (Pdf.getPageRefs doc).Length fields.Length result.Permissions.Raw result.Permissions.FillForms
+            for f in fields |> List.truncate 60 do printfn "    %-60s %-9s %A" f.Name f.Kind f.Tooltip
+            check "encryption: sample has fields" (not fields.IsEmpty))
 
     if failures > 0 then
         printfn "%d failure(s)" failures

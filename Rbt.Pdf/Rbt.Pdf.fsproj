@@ -5,6 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Rbt.Pdf.fs" />
+    <Compile Include="Encryption.fs" />
   </ItemGroup>
   <!-- Font utilities and image/stream codecs come from shared packages, including
        their F# sources for Fable builds. PDF-specific recovery policy stays here. -->
