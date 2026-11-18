@@ -2286,7 +2286,7 @@ let main _ =
         check "forms: kinds" (all |> List.map (fun f -> f.Kind) = [ "text"; "checkbox"; "radio"; "text"; "text"; "text" ])
         let name = fieldNamed doc "name"
         check "forms: tooltip" (name.Tooltip = "Business name")
-        check "forms: box from the top-left" (name.Widgets = [ { Page = 1; X = 50.0; Y = 72.0; Width = 200.0; Height = 20.0 } ])
+        check "forms: box from the top-left" (name.Widgets = [ { Page = 1; X = 50.0; Y = 72.0; Width = 200.0; Height = 20.0; Option = "" } ])
         check "forms: checkbox options" ((fieldNamed doc "llc").Options = [ "Yes" ])
         check "forms: radio options across widgets" ((fieldNamed doc "class").Options = [ "individual"; "partnership" ])
         check "forms: radio has two widgets" ((fieldNamed doc "class").Widgets.Length = 2)
@@ -2342,6 +2342,28 @@ let main _ =
         let again = Pdf.openData bytes
         let second = Forms.fill again [ "name", "Hang Chu, LLC" ]
         check "forms: refill" (second.Filled = [ "name" ] && (fieldNamed (Pdf.openData (Forms.toBytes again)) "name").Value = "Hang Chu, LLC"))
+
+    test "forms: a radio group whose /Opt repeats a value is chosen by state, one button at a time" (fun () ->
+        let ap state = $"<</N <</{state} 9 0 R /Off 9 0 R>>>>"
+        let objects =
+            [ 1, "<</Type /Catalog /Pages 2 0 R /AcroForm <</Fields [4 0 R]>>>>"
+              2, "<</Type /Pages /Kids [3 0 R] /Count 1>>"
+              3, "<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R 6 0 R 7 0 R]>>"
+              4, "<</FT /Btn /Ff 49152 /T (Tax Class) /V /7 /Opt [(Choice1) (Choice2) (Choice2)] /Kids [5 0 R 6 0 R 7 0 R]>>"
+              5, $"<</Subtype /Widget /Parent 4 0 R /P 3 0 R /Rect [70 620 84 634] /AS /Off /AP {ap 0}>>"
+              6, $"<</Subtype /Widget /Parent 4 0 R /P 3 0 R /Rect [246 620 260 634] /AS /Off /AP {ap 1}>>"
+              7, $"<</Subtype /Widget /Parent 4 0 R /P 3 0 R /Rect [84 600 98 614] /AS /Off /AP {ap 2}>>"
+              9, "<</Type /XObject /Subtype /Form /BBox [0 0 14 14] /Length 0>>\nstream\n\nendstream" ]
+        let doc = Pdf.openData (build normal objects 1)
+        let field = fieldNamed doc "Tax Class"
+        check "forms: duplicate labels give way to states" (field.Options = [ "0"; "1"; "2" ])
+        check "forms: each button names its option" (field.Widgets |> List.map (fun w -> w.Option) = [ "0"; "1"; "2" ])
+        let result = Forms.fill doc [ "Tax Class", "2" ]
+        check "forms: filled by state" (result.Filled = [ "Tax Class" ])
+        let filled = Pdf.openData (Forms.toBytes doc)
+        let state n = match Pdf.dictGet filled "AS" (PdfIndirect (n, 0)) with Some (PdfName s) -> s | _ -> ""
+        check "forms: only the third button is on" (state 5 = "Off" && state 6 = "Off" && state 7 = "2")
+        check "forms: the value reads back" ((fieldNamed filled "Tax Class").Value = "2"))
 
     test "forms: values outside Latin-1 are stored as UTF-16" (fun () ->
         let doc = Pdf.openData (formFixture ())

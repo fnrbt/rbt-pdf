@@ -5085,8 +5085,10 @@ module Forms =
     open System
     open System.Text
 
-    /// Where one of a field's widgets is: its page (1-based) and its box.
-    type FieldBox = { Page: int; X: float; Y: float; Width: float; Height: float }
+    /// Where one of a field's widgets is: its page (1-based) and its box, and
+    /// for a checkbox or radio button the option that turns it on ("" for
+    /// other fields).
+    type FieldBox = { Page: int; X: float; Y: float; Width: float; Height: float; Option: string }
 
     type FormField = {
         /// The fully qualified name (parent names joined with ".").
@@ -5273,13 +5275,19 @@ module Forms =
 
     /// A button field's states: the widgets' on-states, and for each the
     /// value people know it by (its /Opt export value when there is one).
+    /// When /Opt repeats a value (forms whose buttons all export "Choice2"),
+    /// the states themselves are the options, so each one picks one button.
     let private buttonStates (doc: PdfDocument) (t: Terminal) =
         let states = t.Widgets |> List.collect (onStates doc) |> List.distinct
         let exports = opts doc t |> List.map fst
-        states |> List.map (fun state ->
-            match Int32.TryParse state with
-            | true, i when i >= 0 && i < exports.Length -> state, exports.[i]
-            | _ -> state, state)
+        let named =
+            states |> List.map (fun state ->
+                match Int32.TryParse state with
+                | true, i when i >= 0 && i < exports.Length -> state, exports.[i]
+                | _ -> state, state)
+        let labels = named |> List.map snd
+        if List.length (List.distinct labels) = labels.Length then named
+        else states |> List.map (fun state -> state, state)
 
     let private valueOf (doc: PdfDocument) (t: Terminal) =
         let kind = kindOf doc t
@@ -5317,15 +5325,15 @@ module Forms =
         | Some box -> box
         | None -> rectOf doc (Pdf.getPageInheritable doc page "MediaBox") |> Option.defaultValue (0.0, 0.0, 612.0, 792.0)
 
-    let private boxOf (doc: PdfDocument) (pages: Collections.Generic.Dictionary<int, int * PdfObj>) (widget: PdfObj) =
+    let private boxOf (doc: PdfDocument) (pages: Collections.Generic.Dictionary<int, int * PdfObj>) (option: PdfObj -> string) (widget: PdfObj) =
         match widget, rectOf doc (Pdf.dictGet doc "Rect" widget) with
         | PdfIndirect (n, _), Some (x0, y0, x1, y1) when pages.ContainsKey n ->
             let page, pageRef = pages.[n]
             let left, _, _, top = cropBox doc pageRef
-            Some { Page = page; X = x0 - left; Y = top - y1; Width = x1 - x0; Height = y1 - y0 }
+            Some { Page = page; X = x0 - left; Y = top - y1; Width = x1 - x0; Height = y1 - y0; Option = option widget }
         | _, Some (x0, y0, x1, y1) ->
             // A widget no page lists: its box, page unknown (0).
-            Some { Page = 0; X = x0; Y = y0; Width = x1 - x0; Height = y1 - y0 }
+            Some { Page = 0; X = x0; Y = y0; Width = x1 - x0; Height = y1 - y0; Option = option widget }
         | _ -> None
 
     /// The document's form fields, in the form's order (none without a form).
@@ -5346,7 +5354,13 @@ module Forms =
               Multiline = kind = "text" && ff &&& (1 <<< 12) <> 0
               MaxLength = intOf doc (Map.tryFind "MaxLen" t.Attrs)
               Tooltip = Map.tryFind "TU" t.Attrs |> Option.bind (textOf doc) |> Option.defaultValue ""
-              Widgets = t.Widgets |> List.choose (boxOf doc pages) })
+              Widgets =
+                let states = if kind = "checkbox" || kind = "radio" then buttonStates doc t else []
+                let option widget =
+                    match onStates doc widget with
+                    | state :: _ -> states |> List.tryFind (fun (s, _) -> s = state) |> Option.map snd |> Option.defaultValue state
+                    | [] -> ""
+                t.Widgets |> List.choose (boxOf doc pages (if states.IsEmpty then (fun _ -> "") else option)) })
 
     // ------------------------------------------------------------------ writing
 
