@@ -2126,6 +2126,122 @@ let main _ =
               4, "<</Length 99>>\nstream\nBT (Hello) Tj ET\nendstream" ]
         assertHello "wrong /Length" (build normal objects 1))
 
+    // ---------------------------------------------------------------- forms
+    let formFixture () =
+        let check (name: string) = $"<</Type /XObject /Subtype /Form /BBox [0 0 12 12] /Length 0>>\nstream\n\nendstream"
+        let objects =
+            [ 1, "<</Type /Catalog /Pages 2 0 R /AcroForm 20 0 R>>"
+              2, "<</Type /Pages /Kids [3 0 R] /Count 1>>"
+              3, "<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [5 0 R 6 0 R 10 0 R 11 0 R 9 0 R 12 0 R 13 0 R]>>"
+              4, "<</Length 18>>\nstream\nBT (Form) Tj ET\n\nendstream"
+              // A text field merged with its widget.
+              5, "<</FT /Tx /T (name) /TU (Business name) /Subtype /Widget /P 3 0 R /Rect [50 700 250 720] /F 4>>"
+              // A checkbox with Yes/Off appearances.
+              6, "<</FT /Btn /T (llc) /Subtype /Widget /P 3 0 R /Rect [50 670 62 682] /V /Off /AS /Off /AP <</N <</Yes 14 0 R /Off 15 0 R>>>>>>"
+              // A radio group of two widgets.
+              7, "<</FT /Btn /Ff 49152 /T (class) /V /Off /Kids [10 0 R 11 0 R]>>"
+              10, "<</Subtype /Widget /Parent 7 0 R /P 3 0 R /Rect [50 640 62 652] /AS /Off /AP <</N <</individual 14 0 R /Off 15 0 R>>>>>>"
+              11, "<</Subtype /Widget /Parent 7 0 R /P 3 0 R /Rect [80 640 92 652] /AS /Off /AP <</N <</partnership 14 0 R /Off 15 0 R>>>>>>"
+              // A nested field: addr.line1.
+              8, "<</T (addr) /FT /Tx /Kids [9 0 R]>>"
+              9, "<</T (line1) /Parent 8 0 R /Subtype /Widget /P 3 0 R /Rect [50 600 300 616] /DA (/Helv 9 Tf 0 0 1 rg)>>"
+              // A comb field of nine cells, and a read-only field.
+              12, "<</FT /Tx /T (ein) /Ff 16777216 /MaxLen 9 /Subtype /Widget /P 3 0 R /Rect [50 560 230 576]>>"
+              13, "<</FT /Tx /T (locked) /Ff 1 /V (keep) /Subtype /Widget /P 3 0 R /Rect [50 520 150 536]>>"
+              14, check "on"
+              15, check "off"
+              20, "<</Fields [5 0 R 6 0 R 7 0 R 8 0 R 12 0 R 13 0 R] /DA (/Helv 0 Tf 0 g) /DR <</Font <</Helv 21 0 R>>>> /XFA [(template) 22 0 R]>>"
+              21, "<</Type /Font /Subtype /Type1 /BaseFont /Helvetica>>"
+              22, "<</Length 0>>\nstream\n\nendstream" ]
+        build normal objects 1
+
+    let fieldNamed (doc: PdfDocument) name = Forms.fields doc |> List.find (fun f -> f.Name = name)
+
+    test "forms: fields lists names, kinds, options and boxes from the page's top-left" (fun () ->
+        let doc = Pdf.openData (formFixture ())
+        let all = Forms.fields doc
+        check "forms: every terminal field" (all |> List.map (fun f -> f.Name) = [ "name"; "llc"; "class"; "addr.line1"; "ein"; "locked" ])
+        check "forms: kinds" (all |> List.map (fun f -> f.Kind) = [ "text"; "checkbox"; "radio"; "text"; "text"; "text" ])
+        let name = fieldNamed doc "name"
+        check "forms: tooltip" (name.Tooltip = "Business name")
+        check "forms: box from the top-left" (name.Widgets = [ { Page = 1; X = 50.0; Y = 72.0; Width = 200.0; Height = 20.0 } ])
+        check "forms: checkbox options" ((fieldNamed doc "llc").Options = [ "Yes" ])
+        check "forms: radio options across widgets" ((fieldNamed doc "class").Options = [ "individual"; "partnership" ])
+        check "forms: radio has two widgets" ((fieldNamed doc "class").Widgets.Length = 2)
+        check "forms: comb max length" ((fieldNamed doc "ein").MaxLength = Some 9)
+        check "forms: read-only and its value" ((fieldNamed doc "locked").ReadOnly && (fieldNamed doc "locked").Value = "keep")
+        check "forms: a PDF with no form has no fields" (Forms.fields (Pdf.openData (build normal onePage 1)) = []))
+
+    test "forms: fill sets values with appearances, keeps the original bytes, and survives a reopen" (fun () ->
+        let original = formFixture ()
+        let doc = Pdf.openData original
+        let result =
+            Forms.fill doc [
+                "name", "Hang Chu LLC"
+                "llc", "yes"
+                "class", "Partnership"
+                "addr.line1", "722 N Royal Crest Circle #51"
+                "ein", "123456789"
+                "locked", "changed"
+                "missing", "x"
+                "class", "corporation" ]
+        check "forms: filled" (result.Filled = [ "name"; "llc"; "class"; "addr.line1"; "ein" ])
+        check "forms: errors say why" (result.Errors |> List.map fst = [ "locked"; "missing"; "class" ])
+        check "forms: read-only refused" (result.Errors |> List.exists (fun (n, why) -> n = "locked" && why = "read-only"))
+        check "forms: a bad option lists the options" (result.Errors |> List.exists (fun (n, why) -> n = "class" && why.Contains "individual, partnership"))
+        let bytes = Forms.toBytes doc
+        check "forms: the original bytes come first, unchanged" (bytes.Length > original.Length && Array.sub bytes 0 original.Length = original)
+        let reopened = Pdf.openData bytes
+        check "forms: text value" ((fieldNamed reopened "name").Value = "Hang Chu LLC")
+        check "forms: checkbox on" ((fieldNamed reopened "llc").Value = "Yes")
+        check "forms: radio choice" ((fieldNamed reopened "class").Value = "partnership")
+        check "forms: nested value" ((fieldNamed reopened "addr.line1").Value = "722 N Royal Crest Circle #51")
+        check "forms: read-only untouched" ((fieldNamed reopened "locked").Value = "keep")
+        let widgetState n =
+            match Pdf.dictGet reopened "AS" (PdfIndirect (n, 0)) with
+            | Some (PdfName s) -> s
+            | _ -> "<none>"
+        check "forms: checkbox widget shows Yes" (widgetState 6 = "Yes")
+        check "forms: only the chosen radio widget is on" (widgetState 10 = "Off" && widgetState 11 = "partnership")
+        let appearance n =
+            Pdf.dictGet reopened "AP" (PdfIndirect (n, 0))
+            |> Option.bind (Pdf.dictGet reopened "N")
+            |> Option.map (Pdf.getStreamData reopened >> text)
+            |> Option.defaultValue ""
+        check "forms: text appearance shows the value" ((appearance 5).Contains "(Hang Chu LLC) Tj")
+        check "forms: the field's DA size and color are used" ((appearance 9).Contains "/RbtHelv 9 Tf" && (appearance 9).Contains "0 0 1 rg")
+        check "forms: a comb field draws a cell per character" (Text.RegularExpressions.Regex.Matches(appearance 12, " Tj").Count = 9)
+        let acro = Pdf.dictGet reopened "AcroForm" reopened.Catalog |> Option.get
+        check "forms: XFA data is dropped" (Pdf.dictGet reopened "XFA" acro = None)
+        // The filled page renders the value as glyphs.
+        let cmds, _, _, _ = renderPage (RenderOptions.native ()) reopened 1 1.0 |> Option.get
+        check "forms: the filled page renders" (not cmds.IsEmpty)
+        // Filling again over a filled document works too.
+        let again = Pdf.openData bytes
+        let second = Forms.fill again [ "name", "Hang Chu, LLC" ]
+        check "forms: refill" (second.Filled = [ "name" ] && (fieldNamed (Pdf.openData (Forms.toBytes again)) "name").Value = "Hang Chu, LLC"))
+
+    test "forms: values outside Latin-1 are stored as UTF-16" (fun () ->
+        let doc = Pdf.openData (formFixture ())
+        let result = Forms.fill doc [ "name", "Ḫang Čhu" ]
+        check "forms: filled" (result.Filled = [ "name" ])
+        check "forms: round trip" ((fieldNamed (Pdf.openData (Forms.toBytes doc)) "name").Value = "Ḫang Čhu"))
+
+    test "forms: stamp writes text on the page from its top-left, keeping the page's content" (fun () ->
+        let doc = Pdf.openData (build normal onePage 1)
+        Forms.stamp doc [ { Page = 1; X = 72.0; Y = 100.0; Text = "Hang Chu LLC\nLas Vegas"; Size = 11.0 } ]
+        let stamped = Pdf.openData (Forms.toBytes doc)
+        let content = pageContent stamped 1
+        check "forms: original content kept" (content.Contains "BT (Hello) Tj ET")
+        check "forms: stamped lines" (content.Contains "(Hang Chu LLC) Tj" && content.Contains "(Las Vegas) Tj")
+        check "forms: the original content is wrapped" (content.StartsWith "q")
+        let page = Pdf.getPageRefs stamped |> List.head
+        let _, _, _, top = PageOps.getMediaBox stamped page |> Option.get
+        let baseline = top - 100.0 - 11.0 * 0.8
+        check "forms: placed from the top-left" (content.Contains $"1 0 0 1 72 {baseline.ToString(Globalization.CultureInfo.InvariantCulture)} Tm")
+        let threw = try Forms.stamp (Pdf.openData (build normal onePage 1)) [ { Page = 2; X = 0.0; Y = 0.0; Text = "x"; Size = 10.0 } ]; false with _ -> true
+        check "forms: a missing page is refused" threw)
+
     if failures > 0 then
         printfn "%d failure(s)" failures
         1

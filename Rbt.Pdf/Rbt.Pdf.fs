@@ -5070,3 +5070,566 @@ module Operations =
                             | _ -> ()
                     | _ -> ()
                 | None -> ()
+
+/// Fillable forms (AcroForm): list a document's fields, fill them, and stamp
+/// text onto a page for forms that have no fields. A filled field gets its
+/// value and a new appearance drawn in Helvetica, so every viewer shows it
+/// (not only the ones that regenerate appearances). Changes are written as an
+/// incremental update after the original bytes (`toBytes`), so the original
+/// stays byte for byte as it was.
+///
+/// Places are PDF points from the top-left corner of the page's crop box, as
+/// the page shows unrotated: the same orientation as a rendered page image
+/// (a pixel at `dpi` is `72 / dpi` points).
+module Forms =
+    open System
+    open System.Text
+
+    /// Where one of a field's widgets is: its page (1-based) and its box.
+    type FieldBox = { Page: int; X: float; Y: float; Width: float; Height: float }
+
+    type FormField = {
+        /// The fully qualified name (parent names joined with ".").
+        Name: string
+        /// text, checkbox, radio, choice, button or signature.
+        Kind: string
+        /// The current value: the text, the chosen option, or "" when unset
+        /// (a checkbox that is off).
+        Value: string
+        /// A checkbox's or radio group's states other than Off, or a choice
+        /// field's options.
+        Options: string list
+        ReadOnly: bool
+        Multiline: bool
+        MaxLength: int option
+        /// The field's description for people (/TU), often its label.
+        Tooltip: string
+        Widgets: FieldBox list
+    }
+
+    /// What `fill` did: the fields it filled, and why it left the others.
+    type FillResult = { Filled: string list; Errors: (string * string) list }
+
+    /// Text to write on a page at (X, Y), its top-left corner; lines split on "\n".
+    type StampText = { Page: int; X: float; Y: float; Text: string; Size: float }
+
+    // ------------------------------------------------------------------ text
+
+    /// A PDF text string: UTF-16BE (with its byte order mark), UTF-8 (with
+    /// its mark), or PDFDocEncoding (read as Latin-1).
+    let decodeText (bytes: byte[]) =
+        if bytes.Length >= 2 && bytes.[0] = 0xFEuy && bytes.[1] = 0xFFuy then
+            let sb = StringBuilder()
+            let mutable i = 2
+            while i + 1 < bytes.Length do
+                sb.Append(char ((int bytes.[i] <<< 8) ||| int bytes.[i + 1])) |> ignore
+                i <- i + 2
+            sb.ToString()
+        elif bytes.Length >= 3 && bytes.[0] = 0xEFuy && bytes.[1] = 0xBBuy && bytes.[2] = 0xBFuy then
+            Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3)
+        else
+            String(bytes |> Array.map char)
+
+    /// `s` as a PDF text string: Latin-1 bytes when it fits, else UTF-16BE.
+    let encodeText (s: string) =
+        if s |> Seq.forall (fun c -> int c < 0x80 || (int c >= 0xA0 && int c <= 0xFF)) then
+            s |> Seq.map byte |> Array.ofSeq
+        else
+            [| yield 0xFEuy; yield 0xFFuy
+               for c in s do
+                   yield byte (int c >>> 8)
+                   yield byte (int c &&& 0xFF) |]
+
+    let private fmt (f: float) =
+        let r = Math.Round(f, 3)
+#if FABLE_COMPILER
+        let s = r.ToString()
+#else
+        let s = r.ToString("0.###", Globalization.CultureInfo.InvariantCulture)
+#endif
+        if s = "-0" then "0" else s
+
+    let private helveticaWidths = FontResolve.Standard14.lookup "Helvetica" |> Option.get
+
+    /// The width of `text` in Helvetica at `size`, as WinAnsi bytes.
+    let textWidth (text: string) (size: float) =
+        let bytes = Font.toWinAnsi text
+        let units = bytes |> Array.sumBy (fun b -> helveticaWidths.[int b])
+        float units / 1000.0 * size
+
+    // ------------------------------------------------------------------ the field tree
+
+    let private num = function
+        | PdfInt n -> Some (float n)
+        | PdfReal r -> Some r
+        | _ -> None
+
+    let private dictOf (doc: PdfDocument) (o: PdfObj) =
+        match Pdf.deref doc o with
+        | PdfDict d -> d
+        | PdfStream (h, _) -> h
+        | _ -> Map.empty
+
+    let private textOf (doc: PdfDocument) (o: PdfObj) =
+        match Pdf.deref doc o with
+        | PdfString b -> Some (decodeText b)
+        | PdfName n -> Some n
+        | _ -> None
+
+    let private intOf (doc: PdfDocument) (o: PdfObj option) =
+        o |> Option.map (Pdf.deref doc) |> Option.bind num |> Option.map int
+
+    /// The attributes a field inherits from its ancestors.
+    let private inheritable = [ "FT"; "Ff"; "V"; "DV"; "DA"; "Opt"; "MaxLen"; "Q" ]
+
+    type private Terminal = {
+        /// The field's own object (it holds /V); the widget too when merged.
+        Field: PdfObj
+        Name: string
+        /// Its attributes with the inherited ones filled in.
+        Attrs: Map<string, PdfObj>
+        Widgets: PdfObj list
+    }
+
+    let private isWidget (d: Map<string, PdfObj>) =
+        Map.tryFind "Subtype" d = Some (PdfName "Widget")
+
+    let private acroForm (doc: PdfDocument) =
+        Pdf.dictGet doc "AcroForm" doc.Catalog |> Option.map (dictOf doc)
+
+    /// The terminal fields (those holding a value), in tree order.
+    let private terminals (doc: PdfDocument) : Terminal list =
+        match acroForm doc |> Option.bind (Map.tryFind "Fields") |> Option.map (Pdf.deref doc) with
+        | Some (PdfArray roots) ->
+            let seen = Collections.Generic.HashSet<int>()
+            let out = ResizeArray<Terminal>()
+            let rec walk depth (parentName: string) (inherited: Map<string, PdfObj>) (node: PdfObj) =
+                let fresh =
+                    match node with
+                    | PdfIndirect (n, _) -> seen.Add n
+                    | _ -> true
+                if fresh && depth <= 32 then
+                    let d = dictOf doc node
+                    let name =
+                        match Map.tryFind "T" d |> Option.bind (textOf doc) with
+                        | Some t when parentName = "" -> t
+                        | Some t -> parentName + "." + t
+                        | None -> parentName
+                    let attrs =
+                        inheritable
+                        |> List.fold (fun (acc: Map<string, PdfObj>) key ->
+                            match Map.tryFind key d with
+                            | Some v -> Map.add key v acc
+                            | None -> acc) inherited
+                    let attrs = match Map.tryFind "TU" d with Some v -> Map.add "TU" v attrs | None -> Map.remove "TU" attrs
+                    let kids =
+                        match Map.tryFind "Kids" d |> Option.map (Pdf.deref doc) with
+                        | Some (PdfArray kids) -> kids
+                        | _ -> []
+                    // Kids without a name are this field's widgets; named kids are fields.
+                    let fieldKids = kids |> List.filter (fun k -> (dictOf doc k).ContainsKey "T")
+                    let widgetKids = kids |> List.filter (fun k -> not ((dictOf doc k).ContainsKey "T"))
+                    if fieldKids.IsEmpty then
+                        let widgets = if isWidget d then node :: widgetKids else widgetKids
+                        out.Add { Field = node; Name = name; Attrs = attrs; Widgets = widgets }
+                    else
+                        for kid in fieldKids do walk (depth + 1) name attrs kid
+            for root in roots do walk 0 "" Map.empty root
+            List.ofSeq out
+        | _ -> []
+
+    let private flags (doc: PdfDocument) (t: Terminal) =
+        intOf doc (Map.tryFind "Ff" t.Attrs) |> Option.defaultValue 0
+
+    let private kindOf (doc: PdfDocument) (t: Terminal) =
+        let ff = flags doc t
+        match Map.tryFind "FT" t.Attrs |> Option.map (Pdf.deref doc) with
+        | Some (PdfName "Tx") -> "text"
+        | Some (PdfName "Btn") when ff &&& (1 <<< 16) <> 0 -> "button"
+        | Some (PdfName "Btn") when ff &&& (1 <<< 15) <> 0 -> "radio"
+        | Some (PdfName "Btn") -> "checkbox"
+        | Some (PdfName "Ch") -> "choice"
+        | Some (PdfName "Sig") -> "signature"
+        | _ -> "unknown"
+
+    /// A button widget's appearance states other than Off, in order.
+    let private onStates (doc: PdfDocument) (widget: PdfObj) =
+        match Pdf.dictGet doc "AP" widget |> Option.bind (Pdf.dictGet doc "N") |> Option.map (Pdf.deref doc) with
+        | Some (PdfDict states) -> states |> Map.toList |> List.map fst |> List.filter (fun s -> s <> "Off")
+        | _ -> []
+
+    /// /Opt as (export value, display text) pairs.
+    let private opts (doc: PdfDocument) (t: Terminal) =
+        match Map.tryFind "Opt" t.Attrs |> Option.map (Pdf.deref doc) with
+        | Some (PdfArray items) ->
+            items |> List.choose (fun item ->
+                match Pdf.deref doc item with
+                | PdfArray [ export; shown ] ->
+                    match textOf doc export, textOf doc shown with
+                    | Some e, Some s -> Some (e, s)
+                    | _ -> None
+                | other -> textOf doc other |> Option.map (fun s -> s, s))
+        | _ -> []
+
+    /// A button field's states: the widgets' on-states, and for each the
+    /// value people know it by (its /Opt export value when there is one).
+    let private buttonStates (doc: PdfDocument) (t: Terminal) =
+        let states = t.Widgets |> List.collect (onStates doc) |> List.distinct
+        let exports = opts doc t |> List.map fst
+        states |> List.map (fun state ->
+            match Int32.TryParse state with
+            | true, i when i >= 0 && i < exports.Length -> state, exports.[i]
+            | _ -> state, state)
+
+    let private valueOf (doc: PdfDocument) (t: Terminal) =
+        let kind = kindOf doc t
+        match Map.tryFind "V" t.Attrs |> Option.map (Pdf.deref doc) with
+        | Some (PdfName "Off") | None -> ""
+        | Some (PdfName state) when kind = "checkbox" || kind = "radio" ->
+            buttonStates doc t |> List.tryFind (fun (s, _) -> s = state) |> Option.map snd |> Option.defaultValue state
+        | Some (PdfArray items) -> items |> List.choose (textOf doc) |> String.concat ", "
+        | Some v -> textOf doc v |> Option.defaultValue ""
+
+    /// Page number (1-based) of each widget object, from the pages' /Annots.
+    let private widgetPages (doc: PdfDocument) =
+        let pages = Collections.Generic.Dictionary<int, int * PdfObj>()
+        Pdf.getPageRefs doc |> List.iteri (fun i page ->
+            match Pdf.dictGet doc "Annots" page |> Option.map (Pdf.deref doc) with
+            | Some (PdfArray annots) ->
+                for a in annots do
+                    match a with
+                    | PdfIndirect (n, _) when not (pages.ContainsKey n) -> pages.[n] <- (i + 1, page)
+                    | _ -> ()
+            | _ -> ())
+        pages
+
+    let private rectOf (doc: PdfDocument) (o: PdfObj option) =
+        match o |> Option.map (Pdf.deref doc) with
+        | Some (PdfArray [ a; b; c; d ]) ->
+            match num (Pdf.deref doc a), num (Pdf.deref doc b), num (Pdf.deref doc c), num (Pdf.deref doc d) with
+            | Some x0, Some y0, Some x1, Some y1 -> Some (min x0 x1, min y0 y1, max x0 x1, max y0 y1)
+            | _ -> None
+        | _ -> None
+
+    /// The page's crop box (else its media box).
+    let private cropBox (doc: PdfDocument) (page: PdfObj) =
+        match rectOf doc (Pdf.getPageInheritable doc page "CropBox") with
+        | Some box -> box
+        | None -> rectOf doc (Pdf.getPageInheritable doc page "MediaBox") |> Option.defaultValue (0.0, 0.0, 612.0, 792.0)
+
+    let private boxOf (doc: PdfDocument) (pages: Collections.Generic.Dictionary<int, int * PdfObj>) (widget: PdfObj) =
+        match widget, rectOf doc (Pdf.dictGet doc "Rect" widget) with
+        | PdfIndirect (n, _), Some (x0, y0, x1, y1) when pages.ContainsKey n ->
+            let page, pageRef = pages.[n]
+            let left, _, _, top = cropBox doc pageRef
+            Some { Page = page; X = x0 - left; Y = top - y1; Width = x1 - x0; Height = y1 - y0 }
+        | _, Some (x0, y0, x1, y1) ->
+            // A widget no page lists: its box, page unknown (0).
+            Some { Page = 0; X = x0; Y = y0; Width = x1 - x0; Height = y1 - y0 }
+        | _ -> None
+
+    /// The document's form fields, in the form's order (none without a form).
+    let fields (doc: PdfDocument) : FormField list =
+        let pages = widgetPages doc
+        terminals doc |> List.map (fun t ->
+            let kind = kindOf doc t
+            let ff = flags doc t
+            { Name = t.Name
+              Kind = kind
+              Value = valueOf doc t
+              Options =
+                match kind with
+                | "checkbox" | "radio" -> buttonStates doc t |> List.map snd
+                | "choice" -> opts doc t |> List.map fst
+                | _ -> []
+              ReadOnly = ff &&& 1 <> 0
+              Multiline = kind = "text" && ff &&& (1 <<< 12) <> 0
+              MaxLength = intOf doc (Map.tryFind "MaxLen" t.Attrs)
+              Tooltip = Map.tryFind "TU" t.Attrs |> Option.bind (textOf doc) |> Option.defaultValue ""
+              Widgets = t.Widgets |> List.choose (boxOf doc pages) })
+
+    // ------------------------------------------------------------------ writing
+
+    /// Replace an indirect object with `f` of its current value.
+    let private modify (doc: PdfDocument) (o: PdfObj) (f: Map<string, PdfObj> -> Map<string, PdfObj>) =
+        match o with
+        | PdfIndirect (n, _) ->
+            match Pdf.deref doc o with
+            | PdfDict d -> Write.setObj doc n (PdfDict (f d)); true
+            | PdfStream (h, data) -> Write.setObj doc n (PdfStream (f h, data)); true
+            | _ -> false
+        | _ -> false
+
+    let private requireWritable (doc: PdfDocument) =
+        if doc.Trailer.ContainsKey "Encrypt" then
+            failwith "Encrypted PDFs cannot be filled or stamped."
+
+    /// The default appearance's size and color operator (from the field's
+    /// /DA, else the form's).
+    let private defaultAppearance (doc: PdfDocument) (t: Terminal) =
+        let da =
+            match Map.tryFind "DA" t.Attrs |> Option.bind (textOf doc) with
+            | Some da -> da
+            | None -> acroForm doc |> Option.bind (Map.tryFind "DA") |> Option.bind (textOf doc) |> Option.defaultValue ""
+        let tokens = da.Split([| ' '; '\n'; '\r'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+        let number (s: string) =
+            match Double.TryParse(s, Globalization.NumberStyles.Float, Globalization.CultureInfo.InvariantCulture) with
+            | true, v -> Some v
+            | _ -> None
+        let mutable size = 0.0
+        let mutable color = "0 g"
+        for i in 0 .. tokens.Length - 1 do
+            match tokens.[i] with
+            | "Tf" when i >= 1 -> size <- number tokens.[i - 1] |> Option.defaultValue 0.0
+            | "g" when i >= 1 -> color <- String.Join(" ", tokens.[i - 1 .. i])
+            | "rg" when i >= 3 -> color <- String.Join(" ", tokens.[i - 3 .. i])
+            | "k" when i >= 4 -> color <- String.Join(" ", tokens.[i - 4 .. i])
+            | _ -> ()
+        size, color
+
+    let private colorOps (doc: PdfDocument) (o: PdfObj option) (stroke: bool) =
+        match o |> Option.map (Pdf.deref doc) with
+        | Some (PdfArray items) ->
+            let values = items |> List.choose (Pdf.deref doc >> num) |> List.map fmt
+            match values with
+            | [ g ] -> Some (g + (if stroke then " G" else " g"))
+            | [ r; g; b ] -> Some (String.concat " " [ r; g; b ] + (if stroke then " RG" else " rg"))
+            | [ c; m; y; k ] -> Some (String.concat " " [ c; m; y; k ] + (if stroke then " K" else " k"))
+            | _ -> None
+        | _ -> None
+
+    /// Words of `text` wrapped to `width` at `size` (explicit line breaks kept).
+    let private wrap (text: string) (width: float) (size: float) =
+        [ for paragraph in text.Replace("\r\n", "\n").Split('\n') do
+            let words = paragraph.Split(' ')
+            let mutable line = ""
+            for word in words do
+                let candidate = if line = "" then word else line + " " + word
+                if line <> "" && textWidth candidate size > width then
+                    yield line
+                    line <- word
+                else
+                    line <- candidate
+            yield line ]
+
+    let private literal (s: string) = "(" + Font.escapeBytes (Font.toWinAnsi s) + ")"
+
+    /// A text or choice widget's normal appearance showing `value`.
+    let private textAppearance (doc: PdfDocument) (t: Terminal) (widget: PdfObj) (value: string) (font: PdfObj) =
+        let x0, y0, x1, y1 = rectOf doc (Pdf.dictGet doc "Rect" widget) |> Option.defaultValue (0.0, 0.0, 0.0, 0.0)
+        let w, h = x1 - x0, y1 - y0
+        let ff = flags doc t
+        let multiline = ff &&& (1 <<< 12) <> 0
+        let maxLen = intOf doc (Map.tryFind "MaxLen" t.Attrs) |> Option.defaultValue 0
+        let comb = ff &&& (1 <<< 24) <> 0 && maxLen > 0 && not multiline
+        let quadding = intOf doc (Map.tryFind "Q" t.Attrs) |> Option.defaultValue 0
+        let daSize, color = defaultAppearance doc t
+        let pad = 2.0
+        let size =
+            if daSize > 0.0 then daSize
+            elif multiline then 10.0
+            else
+                let byHeight = max 4.0 (min 12.0 ((h - 2.0 * pad) * 0.75))
+                let width = textWidth value 1.0
+                if comb || width <= 0.0 then byHeight else max 4.0 (min byHeight ((w - 2.0 * pad) / width))
+        let sb = StringBuilder()
+        let line (s: string) = sb.Append(s).Append('\n') |> ignore
+        let mk = Pdf.dictGet doc "MK" widget
+        match mk |> Option.bind (fun m -> colorOps doc (Pdf.dictGet doc "BG" m) false) with
+        | Some fill -> line fill; line $"0 0 {fmt w} {fmt h} re f"
+        | None -> ()
+        match mk |> Option.bind (fun m -> colorOps doc (Pdf.dictGet doc "BC" m) true) with
+        | Some stroke -> line stroke; line $"0.5 0.5 {fmt (w - 1.0)} {fmt (h - 1.0)} re S"
+        | None -> ()
+        line "/Tx BMC"
+        line "q"
+        line $"{fmt pad} {fmt 1.0} {fmt (w - 2.0 * pad)} {fmt (h - 2.0)} re W n"
+        line "BT"
+        line $"/RbtHelv {fmt size} Tf"
+        line color
+        let place (text: string) (baseline: float) =
+            let width = textWidth text size
+            let x =
+                match quadding with
+                | 1 -> (w - width) / 2.0
+                | 2 -> w - pad - width
+                | _ -> pad
+            line $"1 0 0 1 {fmt x} {fmt baseline} Tm"
+            line (literal text + " Tj")
+        if comb then
+            let cell = w / float maxLen
+            let baseline = max 1.0 ((h - size * 0.72) / 2.0)
+            value |> Seq.truncate maxLen |> Seq.iteri (fun i c ->
+                let s = string c
+                let x = float i * cell + (cell - textWidth s size) / 2.0
+                line $"1 0 0 1 {fmt x} {fmt baseline} Tm"
+                line (literal s + " Tj"))
+        elif multiline then
+            let leading = size * 1.15
+            wrap value (w - 2.0 * pad) size
+            |> List.iteri (fun i text -> place text (h - pad - size * 0.9 - float i * leading))
+        else
+            place value (max 1.0 ((h - size * 0.72) / 2.0))
+        line "ET"
+        line "Q"
+        line "EMC"
+        // Every byte is ASCII: text goes in as escaped WinAnsi.
+        let data = sb.ToString() |> Seq.map byte |> Array.ofSeq
+        PdfStream (
+            Map.ofList [
+                "Type", PdfName "XObject"
+                "Subtype", PdfName "Form"
+                "BBox", PdfArray [ PdfInt 0L; PdfInt 0L; PdfReal w; PdfReal h ]
+                "Resources", PdfDict (Map.ofList [ "Font", PdfDict (Map.ofList [ "RbtHelv", font ]) ])
+            ],
+            data)
+
+    let private helveticaFont () =
+        PdfDict (Map.ofList [
+            "Type", PdfName "Font"
+            "Subtype", PdfName "Type1"
+            "BaseFont", PdfName "Helvetica"
+            "Encoding", PdfName "WinAnsiEncoding" ])
+
+    let private onWords = set [ "on"; "yes"; "true"; "x"; "1"; "checked" ]
+    let private offWords = set [ "off"; "no"; "false"; ""; "0"; "unchecked" ]
+
+    /// The form's dictionary changed by `f` (where it lives: its own object or
+    /// the catalog).
+    let private modifyAcroForm (doc: PdfDocument) (f: Map<string, PdfObj> -> Map<string, PdfObj>) =
+        match Pdf.dictGet doc "AcroForm" doc.Catalog with
+        | Some (PdfIndirect _ as form) -> modify doc form f |> ignore
+        | Some (PdfDict d) -> modify doc doc.Catalog (Map.add "AcroForm" (PdfDict (f d))) |> ignore
+        | _ -> ()
+
+    /// Fill fields by name with values: text for text and choice fields, an
+    /// option for radio groups and choice fields, on/off (or a state) for
+    /// checkboxes. Each field is filled or reported in `Errors`; nothing is
+    /// written for a field in error. Read-only fields, buttons and signature
+    /// fields are refused. A form with XFA data loses it, so viewers that
+    /// prefer XFA show these values.
+    let fill (doc: PdfDocument) (values: (string * string) list) : FillResult =
+        requireWritable doc
+        let all = terminals doc
+        let mutable font = None
+        let fontRef () =
+            match font with
+            | Some f -> f
+            | None ->
+                let f = Write.newIndirectObj doc (helveticaFont ())
+                font <- Some f
+                f
+        let filled = ResizeArray<string>()
+        let errors = ResizeArray<string * string>()
+        for name, value in values do
+            let matches =
+                match all |> List.filter (fun t -> t.Name = name) with
+                | [] -> all |> List.filter (fun t -> String.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase))
+                | exact -> exact
+            match matches with
+            | [] -> errors.Add (name, "no such field")
+            | t :: _ ->
+                let kind = kindOf doc t
+                let fail reason = errors.Add (name, reason)
+                if flags doc t &&& 1 <> 0 then fail "read-only"
+                else
+                match kind with
+                | "text" | "choice" ->
+                    let options = opts doc t
+                    let editable = flags doc t &&& (1 <<< 18) <> 0
+                    let export =
+                        if kind = "choice" && not options.IsEmpty then
+                            options |> List.tryFind (fun (e, s) ->
+                                String.Equals(e, value, StringComparison.OrdinalIgnoreCase) || String.Equals(s, value, StringComparison.OrdinalIgnoreCase))
+                            |> Option.map fst
+                            |> Option.orElse (if editable then Some value else None)
+                        else Some value
+                    match export with
+                    | None -> fail ("not an option; options: " + (options |> List.map fst |> String.concat ", "))
+                    | Some export ->
+                        let maxLen = intOf doc (Map.tryFind "MaxLen" t.Attrs)
+                        let export = match maxLen with Some m when kind = "text" && m > 0 && export.Length > m -> export.Substring(0, m) | _ -> export
+                        if not (modify doc t.Field (Map.add "V" (PdfString (encodeText export)))) then fail "field is not an object of its own"
+                        else
+                            let shown = options |> List.tryFind (fun (e, _) -> e = export) |> Option.map snd |> Option.defaultValue export
+                            for widget in t.Widgets do
+                                let ap = Write.newIndirectObj doc (textAppearance doc t widget shown (fontRef ()))
+                                modify doc widget (fun d -> d |> Map.add "AP" (PdfDict (Map.ofList [ "N", ap ]))) |> ignore
+                            filled.Add t.Name
+                | "checkbox" | "radio" ->
+                    let states = buttonStates doc t
+                    let v = value.Trim()
+                    let chosen =
+                        match states |> List.tryFind (fun (s, e) -> String.Equals(s, v, StringComparison.OrdinalIgnoreCase) || String.Equals(e, v, StringComparison.OrdinalIgnoreCase)) with
+                        | Some (state, _) -> Ok (Some state)
+                        | None when kind = "checkbox" && onWords.Contains (v.ToLowerInvariant()) ->
+                            match states with
+                            | (state, _) :: _ -> Ok (Some state)
+                            | [] -> Error "has no on state to show"
+                        | None when offWords.Contains (v.ToLowerInvariant()) -> Ok None
+                        | None -> Error ("not an option; options: " + (states |> List.map snd |> String.concat ", "))
+                    match chosen with
+                    | Error reason -> fail reason
+                    | Ok state ->
+                        let stateName = state |> Option.defaultValue "Off"
+                        if not (modify doc t.Field (Map.add "V" (PdfName stateName))) then fail "field is not an object of its own"
+                        else
+                            for widget in t.Widgets do
+                                let shows = state.IsSome && List.contains stateName (onStates doc widget)
+                                modify doc widget (Map.add "AS" (PdfName (if shows then stateName else "Off"))) |> ignore
+                            filled.Add t.Name
+                | "button" -> fail "a push button has no value"
+                | "signature" -> fail "signature fields are signed, not filled"
+                | _ -> fail "unknown field type"
+        if filled.Count > 0 then
+            modifyAcroForm doc (Map.remove "XFA")
+        { Filled = List.ofSeq filled; Errors = List.ofSeq errors }
+
+    /// Write text onto pages (for a form with no fields): each item's lines in
+    /// Helvetica, black, its top-left at (X, Y). The page's own content is
+    /// kept as it was, wrapped so it cannot change where the text lands.
+    /// Rotated pages are refused.
+    let stamp (doc: PdfDocument) (items: StampText list) =
+        requireWritable doc
+        let pages = Pdf.getPageRefs doc
+        let font = lazy (Write.newIndirectObj doc (helveticaFont ()))
+        for page, group in items |> List.groupBy (fun i -> i.Page) do
+            if page < 1 || page > pages.Length then failwithf "There is no page %d." page
+            let pageRef = pages.[page - 1]
+            match intOf doc (Pdf.getPageInheritable doc pageRef "Rotate") with
+            | Some r when r % 360 <> 0 -> failwithf "Page %d is rotated; stamping a rotated page is not supported." page
+            | _ -> ()
+            let left, _, _, top = cropBox doc pageRef
+            let sb = StringBuilder()
+            sb.Append("Q\nq\nBT\n0 g\n") |> ignore
+            for item in group do
+                let size = if item.Size > 0.0 then item.Size else 10.0
+                item.Text.Replace("\r\n", "\n").Split('\n') |> Array.iteri (fun i text ->
+                    let x = left + item.X
+                    let y = top - item.Y - size * 0.8 - float i * size * 1.15
+                    sb.Append($"/RbtStampHelv {fmt size} Tf\n1 0 0 1 {fmt x} {fmt y} Tm\n{literal text} Tj\n") |> ignore)
+            sb.Append("ET\nQ\n") |> ignore
+            let opening = Write.newStream doc ("q\n"B) []
+            let added = Write.newStream doc (sb.ToString() |> Seq.map byte |> Array.ofSeq) []
+            let resources =
+                Pdf.getPageInheritable doc pageRef "Resources" |> Option.map (dictOf doc) |> Option.defaultValue Map.empty
+            let fonts = Map.tryFind "Font" resources |> Option.map (dictOf doc) |> Option.defaultValue Map.empty
+            let resources = resources |> Map.add "Font" (PdfDict (fonts |> Map.add "RbtStampHelv" font.Value))
+            let ok =
+                modify doc pageRef (fun d ->
+                    let existing =
+                        match Map.tryFind "Contents" d |> Option.map (fun c -> c, Pdf.deref doc c) with
+                        | Some (_, PdfArray streams) -> streams
+                        | Some (c, _) -> [ c ]
+                        | None -> []
+                    d
+                    |> Map.add "Contents" (PdfArray (opening :: existing @ [ added ]))
+                    |> Map.add "Resources" (PdfDict resources))
+            if not ok then failwithf "Page %d is not an object of its own." page
+
+    /// The document with its changes: the original bytes, then an incremental
+    /// update. The update's trailer names the document only (an xref-stream
+    /// file's trailer is that stream's own header, which does not belong in it).
+    let toBytes (doc: PdfDocument) : byte[] =
+        doc.Trailer <- doc.Trailer |> Map.filter (fun key _ -> key = "Root" || key = "Info" || key = "ID")
+        Array.append doc.Data (Write.update doc)
