@@ -1264,7 +1264,8 @@ module Output =
     and serializeTo (sb: StringBuilder) (obj: PdfObj) =
         match obj with
         | PdfInt n -> sb.Append(n.ToString()).Append(' ') |> ignore
-        | PdfReal r -> sb.Append(r).Append(' ') |> ignore
+        // (Invariant: a culture's decimal comma is not PDF.)
+        | PdfReal r -> sb.Append(r.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)).Append(' ') |> ignore
         | PdfBool b -> sb.Append(if b then "true " else "false ") |> ignore
         | PdfNull -> sb.Append("null ") |> ignore
         | PdfString data -> sb.Append('<').Append(hexEncode data).Append("> ") |> ignore
@@ -4362,6 +4363,8 @@ module Doc =
         PdfDict (Map.ofList resources)
 
     /// Add a page with drawing operations
+    let private pageNumber (v: float) = if v = System.Math.Floor v then PdfInt (int64 v) else PdfReal v
+
     let addPage (builder: DocBuilder) (width: float, height: float) (fontFamilies: string list) (imageNames: string list) (ops: DrawOp list) =
         // Ensure standard fonts exist. Embedded fonts are already loaded in
         // builder.EmbeddedFonts and must be preferred when remapping SetFont,
@@ -4398,7 +4401,8 @@ module Doc =
 
         let pageDict = PdfDict (Map.ofList [
             ("Type", PdfName "Page")
-            ("MediaBox", PdfArray [PdfInt 0L; PdfInt 0L; PdfInt (int64 width); PdfInt (int64 height)])
+            // (A4 is 595.3 x 841.9pt: a size is not rounded to whole points.)
+            ("MediaBox", PdfArray [PdfInt 0L; PdfInt 0L; pageNumber width; pageNumber height])
             ("Contents", contentRef)
             ("Resources", resources)
         ])

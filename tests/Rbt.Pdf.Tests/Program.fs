@@ -2441,6 +2441,21 @@ let main _ =
             for f in fields |> List.truncate 60 do printfn "    %-60s %-9s %A" f.Name f.Kind f.Tooltip
             check "encryption: sample has fields" (not fields.IsEmpty))
 
+    test "write: a page's MediaBox keeps a size's fraction, written invariantly" (fun () ->
+        let previous = System.Threading.Thread.CurrentThread.CurrentCulture
+        System.Threading.Thread.CurrentThread.CurrentCulture <- System.Globalization.CultureInfo "de-DE"
+        try
+            let builder = Doc.create ()
+            Doc.addPage builder (595.3, 841.9) [] [] []
+            let text = Text.Encoding.Latin1.GetString(Doc.toBytes builder)
+            let at = text.IndexOf "/MediaBox"
+            let box = if at < 0 then "" else text.Substring(at, min 40 (text.Length - at))
+            if not (box.Contains "595.3" && box.Contains "841.9") then printfn "  MediaBox written: %s" box
+            check "write: A4 MediaBox" (box.Contains "595.3" && box.Contains "841.9" && not (box.Contains "595,3"))
+            let doc = Pdf.openData (Doc.toBytes builder)
+            check "write: reads back" ((Pdf.getPageRefs doc).Length = 1)
+        finally System.Threading.Thread.CurrentThread.CurrentCulture <- previous)
+
     if failures > 0 then
         printfn "%d failure(s)" failures
         1
